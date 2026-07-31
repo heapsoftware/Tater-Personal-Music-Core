@@ -1422,7 +1422,7 @@ class DeviceControlPlugin(_DeviceVerbaRuntime):
     name = "device_control"
     verba_name = "Device Control"
     pretty_name = "Device Control"
-    version = "1.0.2"
+    version = "1.0.3"
     min_tater_version = "98.4"
     settings_category = "Device Control"
     platforms = [
@@ -1442,13 +1442,14 @@ class DeviceControlPlugin(_DeviceVerbaRuntime):
     description = (
         "Use for any request to control or check smart-home devices across integrations, "
         "including lights, switches, plugs, fans, covers, garage doors, locks, thermostats, "
-        "cameras, media players, remotes, scenes, and scripts."
+        "media players, remotes, scenes, and scripts. Use Camera Control for cameras and snapshots."
     )
     verba_dec = description
     when_to_use = (
         "Use for any request to control or inspect an integrated smart-home device. "
         "Choose this tool from the requested action and target name; do not guess the device's "
-        "technical category from words such as lights, plug, or switch."
+        "technical category from words such as lights, plug, or switch. For cameras, snapshots, "
+        "or requests about what a camera sees, use Camera Control instead."
     )
     how_to_use = (
         "Pass the user's natural-language request unchanged in query. The verba searches every "
@@ -1466,7 +1467,6 @@ class DeviceControlPlugin(_DeviceVerbaRuntime):
         "cover",
         "blind",
         "lock",
-        "camera",
         "remote",
         "scene",
         "script",
@@ -1481,7 +1481,6 @@ class DeviceControlPlugin(_DeviceVerbaRuntime):
         '{"function":"device_control","arguments":{"query":"set the kitchen lights to 30 percent"}}',
         '{"function":"device_control","arguments":{"query":"close the bedroom blinds"}}',
         '{"function":"device_control","arguments":{"query":"lock the front door"}}',
-        '{"function":"device_control","arguments":{"query":"take a snapshot from the porch camera"}}',
     ]
     common_needs = [
         "The requested action and a room, device name, or user-facing device alias when the target is not global."
@@ -1510,7 +1509,6 @@ class DeviceControlPlugin(_DeviceVerbaRuntime):
         "unlock",
         "set_temperature",
         "set_hvac_mode",
-        "camera_snapshot",
         "send_command",
         "activate",
         "run",
