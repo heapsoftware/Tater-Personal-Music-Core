@@ -30,7 +30,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.4.4"
+__version__ = "3.4.5"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
     "Connect Tater Tube Server to Tater; browse music, build AI-named recommendations from listening history, and keep "
@@ -3002,16 +3002,22 @@ def _settings_target_option(row: Dict[str, Any]) -> Dict[str, Any]:
     lower_target = target.casefold()
     if lower_target.startswith(("voice_core:stereo:", "stereo:")):
         kind = "Tater stereo pair"
+        icon = "T²"
     elif lower_target.startswith(("voice_core:", "native:")):
         kind = "Tater native satellite"
+        icon = "T"
     elif lower_target.startswith("airplay:"):
         kind = "AirPlay device"
+        icon = "△"
     elif lower_target.startswith("sonos:"):
         kind = "Sonos player"
+        icon = "S"
     elif lower_target.startswith("ha:"):
         kind = "Home Assistant player"
+        icon = "H"
     else:
         kind = "Music player"
+        icon = "♪"
 
     status = ""
     lower_label = label.casefold()
@@ -3050,6 +3056,7 @@ def _settings_target_option(row: Dict[str, Any]) -> Dict[str, Any]:
     )
     option["label"] = label or target or "Unnamed player"
     option["description"] = description
+    option["icon"] = _text(option.get("icon")) or icon
     return option
 
 
@@ -6096,9 +6103,10 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
                     {
                         "key": "airplay_receiver_targets",
                         "label": "Play Incoming AirPlay On",
-                        "type": "player_multiselect",
+                        "type": "multiselect",
+                        "presentation": "cards",
+                        "full_width": True,
                         "value": airplay_targets,
-                        "size": max(4, min(8, len(receiver_settings_target_options))),
                         "options": receiver_settings_target_options,
                         "description": (
                             "Choose one or more speakers for incoming AirPlay. Tater keeps the selected "
@@ -6145,9 +6153,10 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
                     {
                         "key": "default_targets",
                         "label": "Default Speakers",
-                        "type": "player_multiselect",
+                        "type": "multiselect",
+                        "presentation": "cards",
+                        "full_width": True,
                         "value": saved_default_targets,
-                        "size": max(4, min(8, len(settings_target_options))),
                         "options": settings_target_options,
                         "description": (
                             "Used only when the request does not name rooms or players "

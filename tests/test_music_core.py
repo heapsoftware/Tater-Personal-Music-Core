@@ -667,16 +667,19 @@ class MusicCoreTests(unittest.TestCase):
             native["description"],
             "Tater native satellite · Back Yard • native:kitchen · Online",
         )
+        self.assertEqual(native["icon"], "T")
         self.assertEqual(stereo["label"], "Office")
         self.assertEqual(
             stereo["description"],
             "Tater stereo pair · Sat 1 L + Voice PE R • ready",
         )
+        self.assertEqual(stereo["icon"], "T²")
         self.assertEqual(airplay["label"], "Kitchen HomePod")
         self.assertEqual(
             airplay["description"],
             "AirPlay device · Apple • 10.4.20.24",
         )
+        self.assertEqual(airplay["icon"], "△")
 
     def test_target_picker_hides_satellites_that_belong_to_a_stereo_pair(self):
         announcement_targets = types.ModuleType("announcement_targets")
@@ -1974,14 +1977,16 @@ class MusicCoreTests(unittest.TestCase):
         settings_fields = {row["key"]: row for row in settings["fields"]}
         self.assertEqual(settings["title"], "Playback Defaults")
         self.assertEqual(settings_fields["default_targets"]["label"], "Default Speakers")
-        self.assertEqual(settings_fields["default_targets"]["type"], "player_multiselect")
-        self.assertEqual(settings_fields["default_targets"]["size"], 4)
+        self.assertEqual(settings_fields["default_targets"]["type"], "multiselect")
+        self.assertEqual(settings_fields["default_targets"]["presentation"], "cards")
+        self.assertTrue(settings_fields["default_targets"]["full_width"])
         self.assertEqual(
             settings_fields["default_targets"]["options"][0],
             {
                 "value": "voice_core:native:kitchen",
                 "label": "Kitchen",
                 "description": "Tater native satellite",
+                "icon": "T",
             },
         )
         self.assertEqual(settings_fields["default_volume_percent"]["type"], "range")
@@ -2130,6 +2135,7 @@ class MusicCoreTests(unittest.TestCase):
                     "value": "voice_core:stereo:bedroom12",
                     "label": "Bedroom",
                     "description": "Tater stereo pair",
+                    "icon": "T²",
                 }
             ],
         )
@@ -3171,8 +3177,9 @@ class MusicCoreTests(unittest.TestCase):
         self.assertEqual(card["hero_badges"][0]["label"], "READY")
         self.assertEqual(fields["airplay_receiver_name"]["value"], "House Tater")
         self.assertEqual(fields["airplay_receiver_pin"]["type"], "password")
-        self.assertEqual(fields["airplay_receiver_targets"]["type"], "player_multiselect")
-        self.assertEqual(fields["airplay_receiver_targets"]["size"], 4)
+        self.assertEqual(fields["airplay_receiver_targets"]["type"], "multiselect")
+        self.assertEqual(fields["airplay_receiver_targets"]["presentation"], "cards")
+        self.assertTrue(fields["airplay_receiver_targets"]["full_width"])
         self.assertEqual(
             [row["value"] for row in fields["airplay_receiver_targets"]["options"]],
             [
