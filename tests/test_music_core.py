@@ -642,6 +642,42 @@ class MusicCoreTests(unittest.TestCase):
             )
         )
 
+    def test_settings_target_options_use_names_and_clear_device_details(self):
+        native = self.core._settings_target_option(
+            {
+                "value": "voice_core:native:kitchen",
+                "label": "Tater Sat: Kitchen (Back Yard • native:kitchen) • online",
+            }
+        )
+        stereo = self.core._settings_target_option(
+            {
+                "value": "voice_core:stereo:office",
+                "label": "Tater Stereo: Office (Sat 1 L + Voice PE R • ready)",
+            }
+        )
+        airplay = self.core._settings_target_option(
+            {
+                "value": "airplay:kitchen",
+                "label": "AirPlay: Kitchen HomePod (Apple • 10.4.20.24)",
+            }
+        )
+
+        self.assertEqual(native["label"], "Kitchen")
+        self.assertEqual(
+            native["description"],
+            "Tater native satellite · Back Yard • native:kitchen · Online",
+        )
+        self.assertEqual(stereo["label"], "Office")
+        self.assertEqual(
+            stereo["description"],
+            "Tater stereo pair · Sat 1 L + Voice PE R • ready",
+        )
+        self.assertEqual(airplay["label"], "Kitchen HomePod")
+        self.assertEqual(
+            airplay["description"],
+            "AirPlay device · Apple • 10.4.20.24",
+        )
+
     def test_target_picker_hides_satellites_that_belong_to_a_stereo_pair(self):
         announcement_targets = types.ModuleType("announcement_targets")
         announcement_targets.build_announcement_target_options = Mock(
@@ -1937,7 +1973,16 @@ class MusicCoreTests(unittest.TestCase):
         )
         settings_fields = {row["key"]: row for row in settings["fields"]}
         self.assertEqual(settings["title"], "Playback Defaults")
-        self.assertEqual(settings_fields["default_targets"]["type"], "player_multiselect")
+        self.assertEqual(settings_fields["default_targets"]["label"], "Default Speakers")
+        self.assertEqual(settings_fields["default_targets"]["type"], "multiselect")
+        self.assertEqual(
+            settings_fields["default_targets"]["options"][0],
+            {
+                "value": "voice_core:native:kitchen",
+                "label": "Kitchen",
+                "description": "Tater native satellite",
+            },
+        )
         self.assertEqual(settings_fields["default_volume_percent"]["type"], "range")
         library_settings = next(
             row for row in payload["ui"]["item_forms"]
@@ -2077,7 +2122,16 @@ class MusicCoreTests(unittest.TestCase):
             ["voice_core:stereo:bedroom12"],
         )
         self.assertEqual(default_targets["value"], ["voice_core:stereo:bedroom12"])
-        self.assertEqual(default_targets["options"], [pair_option])
+        self.assertEqual(
+            default_targets["options"],
+            [
+                {
+                    "value": "voice_core:stereo:bedroom12",
+                    "label": "Bedroom",
+                    "description": "Tater stereo pair",
+                }
+            ],
+        )
 
     def test_saving_defaults_routes_stereo_members_to_the_pair(self):
         member_routes = {
@@ -2315,6 +2369,156 @@ class MusicCoreTests(unittest.TestCase):
         player = self.core._player(self.redis)
         self.assertEqual(player["position_offset_seconds"], 75)
         self.assertEqual(player["status"], "playing")
+        self.assertFalse(player["seek_position_pending"])
+
+    def test_seek_while_not_playing_stages_position_until_explicit_resume(self):
+        for status in ("paused", "stopped"):
+            with self.subTest(status=status):
+                self.redis.set(
+                    self.core.PLAYER_KEY,
+                    json.dumps(
+                        {
+                            "status": status,
+                            "queue": self.tracks,
+                            "index": 0,
+                            "current": self.tracks[0],
+                            "targets": ["voice_core:native:kitchen"],
+                            "provider": "tater_tube",
+                            "volume_percent": 70,
+                            "duration_seconds": 180,
+                            "started_at": 0,
+                            "position_offset_seconds": 20,
+                        }
+                    ),
+                )
+                with patch.object(
+                    self.core,
+                    "_require_native_seek_support",
+                ) as compatible, patch.object(
+                    self.core,
+                    "_stop_target",
+                ) as stop, patch.object(
+                    self.core,
+                    "_play_track",
+                ) as play:
+                    result = self.core.run_client_music_action(
+                        "seek",
+                        {"position_seconds": 75},
+                        client=self.redis,
+                    )
+
+                self.assertTrue(result["ok"])
+                compatible.assert_called_once_with(["voice_core:native:kitchen"])
+                stop.assert_not_called()
+                play.assert_not_called()
+                staged = self.core._player(self.redis)
+                self.assertEqual(staged["status"], status)
+                self.assertEqual(staged["position_offset_seconds"], 75)
+                self.assertTrue(staged["seek_position_pending"])
+
+                with patch.object(
+                    self.core,
+                    "_play_track",
+                    return_value={"ok": True, "sent_count": 1},
+                ) as play, patch.object(
+                    self.core,
+                    "_record_listening_history",
+                ) as history:
+                    resumed = self.core.run_client_music_action(
+                        "resume",
+                        {},
+                        client=self.redis,
+                    )
+
+                self.assertTrue(resumed["ok"])
+                self.assertEqual(play.call_args.kwargs["start_position_seconds"], 75)
+                history.assert_not_called()
+                player = self.core._player(self.redis)
+                self.assertEqual(player["status"], "playing")
+                self.assertFalse(player["seek_position_pending"])
+
+    def test_web_ui_stages_stopped_seek_and_play_starts_from_that_position(self):
+        target = "voice_core:native:kitchen"
+        self.redis.set(
+            self.core.PLAYER_KEY,
+            json.dumps(
+                {
+                    "status": "stopped",
+                    "queue": self.tracks,
+                    "index": 0,
+                    "current": self.tracks[0],
+                    "targets": [target],
+                    "provider": "tater_tube",
+                    "volume_percent": 70,
+                    "duration_seconds": 180,
+                    "started_at": 0,
+                    "position_offset_seconds": 20,
+                }
+            ),
+        )
+
+        with patch.object(
+            self.core,
+            "_require_native_seek_support",
+        ) as compatible, patch.object(
+            self.core,
+            "_stop_target",
+        ) as stop, patch.object(
+            self.core,
+            "_play_track",
+        ) as play:
+            moved = self.core.handle_htmlui_tab_action(
+                action="music_ui_seek",
+                payload={"values": {"position_seconds": 92}},
+                redis_client=self.redis,
+            )
+
+        self.assertTrue(moved["ok"])
+        compatible.assert_called_once_with([target])
+        stop.assert_not_called()
+        play.assert_not_called()
+        staged = self.core._player(self.redis)
+        self.assertEqual(staged["status"], "stopped")
+        self.assertEqual(staged["position_offset_seconds"], 92)
+        self.assertTrue(staged["seek_position_pending"])
+
+        item = self.core._player_item(
+            staged,
+            [{"value": target, "label": "Tater Sat: Kitchen"}],
+            "tater_tube",
+            {},
+        )
+        self.assertEqual(item["playback"]["status"], "stopped")
+        self.assertEqual(item["playback"]["position_seconds"], 92)
+        self.assertEqual(item["actions"][1]["action"], "music_ui_play")
+
+        with patch.object(
+            self.core,
+            "_resolve_targets",
+            return_value=[target],
+        ), patch.object(
+            self.core,
+            "_validate_catalog_provider_targets",
+        ), patch.object(
+            self.core,
+            "_play_track",
+            return_value={"ok": True, "sent_count": 1},
+        ) as play, patch.object(
+            self.core,
+            "_record_listening_history",
+        ) as history:
+            started = self.core.handle_htmlui_tab_action(
+                action="music_ui_play",
+                payload={"values": {"volume_percent": 70}},
+                redis_client=self.redis,
+            )
+
+        self.assertTrue(started["ok"])
+        self.assertEqual(play.call_args.kwargs["start_position_seconds"], 92)
+        history.assert_not_called()
+        player = self.core._player(self.redis)
+        self.assertEqual(player["status"], "playing")
+        self.assertFalse(player["seek_position_pending"])
 
     def test_player_position_combines_seek_offset_with_live_elapsed_time(self):
         position = self.core._player_position_seconds(
@@ -2966,7 +3170,7 @@ class MusicCoreTests(unittest.TestCase):
         self.assertEqual(card["hero_badges"][0]["label"], "READY")
         self.assertEqual(fields["airplay_receiver_name"]["value"], "House Tater")
         self.assertEqual(fields["airplay_receiver_pin"]["type"], "password")
-        self.assertEqual(fields["airplay_receiver_targets"]["type"], "player_multiselect")
+        self.assertEqual(fields["airplay_receiver_targets"]["type"], "multiselect")
         self.assertEqual(
             [row["value"] for row in fields["airplay_receiver_targets"]["options"]],
             [
@@ -2975,6 +3179,10 @@ class MusicCoreTests(unittest.TestCase):
                 "sonos:den",
                 "airplay:living",
             ],
+        )
+        self.assertEqual(
+            [row["label"] for row in fields["airplay_receiver_targets"]["options"]],
+            ["Kitchen", "Office", "Den", "Living"],
         )
 
     def test_local_airplay_receiver_is_not_offered_as_an_outbound_player(self):

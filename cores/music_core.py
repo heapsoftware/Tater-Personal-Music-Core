@@ -30,7 +30,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.4.2"
+__version__ = "3.4.3"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
     "Connect Tater Tube Server to Tater; browse music, build AI-named recommendations from listening history, and keep "
@@ -63,7 +63,7 @@ CORE_SETTINGS = {
             "description": "How often Music Core refreshes artists, albums, genres, and tracks.",
         },
         "default_targets": {
-            "label": "Default Players",
+            "label": "Default Speakers",
             "type": "text",
             "default": "",
             "description": "Fallback playback destinations when a room or speaking satellite is unavailable.",
@@ -2994,6 +2994,65 @@ def _compact_target_option(row: Dict[str, Any]) -> Dict[str, Any]:
     return option
 
 
+def _settings_target_option(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Turn a playback target into a compact, readable settings choice."""
+    option = dict(row)
+    target = _text(option.get("value"))
+    label = _text(option.get("label")) or target
+    lower_target = target.casefold()
+    if lower_target.startswith(("voice_core:stereo:", "stereo:")):
+        kind = "Tater stereo pair"
+    elif lower_target.startswith(("voice_core:", "native:")):
+        kind = "Tater native satellite"
+    elif lower_target.startswith("airplay:"):
+        kind = "AirPlay device"
+    elif lower_target.startswith("sonos:"):
+        kind = "Sonos player"
+    elif lower_target.startswith("ha:"):
+        kind = "Home Assistant player"
+    else:
+        kind = "Music player"
+
+    status = ""
+    lower_label = label.casefold()
+    for suffix in (
+        " • offline or firmware update required",
+        " • offline",
+        " • online",
+    ):
+        if lower_label.endswith(suffix):
+            status = suffix.removeprefix(" • ").capitalize()
+            label = label[: -len(suffix)].strip()
+            break
+
+    for prefix in (
+        "Tater Satellite:",
+        "Tater Sat:",
+        "Tater Stereo:",
+        "AirPlay Bridge:",
+        "AirPlay:",
+        "Sonos:",
+        "Home Assistant:",
+        "Saved player:",
+    ):
+        if label.casefold().startswith(prefix.casefold()):
+            label = label[len(prefix) :].strip()
+            break
+
+    detail = ""
+    detail_start = label.rfind(" (")
+    if detail_start >= 0 and label.endswith(")"):
+        detail = label[detail_start + 2 : -1].strip()
+        label = label[:detail_start].strip()
+
+    description = " · ".join(
+        value for value in (kind, detail, status) if _text(value)
+    )
+    option["label"] = label or target or "Unnamed player"
+    option["description"] = description
+    return option
+
+
 def _split_local_airplay_receiver_options(
     options: List[Dict[str, Any]],
     cfg: Dict[str, Any],
@@ -3815,6 +3874,7 @@ def _start_player_index(
                     _mixed_sync_adjustment(targets, cfg),
                 ),
                 "last_error": "",
+                "seek_position_pending": False,
                 "playback_result": playback_result,
                 "warnings": [
                     _text(value)
@@ -3901,12 +3961,26 @@ def _seek_player(position_seconds: float, *, client: Any = None) -> Dict[str, An
     position = max(0.0, min(max(0.0, duration - 1.0), _as_float(position_seconds)))
     if position > 0:
         _require_native_seek_support(player.get("targets") or player.get("target"))
-    return _start_player_index(
-        _as_int(player.get("index"), 0, 0, max(0, len(queue) - 1)),
-        start_position_seconds=position,
-        record_history=False,
-        client=store,
+    if _text(player.get("status")).lower() == "playing":
+        return _start_player_index(
+            _as_int(player.get("index"), 0, 0, max(0, len(queue) - 1)),
+            start_position_seconds=position,
+            record_history=False,
+            client=store,
+        )
+
+    # A timeline adjustment must not become an implicit play command. Store the
+    # requested position and let the next explicit play/resume action start from
+    # it, while preserving the player's current non-playing status.
+    player.update(
+        {
+            "started_at": 0.0,
+            "position_offset_seconds": position,
+            "seek_position_pending": True,
+        }
     )
+    _save_player(player, store)
+    return player
 
 
 def _create_and_start_queue(
@@ -4098,14 +4172,17 @@ def _resume_player(*, client: Any = None) -> Dict[str, Any]:
     status = _text(player.get("status")).lower()
     if status == "playing":
         return player
+    resume_from_saved_position = status == "paused" or bool(
+        player.get("seek_position_pending")
+    )
     return _start_player_index(
         _as_int(player.get("index"), 0, 0, max(0, len(queue) - 1)),
         start_position_seconds=(
             _player_position_seconds(player)
-            if status == "paused"
+            if resume_from_saved_position
             else 0.0
         ),
-        record_history=status != "paused",
+        record_history=not resume_from_saved_position,
         client=store,
     )
 
@@ -4128,6 +4205,7 @@ def _stop_player(*, client: Any = None) -> Dict[str, Any]:
                 "status": "stopped",
                 "started_at": 0.0,
                 "position_offset_seconds": 0.0,
+                "seek_position_pending": False,
             }
         )
         if warnings:
@@ -5911,6 +5989,10 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
         for row in target_options
         if _is_external_audio_option(row)
     ]
+    settings_target_options = [_settings_target_option(row) for row in target_options]
+    receiver_settings_target_options = [
+        _settings_target_option(row) for row in receiver_target_options
+    ]
     external_audio = _external_audio_status(cfg, player)
     airplay_enabled = _as_bool(cfg.get("airplay_receiver_enabled"), False)
     external_status = _text(external_audio.get("status") or "disabled").lower()
@@ -6014,14 +6096,12 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
                     {
                         "key": "airplay_receiver_targets",
                         "label": "Play Incoming AirPlay On",
-                        "type": "player_multiselect",
+                        "type": "multiselect",
                         "value": airplay_targets,
-                        "size": max(4, min(8, len(receiver_target_options))),
-                        "options": receiver_target_options,
+                        "options": receiver_settings_target_options,
                         "description": (
-                            "Choose Tater Native satellites, stereo pairs, AirPlay-capable Sonos players, "
-                            "or discovered AirPlay speakers. Sonos uses its matched AirPlay endpoint. "
-                            "Tater keeps the selected destinations synchronized as one receiver."
+                            "Choose one or more speakers for incoming AirPlay. Tater keeps the selected "
+                            "destinations synchronized as one receiver."
                         ),
                     },
                     {
@@ -6063,11 +6143,10 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
                 "fields": [
                     {
                         "key": "default_targets",
-                        "label": "Default Players",
-                        "type": "player_multiselect",
+                        "label": "Default Speakers",
+                        "type": "multiselect",
                         "value": saved_default_targets,
-                        "size": max(4, min(8, len(target_options))),
-                        "options": target_options,
+                        "options": settings_target_options,
                         "description": (
                             "Used only when the request does not name rooms or players "
                             "and did not originate from a satellite."
