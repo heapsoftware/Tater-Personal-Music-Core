@@ -30,7 +30,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.4.3"
+__version__ = "3.4.4"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
     "Connect Tater Tube Server to Tater; browse music, build AI-named recommendations from listening history, and keep "
@@ -6096,8 +6096,9 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
                     {
                         "key": "airplay_receiver_targets",
                         "label": "Play Incoming AirPlay On",
-                        "type": "multiselect",
+                        "type": "player_multiselect",
                         "value": airplay_targets,
+                        "size": max(4, min(8, len(receiver_settings_target_options))),
                         "options": receiver_settings_target_options,
                         "description": (
                             "Choose one or more speakers for incoming AirPlay. Tater keeps the selected "
@@ -6144,8 +6145,9 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
                     {
                         "key": "default_targets",
                         "label": "Default Speakers",
-                        "type": "multiselect",
+                        "type": "player_multiselect",
                         "value": saved_default_targets,
+                        "size": max(4, min(8, len(settings_target_options))),
                         "options": settings_target_options,
                         "description": (
                             "Used only when the request does not name rooms or players "

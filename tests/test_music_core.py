@@ -1974,7 +1974,8 @@ class MusicCoreTests(unittest.TestCase):
         settings_fields = {row["key"]: row for row in settings["fields"]}
         self.assertEqual(settings["title"], "Playback Defaults")
         self.assertEqual(settings_fields["default_targets"]["label"], "Default Speakers")
-        self.assertEqual(settings_fields["default_targets"]["type"], "multiselect")
+        self.assertEqual(settings_fields["default_targets"]["type"], "player_multiselect")
+        self.assertEqual(settings_fields["default_targets"]["size"], 4)
         self.assertEqual(
             settings_fields["default_targets"]["options"][0],
             {
@@ -3170,7 +3171,8 @@ class MusicCoreTests(unittest.TestCase):
         self.assertEqual(card["hero_badges"][0]["label"], "READY")
         self.assertEqual(fields["airplay_receiver_name"]["value"], "House Tater")
         self.assertEqual(fields["airplay_receiver_pin"]["type"], "password")
-        self.assertEqual(fields["airplay_receiver_targets"]["type"], "multiselect")
+        self.assertEqual(fields["airplay_receiver_targets"]["type"], "player_multiselect")
+        self.assertEqual(fields["airplay_receiver_targets"]["size"], 4)
         self.assertEqual(
             [row["value"] for row in fields["airplay_receiver_targets"]["options"]],
             [
