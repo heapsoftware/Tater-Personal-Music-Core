@@ -10,6 +10,8 @@ import wave
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import face_identity_stub
+
 
 class FakeRedis:
     def __init__(self):
@@ -79,6 +81,7 @@ def load_automation_core():
     fake_redis = FakeRedis()
     injected_modules = (
         "announcement_targets",
+        "face_identity",
         "helpers",
         "integration_registry",
         "kernel_tools",
@@ -88,6 +91,8 @@ def load_automation_core():
         "vision_settings",
     )
     previous_modules = {name: sys.modules.get(name) for name in injected_modules}
+
+    sys.modules["face_identity"] = face_identity_stub
 
     announcement_targets = types.ModuleType("announcement_targets")
     announcement_targets.build_announcement_target_options = lambda **_kwargs: [
@@ -957,12 +962,14 @@ class AutomationCoreTests(unittest.IsolatedAsyncioTestCase):
             "camera_device": "unifi_protect|cam-front",
             "camera_trigger_media_mode": "image",
             "camera_selected_media_mode": "video",
+            "camera_face_id_enabled": True,
             "camera_tts_targets": ["voice_core:sat-kitchen"],
         }
 
         rule = self.core._rule_from_form(values, {"values": values})
 
         self.assertEqual(rule["camera_media_mode"], "video")
+        self.assertTrue(rule["camera_face_id_enabled"])
         self.assertNotIn("camera_trigger_media_mode", rule)
         self.assertNotIn("camera_selected_media_mode", rule)
 
@@ -1007,6 +1014,115 @@ class AutomationCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(speak.await_args.args[1]["vision"], "A person is standing by the door.")
         self.assertEqual(result["vision_requested_media"], "image")
         self.assertEqual(result["vision_media"], "image")
+
+    async def test_camera_ai_supplies_recognized_face_name_to_vision_and_tts(self):
+        rule = self.core._normalize_rule(
+            {
+                "id": "doorbell-face-greeting",
+                "name": "Doorbell Face Greeting",
+                "trigger_category": "camera",
+                "trigger_event": "doorbell",
+                "action_type": "camera_ai",
+                "camera_source": "selected",
+                "camera_device": "unifi_protect|doorbell-front",
+                "camera_face_id_enabled": True,
+                "vision_prompt": (
+                    "Create a short greeting. If Face ID provides a name, use it; otherwise use a "
+                    "neutral greeting."
+                ),
+                "camera_tts_text": "{vision}",
+                "camera_tts_targets": ["voice_core:sat-kitchen"],
+            }
+        )
+        self.assertIsNotNone(rule)
+        with (
+            patch.object(
+                self.core._shared_face_identity,
+                "runtime_status",
+                return_value={"enabled": True, "loaded": True},
+            ),
+            patch.object(
+                self.core._shared_face_identity,
+                "recognize_image",
+                return_value={
+                    "status": "recognized",
+                    "warning": "",
+                    "people": ["Alice"],
+                    "identity_ids": ["face_alice"],
+                    "faces_detected": 1,
+                },
+            ) as recognize,
+            patch.object(self.core, "_registry", return_value=sample_registry()),
+            patch.object(
+                self.core,
+                "run_integration_device_action",
+                return_value={"ok": True, "bytes": b"jpeg", "content_type": "image/jpeg"},
+            ) as camera_action,
+            patch.object(
+                self.core,
+                "_describe_snapshot_sync",
+                return_value="Hi Alice! It looks like you brought a package.",
+            ) as describe,
+            patch.object(
+                self.core,
+                "_execute_tts",
+                new=AsyncMock(return_value={"ok": True, "summary": "Spoke to the doorbell."}),
+            ) as speak,
+        ):
+            result = await self.core._execute_camera_ai(rule, {"device": "Front Doorbell"})
+
+        self.assertEqual(camera_action.call_count, 1)
+        self.assertEqual(recognize.call_args.kwargs["source"]["owner"], "automation")
+        self.assertIn("recognized the visitor as Alice", describe.call_args.args[2])
+        self.assertEqual(speak.await_args.args[1]["person"], "Alice")
+        self.assertEqual(result["face_id_status"], "recognized")
+        self.assertEqual(result["face_id_people"], ["Alice"])
+        self.assertEqual(result["face_id_warning"], "")
+
+    async def test_camera_ai_face_id_falls_back_to_neutral_greeting_when_disabled(self):
+        rule = self.core._normalize_rule(
+            {
+                "id": "doorbell-neutral-greeting",
+                "name": "Doorbell Neutral Greeting",
+                "trigger_category": "camera",
+                "trigger_event": "doorbell",
+                "action_type": "camera_ai",
+                "camera_source": "selected",
+                "camera_device": "unifi_protect|doorbell-front",
+                "camera_face_id_enabled": True,
+                "vision_prompt": "Create a short greeting.",
+                "camera_tts_targets": ["voice_core:sat-kitchen"],
+            }
+        )
+        with (
+            patch.object(
+                self.core._shared_face_identity,
+                "runtime_status",
+                return_value={"enabled": False, "loaded": False},
+            ),
+            patch.object(self.core, "_registry", return_value=sample_registry()),
+            patch.object(
+                self.core,
+                "run_integration_device_action",
+                return_value={"ok": True, "bytes": b"jpeg", "content_type": "image/jpeg"},
+            ),
+            patch.object(
+                self.core,
+                "_describe_snapshot_sync",
+                return_value="Hi there! How can I help?",
+            ) as describe,
+            patch.object(
+                self.core,
+                "_execute_tts",
+                new=AsyncMock(return_value={"ok": True, "summary": "Spoke to the doorbell."}),
+            ) as speak,
+        ):
+            result = await self.core._execute_camera_ai(rule, {"device": "Front Doorbell"})
+
+        self.assertIn("Use a neutral greeting", describe.call_args.args[2])
+        self.assertEqual(speak.await_args.args[1].get("person"), "")
+        self.assertEqual(result["face_id_status"], "disabled")
+        self.assertIn("Settings › Models", result["face_id_warning"])
 
     async def test_camera_ai_can_analyze_an_integration_video_clip(self):
         rule = self.core._normalize_rule(
@@ -1191,6 +1307,11 @@ class AutomationCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(by_key["tts_mode"]["value"], "default")
         self.assertEqual(by_key["tts_audio_enabled"]["type"], "select")
         self.assertEqual(by_key["tts_audio_enabled"]["presentation"], "cards")
+        self.assertEqual(by_key["camera_face_id_enabled"]["type"], "checkbox")
+        self.assertEqual(
+            by_key["camera_face_id_enabled"]["show_when"],
+            {"source_key": "action_type", "equals": "camera_ai"},
+        )
         self.assertEqual(
             by_key["tts_background_audio_source"]["show_when_all"],
             [

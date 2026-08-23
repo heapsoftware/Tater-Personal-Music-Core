@@ -19,9 +19,9 @@
       "id": "automation",
       "name": "Automation Core",
       "module_key": "automation_core",
-      "version": "1.5.1",
-      "min_tater_version": "98",
-      "description": "Build simple event-to-action automations from Tater's shared integration categories, device actions, notifications, announcement targets, and camera image or video descriptions.",
+      "version": "1.6.0",
+      "min_tater_version": "164",
+      "description": "Build simple event-to-action automations from Tater's shared integration categories, device actions, notifications, announcement targets, camera image or video descriptions, and optional Face ID-aware greetings using Tater's shared People profiles.",
       "settings_category": "Automation Core Settings",
       "required_settings_count": 0,
       "autostart_key": "automation_core_running",
@@ -35,15 +35,15 @@
         "rules"
       ],
       "entry": "cores/automation_core.py",
-      "sha256": "520167bff3d1c5aa85a1e9a4c1203e6d4b2f8d4e7426bf251e7aa329ceda2b24"
+      "sha256": "aad1e9734088fe6ddc85cbcaff430609d2e7c458b98679532daae3d0ef57c8d4"
     },
     {
       "id": "awareness",
       "name": "Awareness Core",
       "module_key": "awareness_core",
-      "version": "4.11.0",
-      "min_tater_version": "59",
-      "description": "Choose which cameras and sensors Tater should observe, describe camera events from images or short video clips, optionally pair sensors with cameras, retain their bounded event history, snapshots, and playable clips, answer questions about past activity, and optionally deliver the completed event with media and Face ID context. Use Automation Core for custom notification text, announcements, and device actions.",
+      "version": "4.12.0",
+      "min_tater_version": "164",
+      "description": "Choose which cameras and sensors Tater should observe, describe camera events from images or short video clips, optionally pair sensors with cameras, retain their bounded event history, snapshots, and playable clips, answer questions about past activity, and optionally deliver the completed event with media and Face ID context. Face profiles are managed in Settings › People › Faces. Use Automation Core for custom notification text, announcements, and device actions.",
       "settings_category": "Awareness Core Settings",
       "required_settings_count": 6,
       "autostart_key": "awareness_core_running",
@@ -57,7 +57,7 @@
         "notifications"
       ],
       "entry": "cores/awareness_core.py",
-      "sha256": "9f0584cf01782f2212c1212ac4a6f4f630a082d18fb7aa59731f238c526024d6"
+      "sha256": "6dc35c20d1461a817cb0ce6104300292c790fe25e55893d5dfd222fe12f679f6"
     },
     {
       "id": "environment",

@@ -24,6 +24,7 @@ from urllib.parse import quote
 from announcement_targets import build_announcement_target_options
 import requests
 
+import face_identity as _shared_face_identity
 from helpers import describe_image_with_local_llm, redis_client, resolve_hydra_base_servers
 from integration_registry import get_integration_device_registry, run_integration_device_action
 from notify import dispatch_notification, notifier_destination_catalog
@@ -40,11 +41,12 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _tater_agent_lab_path = None
 
 
-__version__ = "1.5.1"
-MIN_TATER_VERSION = "98"
+__version__ = "1.6.0"
+MIN_TATER_VERSION = "164"
 CORE_DESCRIPTION = (
     "Build simple event-to-action automations from Tater's shared integration categories, "
-    "device actions, notifications, announcement targets, and camera image or video descriptions."
+    "device actions, notifications, announcement targets, camera image or video descriptions, "
+    "and optional Face ID-aware greetings using Tater's shared People profiles."
 )
 TAGS = ["automation", "integrations", "smart-home", "tts", "vision", "video", "rules"]
 
@@ -77,6 +79,7 @@ _WORKER_COUNT = 4
 _BACKGROUND_AUDIO_MAX_UPLOAD_BYTES = 16 * 1024 * 1024
 _BACKGROUND_AUDIO_PRESET_SECONDS = 12
 _BACKGROUND_AUDIO_PRESET_SAMPLE_RATE = 24000
+_CAMERA_FACE_ID_TIMEOUT_SECONDS = 8.0
 _BACKGROUND_AUDIO_PRESETS: Tuple[Dict[str, str], ...] = (
     {
         "id": "morning_glow",
@@ -1395,6 +1398,7 @@ def _normalize_rule(raw: Any) -> Optional[Dict[str, Any]]:
         "camera_source": _token(raw.get("camera_source") or "trigger"),
         "camera_device": _text(raw.get("camera_device")),
         "camera_media_mode": _token(raw.get("camera_media_mode") or "image"),
+        "camera_face_id_enabled": _bool(raw.get("camera_face_id_enabled"), False),
         "vision_prompt": vision_prompt,
         "vision_fallback": _text(raw.get("vision_fallback") or "Activity was detected."),
         "camera_tts_text": _text(raw.get("camera_tts_text") or "{vision}"),
@@ -2463,6 +2467,107 @@ def _describe_video_sync(video_bytes: bytes, content_type: str, prompt: str) -> 
     return description
 
 
+def _camera_face_identity_rows(client: Any) -> Dict[str, Dict[str, Any]]:
+    return _shared_face_identity.identity_rows(client)
+
+
+def _camera_face_embedding(raw: Any, dimensions: int = 0) -> List[float]:
+    return _shared_face_identity.valid_embedding(raw, dimensions)
+
+
+def _camera_face_distance(left: List[float], right: List[float]) -> float:
+    return _shared_face_identity.cosine_distance(left, right)
+
+
+def _camera_face_references(identity: Dict[str, Any]) -> List[List[float]]:
+    return _shared_face_identity.reference_embeddings(identity)
+
+
+def _camera_face_identity_name(client: Any, identity: Dict[str, Any]) -> str:
+    return _text(_shared_face_identity.display_name(identity, client))
+
+
+def _camera_face_id_readiness() -> Dict[str, Any]:
+    status = dict(_shared_face_identity.runtime_status(redis_client) or {})
+    if not _bool(status.get("enabled"), False):
+        return {
+            "status": "disabled",
+            "warning": "Face ID is disabled in Settings › Models.",
+        }
+    if not _bool(status.get("loaded"), False):
+        return {
+            "status": "not_ready",
+            "warning": "Face ID is enabled but its model is not ready yet.",
+        }
+    return {"status": "ready", "warning": ""}
+
+
+def _recognize_camera_faces_sync(
+    image_bytes: bytes,
+    *,
+    event_id: str = "",
+    source: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return _shared_face_identity.recognize_image(
+        image_bytes,
+        event_id=event_id,
+        source=source,
+        record=True,
+        redis_client=redis_client,
+    )
+
+
+async def _recognize_camera_faces(
+    image_bytes: bytes,
+    *,
+    event_id: str = "",
+    source: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                _recognize_camera_faces_sync,
+                image_bytes,
+                event_id=event_id,
+                source=source,
+            ),
+            timeout=_CAMERA_FACE_ID_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        return {
+            "status": "timeout",
+            "warning": "Face ID did not finish before the greeting timeout.",
+            "people": [],
+            "identity_ids": [],
+        }
+
+
+def _camera_face_people_text(people: Sequence[Any]) -> str:
+    names = [_text(value) for value in people if _text(value)]
+    if len(names) <= 1:
+        return names[0] if names else ""
+    if len(names) == 2:
+        return f"{names[0]} and {names[1]}"
+    return f"{', '.join(names[:-1])}, and {names[-1]}"
+
+
+def _camera_prompt_with_face_context(prompt: Any, face_result: Dict[str, Any]) -> str:
+    base_prompt = _text(prompt)
+    people_text = _camera_face_people_text(face_result.get("people") or [])
+    if people_text:
+        subject = "visitor" if len(face_result.get("people") or []) == 1 else "visitors"
+        context = (
+            f"Face ID independently recognized the {subject} as {people_text}. "
+            "Use this exact name naturally when appropriate, and do not infer any other identity."
+        )
+    else:
+        context = (
+            "Face ID did not provide a known visitor name. Use a neutral greeting and do not guess "
+            "the visitor's identity."
+        )
+    return f"{base_prompt}\n\n{context}" if base_prompt else context
+
+
 async def _execute_camera_ai(rule: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
     registry = _registry(redis_client)
     camera = _camera_device_for_rule(rule, context, registry)
@@ -2488,13 +2593,76 @@ async def _execute_camera_ai(rule: Dict[str, Any], context: Dict[str, Any]) -> D
     next_context = dict(context)
     next_context["device"] = _text(camera.get("name")) or context.get("device") or "camera"
     next_context["device_target"] = _encode_device(provider, device_id)
-    prompt = _render_template(rule.get("vision_prompt"), next_context)
     requested_media = _token(rule.get("camera_media_mode") or "image")
     if requested_media not in _CAMERA_MEDIA_MODES:
         requested_media = "image"
     actual_media = requested_media
     media_errors: List[str] = []
     description = ""
+    image_bytes = b""
+    image_content_type = "image/jpeg"
+    face_requested = _bool(rule.get("camera_face_id_enabled"), False)
+    face_result: Dict[str, Any] = {
+        "status": "disabled_for_automation",
+        "warning": "",
+        "people": [],
+        "identity_ids": [],
+    }
+
+    if face_requested:
+        face_readiness = _camera_face_id_readiness()
+        face_result = {**face_readiness, "people": [], "identity_ids": []}
+        if face_readiness.get("status") == "ready":
+            if not snapshot_action:
+                face_result = {
+                    "status": "unavailable",
+                    "warning": "The selected camera cannot provide a snapshot for Face ID.",
+                    "people": [],
+                    "identity_ids": [],
+                }
+            else:
+                try:
+                    snapshot_result = await asyncio.to_thread(
+                        run_integration_device_action,
+                        provider,
+                        snapshot_action,
+                        device_id,
+                        {},
+                    )
+                    image_bytes, image_content_type = _snapshot_result_bytes(snapshot_result)
+                    face_result = await _recognize_camera_faces(
+                        image_bytes,
+                        event_id=_text(next_context.get("event_id") or next_context.get("trigger_event_id"))
+                        or f"automation_{uuid.uuid4().hex[:16]}",
+                        source={
+                            "owner": "automation",
+                            "provider": provider,
+                            "camera_target": device_id,
+                            "automation_id": _text(rule.get("id")),
+                        },
+                    )
+                except Exception as exc:
+                    face_result = {
+                        "status": "error",
+                        "warning": _text(exc) or "Face ID snapshot capture failed.",
+                        "people": [],
+                        "identity_ids": [],
+                    }
+        existing_person = _text(next_context.get("person"))
+        if not face_result.get("people") and existing_person:
+            face_result = {
+                "status": "recognized_from_trigger",
+                "warning": "",
+                "people": [existing_person],
+                "identity_ids": list(next_context.get("face_identity_ids") or []),
+            }
+        people_text = _camera_face_people_text(face_result.get("people") or [])
+        next_context["person"] = people_text
+        next_context["face_identity_ids"] = list(face_result.get("identity_ids") or [])
+
+    prompt = _render_template(rule.get("vision_prompt"), next_context)
+    if face_requested:
+        prompt = _camera_prompt_with_face_context(prompt, face_result)
 
     if requested_media == "video":
         if not clip_action:
@@ -2526,14 +2694,15 @@ async def _execute_camera_ai(rule: Dict[str, Any], context: Dict[str, Any]) -> D
             media_errors.append("image: The selected camera integration does not expose snapshots.")
         else:
             try:
-                snapshot_result = await asyncio.to_thread(
-                    run_integration_device_action,
-                    provider,
-                    snapshot_action,
-                    device_id,
-                    {},
-                )
-                image_bytes, image_content_type = _snapshot_result_bytes(snapshot_result)
+                if not image_bytes:
+                    snapshot_result = await asyncio.to_thread(
+                        run_integration_device_action,
+                        provider,
+                        snapshot_action,
+                        device_id,
+                        {},
+                    )
+                    image_bytes, image_content_type = _snapshot_result_bytes(snapshot_result)
                 description = await asyncio.to_thread(
                     _describe_snapshot_sync,
                     image_bytes,
@@ -2593,6 +2762,10 @@ async def _execute_camera_ai(rule: Dict[str, Any], context: Dict[str, Any]) -> D
         "vision_warning": vision_error,
         "vision_requested_media": requested_media,
         "vision_media": actual_media,
+        "face_id_requested": face_requested,
+        "face_id_status": _text(face_result.get("status")),
+        "face_id_people": list(face_result.get("people") or []),
+        "face_id_warning": _text(face_result.get("warning")),
         "errors": errors,
     }
 
@@ -2932,6 +3105,7 @@ def _rule_from_form(
         "camera_source",
         "camera_device",
         "camera_media_mode",
+        "camera_face_id_enabled",
         "vision_prompt",
         "vision_fallback",
         "camera_tts_text",
@@ -3677,12 +3851,27 @@ def _editor_fields(
             "full_width": True,
         },
         {
+            "key": "camera_face_id_enabled",
+            "label": "Use Face ID In This Message",
+            "type": "checkbox",
+            "value": _bool(rule.get("camera_face_id_enabled"), False),
+            "description": (
+                "Recognize a known visitor before vision writes the message. If no name is available, "
+                "Tater continues with a neutral greeting. Face ID must be enabled in Settings › Models."
+            ),
+            "show_when": show_camera_ai,
+        },
+        {
             "key": "vision_prompt",
             "label": "What Should Vision Describe?",
             "type": "textarea",
             "value": _text(
                 rule.get("vision_prompt")
                 or "Briefly describe the important activity shown by this camera. Do not invent details."
+            ),
+            "description": (
+                "When Face ID is selected, the recognized name or neutral fallback is supplied to vision "
+                "before it writes the message."
             ),
             "show_when": show_camera_ai,
             "full_width": True,
@@ -3712,7 +3901,7 @@ def _editor_fields(
             "label": "Camera Announcement",
             "type": "textarea",
             "value": _text(rule.get("camera_tts_text") or "{vision}"),
-            "description": "Use {vision} to insert the camera description.",
+            "description": "Use {vision} for the generated message. {person} contains a recognized Face ID name when available.",
             "show_when": show_camera_ai,
             "full_width": True,
         },

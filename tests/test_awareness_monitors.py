@@ -7,6 +7,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import face_identity_stub
+
 
 class FakeRedis:
     def __init__(self):
@@ -200,6 +202,7 @@ def load_awareness_core():
     fake_redis = FakeRedis()
     injected = (
         "announcement_targets",
+        "face_identity",
         "helpers",
         "notify",
         "speech_settings",
@@ -209,6 +212,8 @@ def load_awareness_core():
         "vision_settings",
     )
     previous = {name: sys.modules.get(name) for name in injected}
+
+    sys.modules["face_identity"] = face_identity_stub
 
     helpers = types.ModuleType("helpers")
     helpers.redis_client = fake_redis
@@ -1263,7 +1268,7 @@ class AwarenessMonitorTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.core, "_monitor_registry", return_value=sample_registry()):
             payload = self.core.get_htmlui_tab_data(redis_client=self.redis)
         ui = payload["ui"]
-        self.assertEqual([tab["key"] for tab in ui["manager_tabs"]], ["events", "faces", "monitors", "add"])
+        self.assertEqual([tab["key"] for tab in ui["manager_tabs"]], ["events", "monitors", "add"])
         self.assertEqual(ui["default_tab"], "events")
         self.assertEqual(ui["appearance"], "awareness")
         fields = {field.get("key"): field for field in ui["add_form"]["fields"] if field.get("key")}
@@ -1384,11 +1389,9 @@ class AwarenessMonitorTests(unittest.IsolatedAsyncioTestCase):
 
     def test_face_id_tab_explains_that_the_model_must_be_enabled(self):
         with patch.object(self.core, "_monitor_registry", return_value=sample_registry()):
-            ui = self.core.get_htmlui_tab_data(redis_client=self.redis)["ui"]
-        face_tab = next(tab for tab in ui["manager_tabs"] if tab["key"] == "faces")
-        self.assertEqual(face_tab["label"], "Face ID")
-        face_card = next(item for item in ui["item_forms"] if item.get("group") == "face_person")
-        self.assertEqual(face_card["title"], "Face ID needs to be enabled")
+            payload = self.core.get_htmlui_tab_data(redis_client=self.redis)
+        self.assertNotIn("faces", [tab["key"] for tab in payload["ui"]["manager_tabs"]])
+        self.assertIn("Settings › People › Faces", payload["summary"])
 
     def test_face_identity_name_is_resolved_into_historical_event_context(self):
         detection = {
@@ -1423,17 +1426,16 @@ class AwarenessMonitorTests(unittest.IsolatedAsyncioTestCase):
             "data": {"area": "Back Yard", "face_session_id": "session-fred"},
         }
         self.redis.lpush("tater:automations:events:back_yard", json.dumps(event))
-        self.core.handle_htmlui_tab_action(
-            action="awareness_save_face_identity",
-            payload={"id": identity["id"], "values": {"name": "Fred", "merge_into": ""}},
+        self.core._shared_face_identity.save_profile(
+            identity["id"],
+            name="Fred",
+            person_link_supplied=False,
             redis_client=self.redis,
         )
         context = self.core._face_event_context(self.redis, event)
         compact = self.core._events_query_compact_event_for_llm(event, self.redis)
-        stored = json.loads(self.redis.lists["tater:automations:events:back_yard"][0])
         self.assertEqual(context["known_people"], ["Fred"])
         self.assertEqual(compact["data"]["known_people"], ["Fred"])
-        self.assertEqual(stored["data"]["known_people"], ["Fred"])
 
     async def test_face_burst_captures_five_frames_before_analyzing(self):
         runtime = types.SimpleNamespace(
@@ -1643,7 +1645,17 @@ class AwarenessMonitorTests(unittest.IsolatedAsyncioTestCase):
             patch.object(self.core, "_face_id_enabled", return_value=True),
             patch.object(self.core, "_face_id_runtime", runtime),
             patch.object(self.core, "_FACE_BURST_FRAME_COUNT", 1),
-            patch.object(self.core, "_people_person_name", return_value="Fred"),
+            patch.object(
+                self.core._shared_face_identity,
+                "recognized_people",
+                return_value=[
+                    {
+                        "person_id": "person_fred",
+                        "person_name": "Fred",
+                        "face_identity_ids": ["face_fred"],
+                    }
+                ],
+            ),
         ):
             await self.core._run_face_burst(
                 session=session,
@@ -1662,6 +1674,7 @@ class AwarenessMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(saved["recognized_person_ids"], ["person_fred"])
         self.assertEqual(saved["automation_events_emitted"], 1)
 
+    @unittest.skip("Face sorting is covered by Tater's shared Face ID service tests.")
     def test_unknown_face_can_be_manually_sorted_into_a_known_person(self):
         base = {
             "facial_area": {"w": 100, "h": 100},
@@ -1726,29 +1739,11 @@ class AwarenessMonitorTests(unittest.IsolatedAsyncioTestCase):
         ):
             ui = self.core.get_htmlui_tab_data(redis_client=self.redis)["ui"]
 
-        face = next(item for item in ui["item_forms"] if item.get("id") == identity["id"])
-        fields = {field["key"]: field for field in face["fields"]}
-        face_tab = next(tab for tab in ui["manager_tabs"] if tab["key"] == "faces")
-        self.assertEqual(face["group"], "face_person")
-        self.assertEqual(face["card_variant"], "face_person")
-        self.assertFalse(face["selectable"])
-        self.assertTrue(face["click_opens_fields"])
-        self.assertFalse(face["fields_popup"])
-        self.assertEqual(fields["name"]["type"], "text")
-        self.assertEqual(fields["person_id"]["type"], "select")
-        self.assertEqual(fields["observation_ids"]["type"], "image_checklist")
-        self.assertEqual(len(fields["observation_ids"]["options"]), 2)
-        self.assertTrue(all(row["selectable"] for row in fields["observation_ids"]["options"]))
-        self.assertEqual(fields["target_identity_id"]["type"], "select")
-        self.assertEqual(face["actions"][0]["action"], "awareness_move_face_images")
-        self.assertEqual(face["actions"][1]["action"], "awareness_remove_face_images")
-        self.assertEqual(face["actions"][1]["label"], "Remove Selected Images")
-        self.assertNotIn("remove_action", face)
-        self.assertEqual(face["run_action"], "awareness_remove_face_identity")
-        self.assertEqual(face["run_label"], "Remove Person")
-        self.assertEqual(face_tab["item_group"], "face_person")
-        self.assertNotIn("bulk_actions", face_tab)
+        self.assertNotIn("faces", [tab["key"] for tab in ui["manager_tabs"]])
+        self.assertFalse(any(item.get("group") == "face_person" for item in ui["item_forms"]))
+        self.assertIn(identity["id"], self.core._shared_face_identity.identity_rows(self.redis))
 
+    @unittest.skip("Face-to-People linking is covered by Tater's shared Face ID service tests.")
     def test_face_identity_links_to_people_api_and_enriches_events(self):
         people = [{"id": "person_fred", "display_name": "Fred", "aliases": []}]
         identity = self.core._record_face_detection(
@@ -1832,6 +1827,7 @@ class AwarenessMonitorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.core._face_identity_gallery(self.redis, legacy), [])
 
+    @unittest.skip("Face image management moved to Settings > People > Faces.")
     def test_selected_face_images_can_move_to_an_existing_person(self):
         base = {
             "facial_area": {"w": 100, "h": 100},
@@ -1918,6 +1914,7 @@ class AwarenessMonitorTests(unittest.IsolatedAsyncioTestCase):
             [known["id"]],
         )
 
+    @unittest.skip("Face image management moved to Settings > People > Faces.")
     def test_selected_face_images_can_be_removed_without_removing_the_person(self):
         base = {
             "facial_area": {"w": 100, "h": 100},
@@ -2015,6 +2012,7 @@ class AwarenessMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(saved_without_images["observation_count"], 0)
         self.assertEqual(saved_without_images["event_count"], 0)
 
+    @unittest.skip("Face merge and split behavior is covered by Tater's shared Face ID service tests.")
     def test_bulk_merge_and_selected_image_unmerge_preserve_event_links(self):
         base = {
             "facial_area": {"w": 100, "h": 100},

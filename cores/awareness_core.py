@@ -24,6 +24,7 @@ from urllib.parse import quote
 import requests
 from dotenv import load_dotenv
 
+import face_identity as _shared_face_identity
 from helpers import extract_json, get_llm_client_from_env, redis_client
 try:
     from helpers import redis_blob_client as _shared_redis_blob_client
@@ -61,12 +62,14 @@ try:
 except Exception:  # pragma: no cover - compatibility with Tater versions before video understanding.
     _shared_video_analyze = None
 
-__version__ = "4.11.0"
+__version__ = "4.12.0"
+MIN_TATER_VERSION = "164"
 CORE_DESCRIPTION = (
     "Choose which cameras and sensors Tater should observe, describe camera events from images or short video clips, "
     "optionally pair sensors with cameras, retain their bounded event history, snapshots, and playable clips, "
     "answer questions about past activity, and optionally deliver the completed event with media and Face ID context. "
-    "Use Automation Core for custom notification text, announcements, and device actions."
+    "Face profiles are managed in Settings › People › Faces. Use Automation Core for custom notification text, "
+    "announcements, and device actions."
 )
 TAGS = ["awareness", "cameras", "sensors", "event-history", "vision", "video", "notifications"]
 
@@ -178,7 +181,7 @@ _EVENTS_PREFIX = "tater:automations:events:"
 _EVENT_SNAPSHOT_PREFIX = "awareness:event_snapshot:"
 _EVENT_CLIP_PREFIX = "awareness:event_clip:"
 _EVENT_CLIP_META_PREFIX = "awareness:event_clip_meta:"
-_FACE_IDENTITIES_KEY = "awareness:face_identities"
+_FACE_IDENTITIES_KEY = _shared_face_identity.SHARED_IDENTITIES_KEY
 _FACE_SESSION_PREFIX = "awareness:face_session:"
 _FACE_BURST_FRAME_COUNT = 5
 _FACE_BURST_INTERVAL_SECONDS = 1.0
@@ -726,28 +729,7 @@ def _publish_automation_event(client: Any, *, kind: str, payload: Dict[str, Any]
 
 
 def _recognized_people_for_identities(client: Any, identity_ids: List[str]) -> List[Dict[str, Any]]:
-    identities = _face_identity_rows(client)
-    recognized: List[Dict[str, Any]] = []
-    seen_people: set[str] = set()
-    for identity_id in identity_ids:
-        identity = identities.get(_text(identity_id)) or {}
-        person_id = _text(identity.get("person_id"))
-        person_name = _people_person_name(client, person_id) if person_id else ""
-        if not person_id or not person_name or person_id in seen_people:
-            continue
-        seen_people.add(person_id)
-        recognized.append(
-            {
-                "person_id": person_id,
-                "person_name": person_name,
-                "face_identity_ids": [
-                    _text(candidate_id)
-                    for candidate_id in identity_ids
-                    if _text((identities.get(_text(candidate_id)) or {}).get("person_id")) == person_id
-                ],
-            }
-        )
-    return recognized
+    return _shared_face_identity.recognized_people(identity_ids, client)
 
 
 def _publish_recognized_person_events(client: Any, session: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1239,32 +1221,11 @@ def _people_detach_face_identity(client: Any, *, person_id: str, identity_id: st
 
 
 def _face_identity_display_name(client: Any, identity: Dict[str, Any]) -> str:
-    person_id = _text(identity.get("person_id"))
-    linked_name = _people_person_name(client, person_id) if person_id else ""
-    return linked_name or _text(identity.get("name") or identity.get("person_name"))
+    return _text(_shared_face_identity.display_name(identity, client))
 
 
 def _face_runtime_status(client: Any) -> Dict[str, Any]:
-    if _face_id_runtime is None:
-        return {
-            "enabled": False,
-            "loaded": False,
-            "loading": False,
-            "state": "unavailable",
-            "error": "This Tater version does not provide the Face ID runtime.",
-            "model": "Facenet512",
-        }
-    try:
-        return dict(_face_id_runtime.status(client) or {})
-    except Exception as exc:
-        return {
-            "enabled": False,
-            "loaded": False,
-            "loading": False,
-            "state": "error",
-            "error": str(exc),
-            "model": "Facenet512",
-        }
+    return dict(_shared_face_identity.runtime_status(client) or {})
 
 
 def _face_id_enabled(client: Any) -> bool:
@@ -1272,50 +1233,12 @@ def _face_id_enabled(client: Any) -> bool:
 
 
 def _face_identity_rows(client: Any, *, cleanup: bool = False) -> Dict[str, Dict[str, Any]]:
-    redis_obj = client or redis_client
-    if redis_obj is None:
-        return {}
-    try:
-        raw_rows = redis_obj.hgetall(_FACE_IDENTITIES_KEY) or {}
-    except Exception:
-        return {}
-    rows: Dict[str, Dict[str, Any]] = {}
-    for raw_id, raw_payload in raw_rows.items():
-        identity_id = _text(raw_id)
-        try:
-            payload = json.loads(raw_payload) if isinstance(raw_payload, (str, bytes, bytearray)) else raw_payload
-        except Exception:
-            continue
-        if identity_id and isinstance(payload, dict):
-            payload["id"] = identity_id
-            rows[identity_id] = payload
-
-    if cleanup:
-        retention = _events_retention_seconds(redis_obj)
-        if retention is not None:
-            cutoff = datetime.now() - timedelta(seconds=max(60, int(retention)))
-            for identity_id, payload in list(rows.items()):
-                if _text(payload.get("name")):
-                    continue
-                last_seen = _parse_iso(payload.get("last_seen"))
-                if last_seen is not None and last_seen < cutoff:
-                    try:
-                        redis_obj.hdel(_FACE_IDENTITIES_KEY, identity_id)
-                    except Exception:
-                        pass
-                    rows.pop(identity_id, None)
-    return rows
+    del cleanup
+    return _shared_face_identity.identity_rows(client)
 
 
 def _save_face_identity(client: Any, identity: Dict[str, Any]) -> Dict[str, Any]:
-    redis_obj = client or redis_client
-    identity_id = _text(identity.get("id"))
-    if redis_obj is None or not identity_id:
-        raise ValueError("Face identity cannot be stored.")
-    payload = dict(identity)
-    payload["id"] = identity_id
-    redis_obj.hset(_FACE_IDENTITIES_KEY, identity_id, json.dumps(payload))
-    return payload
+    return _shared_face_identity.save_identity(identity, client)
 
 
 def _face_session_key(session_id: str) -> str:
@@ -1622,81 +1545,15 @@ def _record_face_detection(
     *,
     event_id: str,
     seen_at: str,
+    source: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    embedding_raw = detection.get("embedding")
-    if not isinstance(embedding_raw, list) or not embedding_raw:
-        raise ValueError("Face result did not include an embedding.")
-    embedding = [float(value) for value in embedding_raw]
-    area = detection.get("facial_area") if isinstance(detection.get("facial_area"), dict) else {}
-    confidence = _as_float(detection.get("confidence"), 0.0)
-    area_pixels = max(1, _as_int(area.get("w"), 1, minimum=1) * _as_int(area.get("h"), 1, minimum=1))
-    quality = max(0.0, confidence) + min(2.0, area_pixels / 100_000.0)
-    threshold = _as_float(getattr(_face_id_runtime, "MATCH_THRESHOLD", 0.30), 0.30)
-
-    with _FACE_IDENTITY_LOCK:
-        identities = _face_identity_rows(client, cleanup=True)
-        identity_id, distance = _face_match_identity(identities, embedding, threshold=threshold)
-        identity = dict(identities.get(identity_id) or {})
-        created_identity = not identity_id
-        if not identity_id:
-            identity_id = f"face_{uuid.uuid4().hex[:16]}"
-            identity = {
-                "id": identity_id,
-                "name": "",
-                "created_at": seen_at,
-                "first_seen": seen_at,
-                "observation_count": 0,
-                "event_count": 0,
-                "centroid": embedding,
-                "centroid_count": 0,
-                "reference_centroids": [embedding],
-                "best_quality": 0.0,
-            }
-            distance = 0.0
-
-        existing_observations = _face_observations(identity)
-        if not created_identity and not existing_observations and not identity.get("anchor_references"):
-            legacy_references = _face_reference_embeddings(identity)
-            if legacy_references:
-                identity["anchor_references"] = legacy_references
-
-        centroid = identity.get("centroid") if isinstance(identity.get("centroid"), list) else embedding
-        centroid_count = _as_int(identity.get("centroid_count"), 0, minimum=0)
-        if centroid_count <= 0 or len(centroid) != len(embedding):
-            next_centroid = embedding
-            next_count = 1
-        else:
-            next_count = centroid_count + 1
-            next_centroid = [
-                ((float(old) * centroid_count) + float(new)) / next_count
-                for old, new in zip(centroid, embedding)
-            ]
-        identity["centroid"] = next_centroid
-        identity["centroid_count"] = next_count
-        identity["observation_count"] = _as_int(identity.get("observation_count"), 0, minimum=0) + 1
-        if _text(identity.get("last_event_id")) != event_id:
-            identity["event_count"] = _as_int(identity.get("event_count"), 0, minimum=0) + 1
-            identity["last_event_id"] = event_id
-        identity["last_seen"] = seen_at
-        identity["last_distance"] = round(max(0.0, float(distance)), 5)
-        observations = existing_observations
-        observations.insert(
-            0,
-            _face_detection_observation(
-                detection,
-                embedding=embedding,
-                event_id=event_id,
-                seen_at=seen_at,
-                quality=quality,
-            ),
-        )
-        identity["observations"] = observations[:_FACE_OBSERVATION_LIMIT]
-        if quality >= _as_float(identity.get("best_quality"), 0.0) and _text(detection.get("crop_b64")):
-            identity["best_quality"] = round(quality, 5)
-            identity["face_b64"] = _text(detection.get("crop_b64"))
-            identity["face_content_type"] = _text(detection.get("crop_content_type") or "image/jpeg")
-        identity["reference_centroids"] = _curate_face_reference_embeddings(identity)
-        return _save_face_identity(client, identity)
+    return _shared_face_identity.record_detection(
+        detection,
+        event_id=event_id,
+        seen_at=seen_at,
+        source=source,
+        redis_client=client,
+    )
 
 
 def _face_event_context(client: Any, event: Dict[str, Any]) -> Dict[str, Any]:
@@ -1705,11 +1562,11 @@ def _face_event_context(client: Any, event: Dict[str, Any]) -> Dict[str, Any]:
     if not session_id:
         return {}
     session = _load_face_session(client, session_id)
-    identity_ids = [
-        token
-        for token in [_text(value) for value in session.get("identity_ids") or []]
-        if token
-    ]
+    identity_ids = _shared_face_identity.identity_ids_for_event(
+        event.get("id"),
+        session.get("identity_ids") or [],
+        client,
+    )
     identities = _face_identity_rows(client)
     known_people: List[str] = []
     recognized_people: List[str] = []
@@ -1718,8 +1575,8 @@ def _face_event_context(client: Any, event: Dict[str, Any]) -> Dict[str, Any]:
     for identity_id in identity_ids:
         identity = identities.get(identity_id) or {}
         person_id = _text(identity.get("person_id"))
-        linked_name = _people_person_name(client, person_id) if person_id else ""
-        name = linked_name or _text(identity.get("name") or identity.get("person_name"))
+        linked_name = _shared_face_identity.person_name(person_id, client) if person_id else ""
+        name = _shared_face_identity.display_name(identity, client)
         if name and name.casefold() not in {item.casefold() for item in known_people}:
             known_people.append(name)
         elif not name:
@@ -1880,6 +1737,12 @@ async def _run_face_burst(
                     detection,
                     event_id=_text(session.get("event_id")),
                     seen_at=_now_iso(),
+                    source={
+                        "owner": "awareness",
+                        "provider": provider,
+                        "camera_target": camera_target,
+                        "area": _text(session.get("area")),
+                    },
                 )
             except Exception as exc:
                 errors.append(_compact(str(exc), limit=180))
@@ -7105,7 +6968,6 @@ def _awareness_manager_ui(client: Any) -> Dict[str, Any]:
     registry = _monitor_registry(client)
     event_page = _event_page_for_ui(client)
     event_forms = list(event_page.get("items") or [])
-    face_forms = _face_identity_forms(client)
     monitor_forms = [
         _monitor_form(monitor, registry, client)
         for monitor in sorted(
@@ -7216,14 +7078,6 @@ def _awareness_manager_ui(client: Any) -> Dict[str, Any]:
                     "total": _as_int(event_page.get("total"), 0, minimum=0),
                 },
                 "empty_message": "No stored awareness events found.",
-            },
-            {
-                "key": "faces",
-                "label": "Face ID",
-                "source": "items",
-                "item_group": "face_person",
-                "selector": False,
-                "empty_message": "No faces captured yet.",
             },
             {
                 "key": "monitors",
@@ -7434,7 +7288,7 @@ def _awareness_manager_ui(client: Any) -> Dict[str, Any]:
                 },
             ],
         },
-        "item_forms": [*event_forms, *face_forms, *monitor_forms],
+        "item_forms": [*event_forms, *monitor_forms],
     }
 
 
@@ -7453,7 +7307,7 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
     known_people = sum(1 for identity in face_identities.values() if _face_identity_display_name(client, identity))
     face_state = _text(face_runtime.get("state") or "disabled").replace("_", " ").title()
     return {
-        "summary": "Choose the cameras and sensors Awareness should observe, review recognized faces, and browse the history it stores.",
+        "summary": "Choose the cameras and sensors Awareness should observe and browse the history it stores. Manage recognized faces in Settings › People › Faces.",
         "stats": [
             {"label": "Monitored Sources", "value": len(monitors)},
             {"label": "Active", "value": enabled_count},
@@ -7534,137 +7388,6 @@ def handle_htmlui_tab_action(*, action: str, payload: Dict[str, Any], redis_clie
             "page": requested_page,
             "page_size": requested_page_size,
         }
-    if action_name == "awareness_merge_face_identities":
-        requested_ids = _monitor_string_list(
-            _value(values, body, "identity_ids", body.get("ids") or [])
-        )
-        identities = _face_identity_rows(client)
-        identity_ids = list(dict.fromkeys(value for value in requested_ids if value in identities))
-        if len(identity_ids) < 2:
-            raise ValueError("Select at least two people to merge.")
-        named_ids = [value for value in identity_ids if _face_identity_display_name(client, identities.get(value) or {})]
-        target_id = named_ids[0] if named_ids else identity_ids[0]
-        merged_count = 0
-        for source_id in identity_ids:
-            if source_id == target_id:
-                continue
-            _merge_face_identities(client, source_id, target_id)
-            merged_count += 1
-        target = _face_identity_rows(client).get(target_id) or {}
-        _refresh_stored_face_events(client)
-        target_label = _face_identity_display_name(client, target) or "one unknown person"
-        return {
-            "ok": True,
-            "id": target_id,
-            "merged": merged_count,
-            "message": f"Selected faces merged into {target_label}.",
-        }
-    if action_name == "awareness_unmerge_face_observations":
-        identity_id = _text(body.get("id"))
-        observation_ids = _monitor_string_list(_value(values, body, "observation_ids", []))
-        result = _unmerge_face_observations(client, identity_id, observation_ids)
-        _refresh_stored_face_events(client)
-        return {
-            "ok": True,
-            "id": _text((result.get("split") or {}).get("id")),
-            "moved": _as_int(result.get("moved"), 0, minimum=0),
-            "message": "Selected images moved into a separate unknown person.",
-        }
-    if action_name == "awareness_move_face_images":
-        identity_id = _text(body.get("id"))
-        target_identity_id = _text(_value(values, body, "target_identity_id", ""))
-        observation_ids = _monitor_string_list(_value(values, body, "observation_ids", []))
-        result = _move_face_images(client, identity_id, target_identity_id, observation_ids)
-        _refresh_stored_face_events(client)
-        target = result.get("target") if isinstance(result.get("target"), dict) else {}
-        target_label = _face_identity_display_name(client, target) or f"Unknown face · {_text(target.get('id'))[-6:]}"
-        moved = _as_int(result.get("moved"), 0, minimum=0)
-        return {
-            "ok": True,
-            "id": _text(target.get("id")),
-            "moved": moved,
-            "source_removed": bool(result.get("source_removed")),
-            "message": f"Moved {moved} image{'s' if moved != 1 else ''} to {target_label}.",
-        }
-    if action_name == "awareness_remove_face_images":
-        identity_id = _text(body.get("id"))
-        observation_ids = _monitor_string_list(_value(values, body, "observation_ids", []))
-        result = _remove_face_images(client, identity_id, observation_ids)
-        _refresh_stored_face_events(client)
-        removed = _as_int(result.get("removed"), 0, minimum=0)
-        return {
-            "ok": True,
-            "id": identity_id,
-            "removed": removed,
-            "message": f"Removed {removed} selected image{'s' if removed != 1 else ''}. The person was kept.",
-        }
-    if action_name == "awareness_save_face_identity":
-        identity_id = _text(body.get("id"))
-        name = " ".join(_text(_value(values, body, "name", "")).split())
-        person_link_supplied = "person_id" in values or "person_id" in body
-        requested_person_id = _text(_value(values, body, "person_id", "")) if person_link_supplied else ""
-        if len(name) > 80:
-            raise ValueError("Person name must be 80 characters or fewer.")
-        merge_into = _text(_value(values, body, "merge_into", ""))
-        if merge_into and merge_into != identity_id:
-            identity = _merge_face_identities(client, identity_id, merge_into)
-            identity_id = _text(identity.get("id"))
-        with _FACE_IDENTITY_LOCK:
-            identities = _face_identity_rows(client)
-            identity = dict(identities.get(identity_id) or {})
-            if not identity:
-                raise KeyError("Face identity not found.")
-            previous_person_id = _text(identity.get("person_id"))
-            if person_link_supplied and requested_person_id:
-                linked_name = _people_person_name(client, requested_person_id)
-                if not linked_name:
-                    raise ValueError("Choose an existing Tater Person.")
-                _people_attach_face_identity(
-                    client,
-                    person_id=requested_person_id,
-                    identity_id=identity_id,
-                    label=linked_name,
-                )
-                if previous_person_id and previous_person_id != requested_person_id:
-                    _people_detach_face_identity(
-                        client,
-                        person_id=previous_person_id,
-                        identity_id=identity_id,
-                    )
-                identity["person_id"] = requested_person_id
-                identity["person_name"] = linked_name
-                identity["name"] = linked_name
-            elif person_link_supplied:
-                if previous_person_id:
-                    _people_detach_face_identity(
-                        client,
-                        person_id=previous_person_id,
-                        identity_id=identity_id,
-                    )
-                identity.pop("person_id", None)
-                identity.pop("person_name", None)
-                identity["name"] = name
-            elif not merge_into:
-                identity["name"] = name
-            identity["updated_at"] = _now_iso()
-            identity = _save_face_identity(client, identity)
-        _refresh_stored_face_events(client)
-        saved_name = _face_identity_display_name(client, identity)
-        return {
-            "ok": True,
-            "id": identity_id,
-            "name": saved_name,
-            "person_id": _text(identity.get("person_id")),
-            "message": f"Face linked to {saved_name}." if _text(identity.get("person_id")) else (
-                f"Face saved as {saved_name}." if saved_name else "Face sorting updated."
-            ),
-        }
-    if action_name == "awareness_remove_face_identity":
-        identity_id = _text(body.get("id"))
-        if not _remove_face_identity(client, identity_id):
-            raise KeyError("Face identity not found.")
-        _refresh_stored_face_events(client)
-        return {"ok": True, "id": identity_id, "message": "Face identity removed."}
     if action_name == "awareness_add_monitor":
         monitor = _build_monitor_from_values(values=values, payload=body, client=client)
         monitor = _save_monitor(client, monitor)
