@@ -864,11 +864,28 @@ class AutomationCoreTests(unittest.IsolatedAsyncioTestCase):
         press_event = {
             "provider": "unifi_protect",
             "kind": "protect_event",
-            "payload": {"type": "ring", "device": "doorbell-front"},
+            "payload": {
+                "id": "protect-ring-1",
+                "modelKey": "event",
+                "type": "ring",
+                "start": 1_787_494_112_506,
+                "end": 1_787_494_122_506,
+                "device": "doorbell-front",
+            },
+        }
+        removed_press_event = {
+            "provider": "unifi_protect",
+            "kind": "protect_event",
+            "payload": {
+                **press_event["payload"],
+                "__ws_action": "remove",
+            },
         }
 
         self.assertFalse(self.core._event_match(rule, motion_event, sample_registry())[0])
+        self.assertTrue(self.core._event_is_terminal(press_event))
         self.assertTrue(self.core._event_match(rule, press_event, sample_registry())[0])
+        self.assertFalse(self.core._event_match(rule, removed_press_event, sample_registry())[0])
 
     def test_unifi_back_door_open_state_change_matches_selected_sensor(self):
         device_id = "66097deb01fbe603e405bbf6"

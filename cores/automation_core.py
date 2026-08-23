@@ -40,7 +40,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _tater_agent_lab_path = None
 
 
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 MIN_TATER_VERSION = "98"
 CORE_DESCRIPTION = (
     "Build simple event-to-action automations from Tater's shared integration categories, "
@@ -1811,6 +1811,12 @@ def _event_is_terminal(event: Dict[str, Any]) -> bool:
     return False
 
 
+def _event_is_removed(event: Dict[str, Any]) -> bool:
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    action = _token(payload.get("__ws_action") or payload.get("action"))
+    return action in {"remove", "delete", "deleted"}
+
+
 def _event_match(rule: Dict[str, Any], event: Dict[str, Any], registry: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
     devices = _matching_devices(event, registry)
     categories = set(_heuristic_categories(event))
@@ -1874,7 +1880,12 @@ def _event_match(rule: Dict[str, Any], event: Dict[str, Any], registry: Dict[str
     elif trigger == "disconnects":
         matched = "disconnected" in kind or "missing" in kind or state in {"disconnected", "offline", "away"}
     elif trigger == "doorbell":
-        matched = not _event_is_terminal(event) and any(
+        # Protect can publish a single, completed ring record containing both
+        # start and end timestamps. A doorbell press is momentary, so that end
+        # timestamp describes the press instead of cancelling it. Continue to
+        # ignore records explicitly removed from Protect; the rule cooldown
+        # suppresses repeated updates for the same press.
+        matched = not _event_is_removed(event) and any(
             word in signal_haystack for word in ("doorbell", "ring", "pressed", "button_press")
         )
     elif trigger == "recognized_person":
