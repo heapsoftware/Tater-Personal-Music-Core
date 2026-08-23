@@ -1905,13 +1905,7 @@ class MusicCoreTests(unittest.TestCase):
         self.assertEqual(player["track_list_label"], "Playlist")
         self.assertEqual(player["track_list_action"], "music_ui_queue_play")
         self.assertEqual(player["track_list_shuffle_action"], "music_ui_set_shuffle")
-        self.assertEqual(player["playback"]["seek_action"], "music_ui_seek")
-        self.assertEqual(
-            player["playback"]["seek_relative_action"],
-            "music_ui_seek_relative",
-        )
-        self.assertEqual(player["playback"]["seek_step_seconds"], 15)
-        self.assertFalse(player["playback"]["seekable"])
+        self.assertNotIn("playback", player)
         self.assertEqual(
             [row["action"] for row in player["actions"]],
             [
@@ -2495,8 +2489,7 @@ class MusicCoreTests(unittest.TestCase):
             "tater_tube",
             {},
         )
-        self.assertEqual(item["playback"]["status"], "stopped")
-        self.assertEqual(item["playback"]["position_seconds"], 92)
+        self.assertNotIn("playback", item)
         self.assertEqual(item["actions"][1]["action"], "music_ui_play")
 
         with patch.object(
@@ -2793,7 +2786,7 @@ class MusicCoreTests(unittest.TestCase):
         toggle = item["actions"][1]
         self.assertEqual(toggle["action"], "music_ui_play")
         self.assertEqual(toggle["aria_label"], "Resume music")
-        self.assertEqual(item["playback"]["position_seconds"], 67.0)
+        self.assertNotIn("playback", item)
 
         with patch.object(
             self.core,

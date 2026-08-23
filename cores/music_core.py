@@ -30,7 +30,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.4.5"
+__version__ = "3.4.6"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
     "Connect Tater Tube Server to Tater; browse music, build AI-named recommendations from listening history, and keep "
@@ -4722,10 +4722,6 @@ def _player_item(
     queue = player.get("queue") if isinstance(player.get("queue"), list) else []
     queue_count = len(queue)
     current_index = _as_int(player.get("index"), -1, -1, max(0, queue_count - 1))
-    duration_seconds = max(0.0, _as_float(player.get("duration_seconds")))
-    position_seconds = _player_position_seconds(player)
-    if duration_seconds > 0:
-        position_seconds = min(duration_seconds, position_seconds)
     track_list = [
         {
             "id": f"queue:{index}",
@@ -4829,16 +4825,6 @@ def _player_item(
         ),
         "hero_image_src": _artwork_display_url(current),
         "hero_image_alt": f"{_track_label(current) if current else 'Music'} artwork",
-        "playback": {
-            "status": status.lower(),
-            "position_seconds": position_seconds,
-            "duration_seconds": duration_seconds,
-            "position_updated_at": time.time(),
-            "seekable": bool(current and duration_seconds > 0),
-            "seek_action": "music_ui_seek",
-            "seek_relative_action": "music_ui_seek_relative",
-            "seek_step_seconds": 15,
-        },
         "hero_badges": [
             {
                 "label": status,
