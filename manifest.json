@@ -48,7 +48,7 @@
         "integration"
       ],
       "entry": "verba/battery_status.py",
-      "sha256": "486de482f0390c4f26ee23d04656c621db8613955a86fc5ffa75cda32819a220"
+      "sha256": "f65b7a42bbaea9a2baa09315e42e3379ed55eeeecc8b67b3e57607b6da3d54cc"
     },
     {
       "id": "broadcast",
@@ -106,7 +106,7 @@
         "integration"
       ],
       "entry": "verba/camera_control.py",
-      "sha256": "181925ed12cd5a75b3b01d503149f49b9b8fea2352af50d193ecfa5b3e22d20d"
+      "sha256": "03110c5a9eb855f9588d7f8bcfac55db53340d0208edf993f925f46a48433b95"
     },
     {
       "id": "comfyui_audio_ace",
@@ -244,7 +244,7 @@
     {
       "id": "device_control",
       "name": "Device Control",
-      "version": "1.0.3",
+      "version": "1.0.4",
       "min_tater_version": "98.4",
       "description": "Use for any request to control or check smart-home devices across integrations, including lights, switches, plugs, fans, covers, garage doors, locks, thermostats, media players, remotes, scenes, and scripts. Use Camera Control for cameras and snapshots.",
       "portals": [
@@ -272,7 +272,7 @@
         "plug"
       ],
       "entry": "verba/device_control.py",
-      "sha256": "585ba9fd9fe58191988cc66c3ec5fd00e069864b8c2384983b35b146c80c8f2e"
+      "sha256": "ad942527c21964919d1be651085d07c3790c287e8d564e2c7669b2f7971e87a0"
     },
     {
       "id": "discord_admin_response_mode",
@@ -358,7 +358,7 @@
         "integration"
       ],
       "entry": "verba/energy_status.py",
-      "sha256": "7db2b7e1ca8bfebef15583a642ebe90ae781f4caed599e8bf3ad721d0960afff"
+      "sha256": "9911644ccdc6892dc8984685c99bf9c13eefaf928a2ab1bd8b0263c7ead95a7b"
     },
     {
       "id": "entry_sensor_status",
@@ -390,7 +390,7 @@
         "integration"
       ],
       "entry": "verba/entry_sensor_status.py",
-      "sha256": "e35fbe425758caf43335ada3e569b54d779dae11d5a089d119cbdab72366ab5c"
+      "sha256": "6a4c540b6514a327941320f0099fd4db228b2c4f2a9d03e8e928c62f914fa017"
     },
     {
       "id": "find_my_phone",
@@ -491,7 +491,7 @@
         "integration"
       ],
       "entry": "verba/humidity_status.py",
-      "sha256": "0a347a65c5d995f09a13ca732d2fb90688b9f66699199104e6965259497cdf5b"
+      "sha256": "58459e7913e7d352087b6accbc4f50a39fee4e136f1ee8e7fce0228d713b1e2f"
     },
     {
       "id": "illuminance_status",
@@ -523,7 +523,7 @@
         "integration"
       ],
       "entry": "verba/illuminance_status.py",
-      "sha256": "5df76c6e7db60bb685d30efedbcb87c2a5549028c35a6b62ae8409ee0dc4bbb6"
+      "sha256": "8aa1dda2f760d418d3be322d4dce3e6025290d95bd3a0af4b1159f9c5c724edf"
     },
     {
       "id": "irc_admin_op",
@@ -696,7 +696,7 @@
         "integration"
       ],
       "entry": "verba/leak_status.py",
-      "sha256": "6d0d2f4d13f9e7410557bd49094be3cb1bc320ec7135d8f05250ca5bf46854c0"
+      "sha256": "4346eec6ee6ebd42b617ec403d2e83a3cdfdd2697585b764efa4c7866b2a2a37"
     },
     {
       "id": "lowfi_video",
@@ -865,7 +865,7 @@
         "integration"
       ],
       "entry": "verba/motion_status.py",
-      "sha256": "80c76e8a0fe7d551f751509f255f522cf45f7eeb257edab9f846b0cf7dca9801"
+      "sha256": "279d8b0e335167facc36962d886fec732a6a59336a32ba0549cbccfa8921925f"
     },
     {
       "id": "music_assistant",
@@ -922,7 +922,7 @@
         "integration"
       ],
       "entry": "verba/network_device_status.py",
-      "sha256": "00435dc0773685654d484e85f8b43872fdea6c03bedc69f5378309592fa46d84"
+      "sha256": "6627a6f1fa30796f3a18ec8ded624d18e0416e1630cb20ca140435b7f0b5479d"
     },
     {
       "id": "obsidian_note",
@@ -1188,7 +1188,7 @@
         "integration"
       ],
       "entry": "verba/presence_status.py",
-      "sha256": "a9d56a6601f7ec4234aa341664841c8469c3ef294f677d9664d3591a0db74dba"
+      "sha256": "ca53940aa0367078ca03d76c0ec8095fc7845e653f61f1811ad3965adb4b758e"
     },
     {
       "id": "reachy_sleep",
@@ -1293,7 +1293,7 @@
         "integration"
       ],
       "entry": "verba/sensor_status.py",
-      "sha256": "16bad3cd6c5d83608d1be42dad0307215b55e7f8fd7755f2c7695dce4abd6577"
+      "sha256": "6f87a467f0cd798cf1547161e6a253dc38f5bf62fc49a1da7781ea3015369aa4"
     },
     {
       "id": "sftpgo_account",
@@ -1389,7 +1389,7 @@
         "integration"
       ],
       "entry": "verba/temperature_status.py",
-      "sha256": "81b0bf2833a79847ac28324807273bbe35f7b0cdbf7ba99f14e9817ba04bc68a"
+      "sha256": "4d17e39ffcb9913d2068435cc9fd25c4dfbef6dc8ee42c85c214af7b889d64e0"
     },
     {
       "id": "unifi_network_health",

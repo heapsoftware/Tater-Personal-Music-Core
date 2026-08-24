@@ -128,7 +128,7 @@ class StandaloneCategoryVerbaTests(unittest.TestCase):
                     row["version"],
                     {
                         "camera_control": "1.0.3",
-                        "device_control": "1.0.3",
+                        "device_control": "1.0.4",
                     }.get(verba_id, "1.0.1"),
                 )
                 self.assertEqual(row["min_tater_version"], "98.4")
@@ -157,7 +157,7 @@ class DeviceControlVerbaTests(unittest.TestCase):
     def test_manifest_facing_metadata_is_explicit(self) -> None:
         plugin = device_control_module.DeviceControlPlugin()
 
-        self.assertEqual(plugin.version, "1.0.3")
+        self.assertEqual(plugin.version, "1.0.4")
         self.assertEqual(plugin.min_tater_version, "98.4")
         self.assertIn("voice_core", plugin.platforms)
         self.assertIn("webui", plugin.platforms)
@@ -375,6 +375,14 @@ class UnifiedDeviceSelectionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(intent["action"], "set_brightness")
         self.assertEqual(intent["brightness_pct"], 30)
+        self.assertEqual([row["id"] for row in selected], ["light.floor"])
+        self.assertEqual(needs, [])
+
+    async def test_turn_on_with_brightness_uses_brightness_action(self) -> None:
+        intent, selected, needs = await self._resolve("Turn on the living room lights to 20% brightness")
+
+        self.assertEqual(intent["action"], "set_brightness")
+        self.assertEqual(intent["brightness_pct"], 20)
         self.assertEqual([row["id"] for row in selected], ["light.floor"])
         self.assertEqual(needs, [])
 

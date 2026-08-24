@@ -570,6 +570,12 @@ class _DeviceVerbaRuntime(ToolVerba):
                 if not command:
                     command = self._text(ai.get("command"))
 
+        # Preserve explicit dimming requests even when the wording also says
+        # "turn on". Some integrations intentionally ignore brightness on a
+        # plain turn_on action, so use the capability-specific action instead.
+        if action == "turn_on" and brightness is not None and "set_brightness" in self.allowed_actions:
+            action = "set_brightness"
+
         if not target:
             target_query = query
             if action == "set_color":
