@@ -15,7 +15,7 @@ from urllib.parse import parse_qsl, quote
 from helpers import extract_json, redis_client
 from tateros import integration_store as integration_store_module
 
-__version__ = "1.4.19"
+__version__ = "1.4.20"
 MIN_TATER_VERSION = "59"
 CORE_DESCRIPTION = "Local environment telemetry receiver for weather stations and configured sensor integrations."
 TAGS = ["environment", "weather", "ecowitt", "telemetry"]
@@ -193,6 +193,44 @@ HYDRA_WEATHER_CATEGORIES = {
     "solar",
     "temperature",
     "wind",
+}
+
+HYDRA_DEFAULT_CURRENT_AREA_ALIASES = {
+    "",
+    "around_me",
+    "at_home",
+    "current_location",
+    "here",
+    "home",
+    "local",
+    "local_area",
+    "locally",
+    "my_area",
+    "my_home",
+    "my_location",
+    "near_me",
+    "our_area",
+    "our_home",
+    "our_location",
+    "out_there",
+    "outdoors",
+    "outside",
+    "this_area",
+    "this_location",
+    "where_i_am",
+    "where_we_are",
+}
+
+HYDRA_CURRENT_PRIMARY_KEYS = {
+    "condition": ("weather_api_condition",),
+    "temperature": ("tempf", "tempc"),
+    "humidity": ("humidity",),
+    "wind": ("windspeedmph", "weather_api_wind_kph"),
+    "rain": ("rainratein", "weather_api_precip_mm"),
+    "pressure": ("baromrelin", "weather_api_pressure_mb"),
+    "solar": ("uv", "solarradiation"),
+    "air": ("weather_api_aqi_us_epa", "weather_api_pm25", "pm25_ch1"),
+    "lightning": ("lightning_num", "lightning"),
 }
 
 
@@ -5121,11 +5159,118 @@ def _hydra_forecast_payload(args: Dict[str, Any], client: Any, payload: Dict[str
     }
 
 
+def _hydra_uses_configured_current_sources(args: Dict[str, Any]) -> bool:
+    if _hydra_forecast_requested(args):
+        return False
+    if any(_text(args.get(key)) for key in ("provider", "source", "integration", "sensor", "query")):
+        return False
+    area = _clean_key(args.get("area") or args.get("room") or args.get("location"))
+    if area not in HYDRA_DEFAULT_CURRENT_AREA_ALIASES:
+        return False
+    category = _clean_key(args.get("category") or args.get("type") or args.get("measurement"))
+    return not category or category == "weather" or category in HYDRA_WEATHER_CATEGORIES
+
+
+def _hydra_primary_current_reading(snapshot: Dict[str, Any], category: str) -> Optional[Dict[str, Any]]:
+    wanted = _clean_key(category)
+    rows = [
+        row
+        for row in snapshot.get("readings") or []
+        if isinstance(row, dict) and _clean_key(row.get("category")) == wanted
+    ]
+    if not rows:
+        return None
+    for key in HYDRA_CURRENT_PRIMARY_KEYS.get(wanted, ()):
+        match = next((row for row in rows if _clean_key(row.get("key")) == key), None)
+        if match is not None:
+            return match
+
+    def fallback_order(row: Dict[str, Any]) -> Tuple[int, int, str]:
+        area = _clean_key(row.get("area"))
+        label = _clean_key(row.get("label"))
+        indoor = int(area in {"inside", "indoor"} or "indoor" in label)
+        derived = int(any(token in label for token in ("dew_point", "feels_like", "heat_index", "wind_chill")))
+        return indoor, derived, label
+
+    return min(rows, key=fallback_order)
+
+
+def _hydra_configured_current_snapshot(payload: Dict[str, Any]) -> Dict[str, Any]:
+    combined = payload.get("snapshot") if isinstance(payload.get("snapshot"), dict) else {}
+    settings = payload.get("settings") if isinstance(payload.get("settings"), dict) else {}
+    provider_snapshots = payload.get("provider_snapshots") if isinstance(payload.get("provider_snapshots"), dict) else {}
+    selected_sensors = payload.get("selected_sensors") if isinstance(payload.get("selected_sensors"), list) else []
+    live_source = _text(settings.get("current_live_source")) or "provider:ecowitt"
+    condition_source = _text(settings.get("current_condition_source")) or "provider:weather_api"
+    live_snapshot = _display_snapshot_for_source(
+        live_source,
+        combined,
+        provider_snapshots,
+        selected_sensors,
+    )
+    condition_snapshot = _display_snapshot_for_source(
+        condition_source,
+        combined,
+        provider_snapshots,
+        selected_sensors,
+    )
+    if not live_snapshot:
+        live_snapshot = condition_snapshot or combined
+    if not condition_snapshot:
+        condition_snapshot = live_snapshot
+
+    readings: List[Dict[str, Any]] = []
+    for category in HYDRA_CURRENT_PRIMARY_KEYS:
+        source_snapshot = condition_snapshot if category == "condition" else live_snapshot
+        row = _hydra_primary_current_reading(source_snapshot, category)
+        if row is not None:
+            readings.append(dict(row))
+
+    def source_label(snapshot: Dict[str, Any], source: str) -> str:
+        return (
+            _text(snapshot.get("model"))
+            or _text(snapshot.get("stationtype"))
+            or _provider_label(snapshot.get("provider"))
+            or source
+        )
+
+    received_values = [
+        value
+        for value in (_as_float(live_snapshot.get("received_at")), _as_float(condition_snapshot.get("received_at")))
+        if value is not None
+    ]
+    received_at = max(received_values) if received_values else _as_float(combined.get("received_at")) or time.time()
+    current_sources = {
+        "readings": {
+            "selection": live_source,
+            "label": source_label(live_snapshot, live_source),
+        },
+        "conditions": {
+            "selection": condition_source,
+            "label": source_label(condition_snapshot, condition_source),
+        },
+    }
+    return {
+        "provider": "environment",
+        "source_id": "environment:configured_current",
+        "model": current_sources["readings"]["label"],
+        "received_at": received_at,
+        "sample_time": received_at,
+        "readings": readings,
+        "current_sources": current_sources,
+    }
+
+
 def _environment_conditions_kernel(args: Dict[str, Any], client: Any = None, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     payload = payload if isinstance(payload, dict) else _hydra_environment_payload(client)
     if _hydra_forecast_requested(args):
         return _hydra_forecast_payload(args, client or redis_client, payload)
-    snapshot = payload.get("snapshot") if isinstance(payload.get("snapshot"), dict) else {}
+    use_configured_sources = _hydra_uses_configured_current_sources(args)
+    snapshot = (
+        _hydra_configured_current_snapshot(payload)
+        if use_configured_sources
+        else (payload.get("snapshot") if isinstance(payload.get("snapshot"), dict) else {})
+    )
     if not snapshot:
         return {
             "tool": "environment_conditions",
@@ -5133,17 +5278,30 @@ def _environment_conditions_kernel(args: Dict[str, Any], client: Any = None, pay
             "error": "No Environment Core readings are available.",
             "summary_for_user": "I do not have Environment Core readings yet.",
         }
-    readings = [_hydra_reading_row(row) for row in _hydra_relevant_readings(snapshot, args)]
-    last = _age_label(payload.get("received_at"))
+    effective_args = dict(args or {})
+    if use_configured_sources:
+        for key in ("area", "room", "location"):
+            if _clean_key(effective_args.get(key)) in HYDRA_DEFAULT_CURRENT_AREA_ALIASES:
+                effective_args.pop(key, None)
+    readings = [_hydra_reading_row(row) for row in _hydra_relevant_readings(snapshot, effective_args)]
+    last = _age_label(snapshot.get("received_at") or payload.get("received_at"))
     stale = bool(payload.get("stale"))
-    prefix = f"Environment readings were last updated {last}" + (" and may be stale." if stale else ".")
+    current_sources = snapshot.get("current_sources") if isinstance(snapshot.get("current_sources"), dict) else {}
+    readings_source = current_sources.get("readings") if isinstance(current_sources.get("readings"), dict) else {}
+    source_label = _text(readings_source.get("label"))
+    prefix = (
+        f"Current Environment readings from {source_label} were last updated {last}"
+        if use_configured_sources and source_label
+        else f"Environment readings were last updated {last}"
+    ) + (" and may be stale." if stale else ".")
     return {
         "tool": "environment_conditions",
         "ok": True,
         "stale": stale,
         "last_sample": last,
-        "filters": {key: args.get(key) for key in ("area", "room", "location", "category", "provider", "source", "integration", "sensor", "query") if args.get(key)},
+        "filters": {key: effective_args.get(key) for key in ("area", "room", "location", "category", "provider", "source", "integration", "sensor", "query") if effective_args.get(key)},
         "readings": readings,
+        "current_sources": current_sources,
         "sources": payload.get("provider_status") or [],
         "summary_for_user": _hydra_summary_from_readings(readings, prefix=prefix),
     }
@@ -5189,8 +5347,8 @@ def get_hydra_kernel_tools(*, platform: str = "", **_kwargs) -> List[Dict[str, A
     return [
         {
             "id": "environment_conditions",
-            "description": "Read live local weather, environment sensor readings, and WeatherAPI forecast data from Environment Core. Use this for current weather, temperature, humidity, wind, rain, rain chance, tomorrow/tonight/weekly forecasts, and selected sensor readings.",
-            "usage": '{"function":"environment_conditions","arguments":{"request":"What is tomorrow\'s forecast?"}}',
+            "description": "Read local current weather from Environment Core using the same configured Current Card Readings Source and Artwork Source shown in its UI. Use this first for weather here, at home, outside, current temperature, humidity, wind, or rain. Explicit room, sensor, or integration requests search matching sources, while tomorrow/tonight/weekly forecasts use the configured forecast provider.",
+            "usage": '{"function":"environment_conditions","arguments":{"request":"What is the temperature outside right now?"}}',
         },
         {
             "id": "environment_sensors",

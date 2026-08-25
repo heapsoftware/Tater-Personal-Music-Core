@@ -61,8 +61,9 @@ class XBMCInstalledGamesTests(unittest.TestCase):
 
         self.assertIn("- Halo 2", context)
         self.assertIn("- Fable", context)
-        self.assertIn("use the exact title", context)
-        self.assertIn("ask whether to launch it", context)
+        context_lower = context.lower()
+        self.assertIn("use the exact titles", context_lower)
+        self.assertIn("ask which one to launch", context_lower)
 
     def test_empty_or_invalid_payload_adds_no_context(self) -> None:
         build_context = self.helpers["_installed_games_context"]

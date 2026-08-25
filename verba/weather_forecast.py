@@ -17,6 +17,36 @@ load_dotenv()
 logger = logging.getLogger("weather_forecast")
 logger.setLevel(logging.INFO)
 
+_DEFAULT_LOCATION_ALIASES = {
+    "default",
+    "default location",
+    "the default",
+    "use default",
+    "my default",
+    "home",
+    "my home",
+    "our home",
+    "at home",
+    "outside",
+    "outdoors",
+    "out there",
+    "here",
+    "near me",
+    "around me",
+    "local",
+    "locally",
+    "local area",
+    "my location",
+    "our location",
+    "current location",
+    "this location",
+    "my area",
+    "our area",
+    "this area",
+    "where i am",
+    "where we are",
+}
+
 
 def _weather_api_module():
     return integration_store_module.integration_module("weather_api")
@@ -65,7 +95,7 @@ class WeatherForecastPlugin(ToolVerba):
 
     name = "weather_forecast"
     verba_name = "Weather Forecast"
-    version = "1.1.11"
+    version = "1.1.12"
     min_tater_version = "59"
     routing_keywords = [
         "weather",
@@ -80,9 +110,9 @@ class WeatherForecastPlugin(ToolVerba):
         "aqi",
         "pollen",
     ]
-    description = "Get current weather + forecast (and optional AQI/pollen/alerts) through the WeatherAPI.com integration; always uses the default location if none is specified."
+    description = "Get WeatherAPI.com conditions and forecasts. Home, here, outside, near me, and similar local wording always use the configured default location; override it only when the user explicitly names a real city, ZIP code, or latitude/longitude. Prefer Environment Core for live local sensor readings when its environment_conditions tool is available."
     verba_dec = "Fetch WeatherAPI.com weather through Tater integrations and answer only what the user asked (LLM-guided)."
-    when_to_use = "Use for current conditions or forecasts based on the user's natural-language weather request."
+    when_to_use = "Use for forecasts, WeatherAPI conditions, or weather in an explicitly named geographic location. Local phrases such as home, here, outside, and near me mean the configured default location, not a literal search query."
     common_needs = ["weather request (e.g., current, tonight, tomorrow, multi-day)"]
     missing_info_prompts = [
         "What weather do you want (current conditions, tonight, tomorrow, or multi-day forecast)?",
@@ -90,7 +120,7 @@ class WeatherForecastPlugin(ToolVerba):
     pretty_name = "Checking the Weather"
     settings_category = None
 
-    usage = '{"function":"weather_forecast","arguments":{"request":"Weather request in natural language (what conditions or forecast details the user wants)."}}'
+    usage = '{"function":"weather_forecast","arguments":{"request":"Weather request in natural language. Do not add a location unless the user explicitly names a city, ZIP code, or latitude/longitude; home, here, outside, and near me use the configured default."}}'
 
     required_settings = {}
 
@@ -229,19 +259,10 @@ class WeatherForecastPlugin(ToolVerba):
         if not text:
             return ""
         text = re.sub(r"\s+", " ", text)
+        text = re.sub(r"[?!.]+$", "", text).strip()
+        text = re.sub(r"\s+(?:right now|currently|today)$", "", text, flags=re.IGNORECASE).strip()
         lowered = text.lower()
-        generic = {
-            "default",
-            "default location",
-            "the default",
-            "use default",
-            "my default",
-            "current location",
-            "here",
-            "this location",
-            "this area",
-        }
-        if lowered in generic:
+        if lowered in _DEFAULT_LOCATION_ALIASES:
             return ""
         return text
 
@@ -316,7 +337,9 @@ class WeatherForecastPlugin(ToolVerba):
 
         m = re.search(r"\b(?:in|for|at)\s+([A-Za-z0-9 .,'-]+)\s*$", text, flags=re.IGNORECASE)
         if m:
-            loc = m.group(1).strip()
+            loc = self._normalize_location_value(m.group(1))
+            if not loc:
+                return None
             if loc.lower() in ("the morning", "morning", "the afternoon", "afternoon", "today", "tomorrow"):
                 return None
             return loc

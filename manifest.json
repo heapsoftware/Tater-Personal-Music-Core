@@ -1507,7 +1507,7 @@
     {
       "id": "weather_forecast",
       "name": "Weather Forecast",
-      "version": "1.1.11",
+      "version": "1.1.12",
       "min_tater_version": "59",
       "description": "Fetch WeatherAPI.com weather through Tater integrations and answer only what the user asked (LLM-guided).",
       "portals": [
@@ -1528,7 +1528,7 @@
       "settings_category": null,
       "tags": [],
       "entry": "verba/weather_forecast.py",
-      "sha256": "b9206579e4fa24214d73414e9c8216ce8235dc6b1fb07505ef7da62b1176db8f"
+      "sha256": "a2697958d2135064eeca18dc500736cc435c0f87d4e938972a97e79e9d19a99a"
     },
     {
       "id": "webdav_browser",
