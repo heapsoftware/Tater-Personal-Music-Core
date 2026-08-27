@@ -36,12 +36,16 @@ try:
 except Exception:  # pragma: no cover - compatibility with Tater versions before video understanding.
     _shared_video_analyze = None
 try:
+    from kernel_tools import describe_image_bytes as _shared_describe_image_bytes
+except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
+    _shared_describe_image_bytes = None
+try:
     from tater_paths import agent_lab_path as _tater_agent_lab_path
 except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _tater_agent_lab_path = None
 
 
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 MIN_TATER_VERSION = "164"
 CORE_DESCRIPTION = (
     "Build simple event-to-action automations from Tater's shared integration categories, "
@@ -2361,6 +2365,18 @@ def _describe_snapshot_local(
 
 
 def _describe_snapshot_sync(image_bytes: bytes, content_type: str, prompt: str) -> str:
+    if callable(_shared_describe_image_bytes):
+        result = _shared_describe_image_bytes(
+            image_bytes=image_bytes,
+            filename="tater-automation-camera.jpg",
+            prompt=prompt,
+        )
+        description = _text((result or {}).get("description") or (result or {}).get("text"))
+        if description:
+            return description
+        error = _text((result or {}).get("error"))
+        if error:
+            raise RuntimeError(error)
     settings = get_vision_settings(
         default_api_base="http://127.0.0.1:1234",
         default_model="qwen2.5-vl-7b-instruct",

@@ -61,8 +61,16 @@ try:
     from kernel_tools import video_analyze as _shared_video_analyze
 except Exception:  # pragma: no cover - compatibility with Tater versions before video understanding.
     _shared_video_analyze = None
+try:
+    from kernel_tools import describe_image_bytes as _shared_describe_image_bytes
+except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
+    _shared_describe_image_bytes = None
+try:
+    from spud_link_models import should_use_hub as _spud_link_should_use_hub
+except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
+    _spud_link_should_use_hub = None
 
-__version__ = "4.12.0"
+__version__ = "4.12.1"
 MIN_TATER_VERSION = "164"
 CORE_DESCRIPTION = (
     "Choose which cameras and sensors Tater should observe, describe camera events from images or short video clips, "
@@ -1568,9 +1576,11 @@ def _face_event_context(client: Any, event: Dict[str, Any]) -> Dict[str, Any]:
         client,
     )
     identities = _face_identity_rows(client)
-    known_people: List[str] = []
-    recognized_people: List[str] = []
-    recognized_person_ids: List[str] = []
+    known_people: List[str] = [_text(value) for value in (session.get("recognized_people") or []) if _text(value)]
+    recognized_people: List[str] = list(known_people)
+    recognized_person_ids: List[str] = [
+        _text(value) for value in (session.get("recognized_person_ids") or []) if _text(value)
+    ]
     unknown_count = 0
     for identity_id in identity_ids:
         identity = identities.get(identity_id) or {}
@@ -1584,6 +1594,8 @@ def _face_event_context(client: Any, event: Dict[str, Any]) -> Dict[str, Any]:
         if person_id and linked_name and person_id not in recognized_person_ids:
             recognized_person_ids.append(person_id)
             recognized_people.append(linked_name)
+    if not unknown_count and int(session.get("faces_detected") or 0) > len(recognized_people):
+        unknown_count = max(0, int(session.get("faces_detected") or 0) - len(recognized_people))
     return {
         "face_session_id": session_id,
         "face_status": _text(session.get("status") or "pending"),
@@ -1669,6 +1681,8 @@ async def _run_face_burst(
     errors: List[str] = []
     frames_checked = 0
     faces_detected = 0
+    remote_recognized_people: List[str] = []
+    remote_recognized_person_ids: List[str] = []
     frames: List[bytes] = []
     if video_bytes:
         session["status"] = "extracting"
@@ -1717,24 +1731,21 @@ async def _run_face_burst(
         session["frames_captured"] = len(frames)
         _save_face_session(redis_client, session)
 
+    remote_face_id = bool(
+        callable(_spud_link_should_use_hub)
+        and _spud_link_should_use_hub("face_id", redis_conn=redis_client)
+    )
     for image_bytes in frames:
         if not _face_id_enabled(redis_client):
             session["status"] = "disabled"
             session["error"] = "Face ID was disabled before analysis completed."
             break
         frames_checked += 1
-        try:
-            detections = await asyncio.to_thread(_face_id_runtime.analyze_image, image_bytes, redis_client)
-        except Exception as exc:
-            errors.append(_compact(str(exc), limit=180))
-            continue
-        for detection in detections or []:
-            if not isinstance(detection, dict):
-                continue
+        if remote_face_id:
             try:
-                identity = _record_face_detection(
-                    redis_client,
-                    detection,
+                recognition = await asyncio.to_thread(
+                    _shared_face_identity.recognize_image,
+                    image_bytes,
                     event_id=_text(session.get("event_id")),
                     seen_at=_now_iso(),
                     source={
@@ -1743,14 +1754,58 @@ async def _run_face_burst(
                         "camera_target": camera_target,
                         "area": _text(session.get("area")),
                     },
+                    record=True,
+                    redis_client=redis_client,
                 )
             except Exception as exc:
                 errors.append(_compact(str(exc), limit=180))
                 continue
-            faces_detected += 1
-            identity_id = _text(identity.get("id"))
-            if identity_id and identity_id not in identity_ids:
-                identity_ids.append(identity_id)
+            status = _text(recognition.get("status"))
+            warning = _text(recognition.get("warning"))
+            if status in {"error", "not_ready"} and warning:
+                errors.append(_compact(warning, limit=180))
+            faces_detected += max(0, int(recognition.get("faces_detected") or 0))
+            for identity_id in recognition.get("identity_ids") or []:
+                identity_id = _text(identity_id)
+                if identity_id and identity_id not in identity_ids:
+                    identity_ids.append(identity_id)
+            for person_name in recognition.get("people") or []:
+                person_name = _text(person_name)
+                if person_name and person_name.casefold() not in {name.casefold() for name in remote_recognized_people}:
+                    remote_recognized_people.append(person_name)
+            for person_id in recognition.get("person_ids") or []:
+                person_id = _text(person_id)
+                if person_id and person_id not in remote_recognized_person_ids:
+                    remote_recognized_person_ids.append(person_id)
+        else:
+            try:
+                detections = await asyncio.to_thread(_face_id_runtime.analyze_image, image_bytes, redis_client)
+            except Exception as exc:
+                errors.append(_compact(str(exc), limit=180))
+                continue
+            for detection in detections or []:
+                if not isinstance(detection, dict):
+                    continue
+                try:
+                    identity = _record_face_detection(
+                        redis_client,
+                        detection,
+                        event_id=_text(session.get("event_id")),
+                        seen_at=_now_iso(),
+                        source={
+                            "owner": "awareness",
+                            "provider": provider,
+                            "camera_target": camera_target,
+                            "area": _text(session.get("area")),
+                        },
+                    )
+                except Exception as exc:
+                    errors.append(_compact(str(exc), limit=180))
+                    continue
+                faces_detected += 1
+                identity_id = _text(identity.get("id"))
+                if identity_id and identity_id not in identity_ids:
+                    identity_ids.append(identity_id)
         session.update(
             {
                 "identity_ids": identity_ids,
@@ -1771,11 +1826,13 @@ async def _run_face_burst(
         session["error"] = errors[-1]
         session["error_count"] = len(errors)
     recognized = _recognized_people_for_identities(redis_client, identity_ids)
-    session["recognized_person_ids"] = [_text(row.get("person_id")) for row in recognized]
-    session["recognized_people"] = [_text(row.get("person_name")) for row in recognized]
+    local_person_ids = [_text(row.get("person_id")) for row in recognized if _text(row.get("person_id"))]
+    local_people = [_text(row.get("person_name")) for row in recognized if _text(row.get("person_name"))]
+    session["recognized_person_ids"] = list(dict.fromkeys([*local_person_ids, *remote_recognized_person_ids]))
+    session["recognized_people"] = list(dict.fromkeys([*local_people, *remote_recognized_people]))
     _save_face_session(redis_client, session)
     _refresh_stored_face_events(redis_client, event_id=_text(session.get("event_id")))
-    if session.get("status") == "complete" and recognized:
+    if session.get("status") == "complete" and (recognized or session.get("recognized_people")):
         emitted = _publish_recognized_person_events(redis_client, session)
         session["automation_events_emitted"] = len(emitted)
         _save_face_session(redis_client, session)
@@ -3700,6 +3757,18 @@ def _vision_describe_sync(
         ignore_vehicles=ignore_vehicles,
         mode=mode,
     )
+    if callable(_shared_describe_image_bytes):
+        result = _shared_describe_image_bytes(
+            image_bytes=image_bytes,
+            filename="awareness-doorbell.jpg" if mode == "doorbell" else "awareness-camera.jpg",
+            prompt=f"{system_prompt}\n\n{prompt}".strip(),
+        )
+        description = _text((result or {}).get("description") or (result or {}).get("text"))
+        if description:
+            return description
+        error = _text((result or {}).get("error"))
+        if error:
+            raise RuntimeError(error)
     routing_mode = _text(vision_mode).strip().lower() or "api"
     if routing_mode not in {"api", "auto", "base", "dedicated"}:
         routing_mode = "api"
