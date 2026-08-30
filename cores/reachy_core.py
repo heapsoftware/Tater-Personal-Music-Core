@@ -2,20 +2,36 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import contextlib
 import json
 import logging
+import random
+import threading
 import time
+import uuid
+from datetime import datetime
 from typing import Any, Dict, List
 
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
     "Control Reachy Tater Satellite and Reachy Tater Embedded behavior directly "
     "from Tater, including tracking, motion, music reactions, vision, head leveling, "
-    "and Idle Life."
+    "Idle Life, and Face ID greetings backed by Tater People."
 )
-TAGS = ["reachy", "reachy-mini", "robot", "satellite", "idle-life", "motion"]
+TAGS = [
+    "reachy",
+    "reachy-mini",
+    "robot",
+    "satellite",
+    "idle-life",
+    "motion",
+    "face-id",
+    "people",
+]
 
 CORE_SETTINGS = {
     "category": "Reachy Core Settings",
@@ -30,7 +46,23 @@ CORE_WEBUI_TAB = {
 
 _SETTINGS_CAPABILITY = "reachy_settings"
 _SETTINGS_PROTOCOL_VERSION = 1
-_SUPPORTED_SECTIONS = {"motion", "watch", "idle_life", "reachy"}
+_SUPPORTED_SECTIONS = {"motion", "watch", "idle_life", "face_id", "reachy"}
+_FACE_POLL_SECONDS = 0.2
+_FACE_SETTINGS_REFRESH_SECONDS = 20.0
+_FACE_PRESENCE_STALE_SECONDS = 20.0
+_FACE_CLIP_FRAME_COUNT = 4
+_FACE_CLIP_FRAME_INTERVAL_SECONDS = 0.85
+_MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
+_FACE_STATE_LOCK = threading.RLock()
+_FACE_STATES: Dict[str, Dict[str, Any]] = {}
+_GREETING_TEMPLATES = (
+    "Oh, hello there, {name}!",
+    "Hey {name}, nice to see you!",
+    "Well hello, {name}!",
+    "Hi {name}! Glad you stopped by.",
+    "There you are, {name}!",
+    "Hello {name}! It's good to see you.",
+)
 
 logger = logging.getLogger("reachy_core")
 
@@ -81,6 +113,22 @@ def _native_request(
             timeout_s=timeout,
         ),
         timeout=timeout + 1.0,
+    )
+    return result if isinstance(result, dict) else {}
+
+
+def _native_command(
+    selector: str,
+    message_type: str,
+    payload: Dict[str, Any] | None = None,
+    *,
+    timeout: float = 10.0,
+) -> Dict[str, Any]:
+    from tater_voice import native_satellite
+
+    result = native_satellite.run_on_runtime_loop(
+        native_satellite.send_command(selector, message_type, payload or {}),
+        timeout=timeout,
     )
     return result if isinstance(result, dict) else {}
 
@@ -153,6 +201,7 @@ def _field(
     maximum: float | None = None,
     step: float | None = None,
     suffix: str = "",
+    options: List[Dict[str, str]] | None = None,
 ) -> Dict[str, Any]:
     row: Dict[str, Any] = {
         "key": key,
@@ -170,6 +219,8 @@ def _field(
         row["step"] = step
     if suffix:
         row["suffix"] = suffix
+    if options:
+        row["options"] = options
     return row
 
 
@@ -259,6 +310,95 @@ def _motion_card(row: Dict[str, Any], values: Dict[str, Any]) -> Dict[str, Any]:
         _field("music_dance_enabled", "Dance to Music", "checkbox", _as_bool(values.get("music_dance_enabled"), True)),
         _field("music_dance_intensity", "Music Dance Intensity", "number", _as_float(values.get("music_dance_intensity"), 0.78), minimum=0, maximum=1, step=0.05),
         _field("music_reactions_enabled", "Spoken Song Reactions", "checkbox", _as_bool(values.get("music_reactions_enabled"), True)),
+    ]
+    return card
+
+
+def _face_id_card(row: Dict[str, Any], values: Dict[str, Any]) -> Dict[str, Any]:
+    card = _device_card_base(
+        row,
+        section="face_id",
+        title="Face ID",
+        subtitle=(
+            "Recognize one known person through Tater Face ID, greet them naturally, "
+            "and keep their linked People profile active while Reachy tracks them."
+        ),
+    )
+    card["fields"] = [
+        _field(
+            "enabled",
+            "Enable Reachy Face ID",
+            "checkbox",
+            _as_bool(values.get("enabled")),
+            description=(
+                "Requires Idle Life, Reachy Vision snapshots, and Tater Face ID. "
+                "A Face ID profile must be linked to a Person before Reachy uses its name. "
+                "Reachy's local tracker must first hold a clear, centered face."
+            ),
+        ),
+        _field(
+            "capture_mode",
+            "Capture Method",
+            "select",
+            _text(values.get("capture_mode")) or "snapshot",
+            description=(
+                "Snapshot is fastest. Short clip samples several live frames for a more reliable match; "
+                "no video file is stored, while Face ID keeps its normal identity observations."
+            ),
+            options=[
+                {"value": "snapshot", "label": "Snapshot"},
+                {"value": "clip", "label": "Short Clip"},
+            ],
+        ),
+        _field(
+            "greetings_enabled",
+            "Greet Recognized People",
+            "checkbox",
+            _as_bool(values.get("greetings_enabled"), True),
+            description="Say a short varied hello using the matched Person's display name.",
+        ),
+        _field(
+            "conversation_identity_enabled",
+            "Use Face ID in Conversations",
+            "checkbox",
+            _as_bool(values.get("conversation_identity_enabled"), True),
+            description=(
+                "Use the known person Reachy is currently tracking as the Person for Reachy conversations. "
+                "This does not change identity handling on satellites without cameras."
+            ),
+        ),
+        _field(
+            "scan_interval_seconds",
+            "Good-Face Recheck Interval",
+            "number",
+            _as_float(values.get("scan_interval_seconds"), 60),
+            minimum=15,
+            maximum=3600,
+            step=15,
+            suffix="sec",
+            description="GPU Face ID runs at most this often, and only while the local good-face gate is open.",
+        ),
+        _field(
+            "greeting_cooldown_seconds",
+            "Repeat Greeting Cooldown",
+            "number",
+            _as_float(values.get("greeting_cooldown_seconds"), 1800),
+            minimum=60,
+            maximum=86400,
+            step=60,
+            suffix="sec",
+        ),
+        _field(
+            "context_ttl_seconds",
+            "Conversation Match Lifetime",
+            "number",
+            _as_float(values.get("context_ttl_seconds"), 300),
+            minimum=30,
+            maximum=3600,
+            step=30,
+            suffix="sec",
+            description="Safety expiry if Reachy stops reporting visual tracking state.",
+        ),
     ]
     return card
 
@@ -415,6 +555,7 @@ def _device_manager_tab(
         "watch": "Tracking",
         "motion": "Motion & Music",
         "idle_life": "Idle Life",
+        "face_id": "Face ID",
     }
     return {
         "key": f"reachy-{index + 1}",
@@ -458,13 +599,14 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
                     _tracking_card(row, settings.get("watch") if isinstance(settings.get("watch"), dict) else {}),
                     _motion_card(row, settings.get("motion") if isinstance(settings.get("motion"), dict) else {}),
                     _idle_life_card(row, settings.get("idle_life") if isinstance(settings.get("idle_life"), dict) else {}),
+                    _face_id_card(row, settings.get("face_id") if isinstance(settings.get("face_id"), dict) else {}),
                 ]
             )
             tabs.append(
                 _device_manager_tab(
                     row,
                     index,
-                    sections=["overview", "reachy", "watch", "motion", "idle_life"],
+                    sections=["overview", "reachy", "watch", "motion", "idle_life", "face_id"],
                 )
             )
         except Exception as exc:
@@ -598,15 +740,445 @@ def handle_htmlui_tab_action(
     raise KeyError(f"Unknown Reachy Core action: {action_name or 'missing'}")
 
 
+def _face_state(selector: str) -> Dict[str, Any]:
+    with _FACE_STATE_LOCK:
+        state = _FACE_STATES.get(selector)
+        if state is None:
+            state = {
+                "settings": {},
+                "next_settings_at": 0.0,
+                "next_scan_at": 0.0,
+                "scan_active": False,
+                "person_id": "",
+                "person_name": "",
+                "identity_ids": [],
+                "expires_at": 0.0,
+                "last_greeted": {},
+                "alias_person_id": "",
+                "injected_session_id": "",
+                "tracking_visible": False,
+            }
+            _FACE_STATES[selector] = state
+        return state
+
+
+def _clear_face_person(state: Dict[str, Any]) -> None:
+    state["person_id"] = ""
+    state["person_name"] = ""
+    state["identity_ids"] = []
+    state["expires_at"] = 0.0
+    state["injected_session_id"] = ""
+
+
+def _face_visible(row: Dict[str, Any], *, now: float) -> bool:
+    status = row.get("last_status") if isinstance(row.get("last_status"), dict) else {}
+    reachy = status.get("reachy") if isinstance(status.get("reachy"), dict) else {}
+    if "face_visible" not in reachy:
+        return False
+    # last_seen_ts is stamped by Tater, so this remains reliable even when the
+    # robot and server clocks are not synchronized.
+    last_seen_at = _as_float(row.get("last_seen_ts"), 0.0)
+    if last_seen_at > 0.0 and now - last_seen_at > _FACE_PRESENCE_STALE_SECONDS:
+        return False
+    return _as_bool(reachy.get("face_visible"), False)
+
+
+def _face_id_ready(row: Dict[str, Any], *, now: float) -> bool:
+    if not _face_visible(row, now=now):
+        return False
+    status = row.get("last_status") if isinstance(row.get("last_status"), dict) else {}
+    reachy = status.get("reachy") if isinstance(status.get("reachy"), dict) else {}
+    return _as_bool(reachy.get("face_id_ready"), False)
+
+
+def _client_busy(row: Dict[str, Any]) -> bool:
+    voice = row.get("voice") if isinstance(row.get("voice"), dict) else {}
+    media = row.get("media_session") if isinstance(row.get("media_session"), dict) else {}
+    overlay = row.get("audio_overlay") if isinstance(row.get("audio_overlay"), dict) else {}
+    return any(
+        (
+            _as_bool(voice.get("active"), False),
+            _as_bool(media.get("active"), False),
+            _as_bool(overlay.get("active"), False),
+        )
+    )
+
+
+def _refresh_face_settings(row: Dict[str, Any], state: Dict[str, Any], *, now: float) -> Dict[str, Any]:
+    if now < _as_float(state.get("next_settings_at"), 0.0):
+        return state.get("settings") if isinstance(state.get("settings"), dict) else {}
+    try:
+        response = _read_settings(row)
+        settings = response.get("settings") if isinstance(response.get("settings"), dict) else {}
+        state["settings"] = settings
+        state["next_settings_at"] = now + _FACE_SETTINGS_REFRESH_SECONDS
+    except Exception as exc:
+        state["next_settings_at"] = now + 5.0
+        logger.debug("[Reachy Core] Could not refresh Face ID settings for %s: %s", row.get("selector"), exc)
+    return state.get("settings") if isinstance(state.get("settings"), dict) else {}
+
+
+def _decode_snapshot(result: Dict[str, Any]) -> bytes:
+    if not _as_bool(result.get("ok"), False):
+        return b""
+    encoded = _text(result.get("image_base64"))
+    if not encoded:
+        return b""
+    try:
+        image = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error):
+        return b""
+    if not image or len(image) > _MAX_SNAPSHOT_BYTES:
+        return b""
+    return image
+
+
+def _capture_face_frames(selector: str, capture_mode: str) -> List[bytes]:
+    count = _FACE_CLIP_FRAME_COUNT if capture_mode == "clip" else 1
+    frames: List[bytes] = []
+    for index in range(count):
+        if index:
+            time.sleep(_FACE_CLIP_FRAME_INTERVAL_SECONDS)
+        if not _face_id_ready(_current_client(selector), now=time.time()):
+            break
+        try:
+            result = _native_request(
+                selector,
+                "camera.snapshot",
+                {"reason": "reachy_core_face_id", "frame": index + 1},
+                timeout=8.0,
+            )
+        except Exception as exc:
+            logger.debug("[Reachy Core] Camera snapshot failed for %s: %s", selector, exc)
+            continue
+        if not _face_id_ready(_current_client(selector), now=time.time()):
+            break
+        image = _decode_snapshot(result)
+        if image:
+            frames.append(image)
+    return frames
+
+
+def _quiet_hours_active(idle_settings: Dict[str, Any]) -> bool:
+    if not _as_bool(idle_settings.get("quiet_hours_enabled"), False):
+        return False
+
+    def minutes(value: Any) -> int | None:
+        token = _text(value)
+        try:
+            hour_text, minute_text = token.split(":", 1)
+            hour = int(hour_text)
+            minute = int(minute_text)
+        except (TypeError, ValueError):
+            return None
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            return None
+        return (hour * 60) + minute
+
+    start = minutes(idle_settings.get("quiet_hours_start"))
+    end = minutes(idle_settings.get("quiet_hours_end"))
+    if start is None or end is None or start == end:
+        return False
+    local_now = datetime.now().astimezone()
+    current = (local_now.hour * 60) + local_now.minute
+    if start < end:
+        return start <= current < end
+    return current >= start or current < end
+
+
+def _current_client(selector: str) -> Dict[str, Any]:
+    with contextlib.suppress(Exception):
+        clients = _native_snapshot().get("clients")
+        if isinstance(clients, dict):
+            row = clients.get(selector)
+            if isinstance(row, dict):
+                return row
+    return {}
+
+
+def _speak_face_greeting(selector: str, name: str) -> bool:
+    row = _current_client(selector)
+    if not row or _client_busy(row):
+        return False
+    from tater_voice import native_satellite, voice_pipeline
+    from tater_voice.voice_pipeline import backends
+
+    text_value = random.choice(_GREETING_TEMPLATES).format(name=name)
+    text_value = voice_pipeline._sanitize_spoken_response_text(text_value)[:220].strip()
+    if not text_value:
+        return False
+
+    async def synthesize() -> tuple[bytes, Dict[str, Any], str, str]:
+        return await backends._native_synthesize_text(
+            text_value,
+            values=voice_pipeline._shared_speech_voice_settings(),
+        )
+
+    audio_bytes, audio_format, backend, _note = native_satellite.run_on_runtime_loop(
+        synthesize(),
+        timeout=180.0,
+    )
+    if not audio_bytes or _client_busy(_current_client(selector)):
+        return False
+    session_id = f"reachy-face-greeting-{uuid.uuid4().hex}"
+    audio_url = voice_pipeline._store_tts_url(selector, session_id, audio_bytes, audio_format)
+    if not audio_url:
+        return False
+    result = _native_command(
+        selector,
+        "play.url",
+        {"url": audio_url, "text": text_value, "tts_kind": "ambient"},
+    )
+    if _as_bool(result.get("ok"), False):
+        logger.info(
+            "[Reachy Core] Queued Face ID greeting selector=%s backend=%s person=%s",
+            selector,
+            backend or "default",
+            name,
+        )
+        return True
+    return False
+
+
+def _recognize_face_worker(selector: str, device_name: str) -> None:
+    with _FACE_STATE_LOCK:
+        state = _face_state(selector)
+        settings = dict(state.get("settings") or {})
+    face_settings = settings.get("face_id") if isinstance(settings.get("face_id"), dict) else {}
+    idle_settings = settings.get("idle_life") if isinstance(settings.get("idle_life"), dict) else {}
+    capture_mode = "clip" if _text(face_settings.get("capture_mode")).lower() == "clip" else "snapshot"
+    interval = max(15.0, _as_float(face_settings.get("scan_interval_seconds"), 60.0))
+    people_found: Dict[str, Dict[str, Any]] = {}
+    identity_ids: List[str] = []
+    max_faces_in_frame = 0
+    analysis_completed = False
+    error = ""
+    try:
+        frames = _capture_face_frames(selector, capture_mode)
+        if not frames:
+            raise RuntimeError("Reachy did not return a camera frame")
+        import face_identity
+
+        event_id = f"reachy_core_{uuid.uuid4().hex}"
+        for image in frames:
+            result = face_identity.recognize_image(
+                image,
+                event_id=event_id,
+                source={"owner": "reachy_core", "selector": selector, "device_name": device_name},
+                record=True,
+            )
+            max_faces_in_frame = max(
+                max_faces_in_frame,
+                int(_as_float(result.get("faces_detected"), 0.0)),
+            )
+            for identity_id in result.get("identity_ids") or []:
+                token = _text(identity_id)
+                if token and token not in identity_ids:
+                    identity_ids.append(token)
+            person_ids = list(result.get("person_ids") or [])
+            names = list(result.get("people") or [])
+            for index, person_id in enumerate(person_ids):
+                token = _text(person_id)
+                name = _text(names[index] if index < len(names) else "")
+                if token and name:
+                    people_found[token] = {"person_id": token, "person_name": name}
+        analysis_completed = True
+    except Exception as exc:
+        error = _text(exc)
+
+    now = time.time()
+    greet_name = ""
+    with _FACE_STATE_LOCK:
+        state = _face_state(selector)
+        state["scan_active"] = False
+        state["next_scan_at"] = now + (
+            interval if analysis_completed else min(5.0, interval)
+        )
+        settings = state.get("settings") if isinstance(state.get("settings"), dict) else {}
+        face_settings = settings.get("face_id") if isinstance(settings.get("face_id"), dict) else {}
+        idle_settings = settings.get("idle_life") if isinstance(settings.get("idle_life"), dict) else {}
+        row = _current_client(selector)
+        if not row or not _face_visible(row, now=now) or not _as_bool(face_settings.get("enabled"), False):
+            _clear_face_person(state)
+        elif len(people_found) == 1 and max_faces_in_frame <= 1:
+            person = next(iter(people_found.values()))
+            person_id = _text(person.get("person_id"))
+            person_name = _text(person.get("person_name"))
+            changed = person_id != _text(state.get("person_id"))
+            state["person_id"] = person_id
+            state["person_name"] = person_name
+            state["identity_ids"] = list(identity_ids)
+            state["expires_at"] = now + max(30.0, _as_float(face_settings.get("context_ttl_seconds"), 300.0))
+            if changed:
+                state["injected_session_id"] = ""
+            last_greeted = state.get("last_greeted") if isinstance(state.get("last_greeted"), dict) else {}
+            cooldown = max(60.0, _as_float(face_settings.get("greeting_cooldown_seconds"), 1800.0))
+            if (
+                _as_bool(face_settings.get("greetings_enabled"), True)
+                and not _quiet_hours_active(idle_settings)
+                and now - _as_float(last_greeted.get(person_id), 0.0) >= cooldown
+                and not _client_busy(row)
+            ):
+                greet_name = person_name
+        elif len(people_found) > 1 or max_faces_in_frame > 0:
+            _clear_face_person(state)
+
+    if error:
+        logger.debug("[Reachy Core] Face ID scan failed for %s: %s", selector, error)
+    if greet_name and _speak_face_greeting(selector, greet_name):
+        with _FACE_STATE_LOCK:
+            state = _face_state(selector)
+            if _text(state.get("person_name")) == greet_name:
+                greeted = state.get("last_greeted") if isinstance(state.get("last_greeted"), dict) else {}
+                greeted[_text(state.get("person_id"))] = time.time()
+                state["last_greeted"] = greeted
+
+
+def _ensure_voice_alias(selector: str, state: Dict[str, Any]) -> str:
+    person_id = _text(state.get("person_id"))
+    person_name = _text(state.get("person_name"))
+    if not person_id or not person_name:
+        return ""
+    external_id = f"reachy-face:{selector}:{person_id}"
+    if _text(state.get("alias_person_id")) == person_id:
+        return external_id
+    import people
+
+    people.attach_alias(
+        person_id=person_id,
+        platform="voice_core",
+        external_id=external_id,
+        label=person_name,
+        kind="face_id",
+    )
+    state["alias_person_id"] = person_id
+    return external_id
+
+
+def _inject_face_identity(selector: str, session_id: str, state: Dict[str, Any]) -> None:
+    if not session_id or _text(state.get("injected_session_id")) == session_id:
+        return
+    try:
+        speaker_id = _ensure_voice_alias(selector, state)
+    except Exception as exc:
+        logger.debug("[Reachy Core] Could not link Face ID to People for %s: %s", selector, exc)
+        return
+    speaker_name = _text(state.get("person_name"))
+    if not speaker_id or not speaker_name:
+        return
+
+    async def apply_identity() -> bool:
+        from tater_voice import voice_pipeline
+
+        runtime = voice_pipeline._selector_runtime(selector)
+        lock = runtime.get("lock")
+        if not hasattr(lock, "__aenter__"):
+            return False
+        async with lock:
+            session = runtime.get("session")
+            if session is None or _text(getattr(session, "session_id", "")) != session_id:
+                return False
+            session.speaker_id = speaker_id
+            session.speaker_name = speaker_name
+            session.speaker_score = 1.0
+            session.speaker_match_reason = "reachy_face"
+            if not isinstance(session.context, dict):
+                session.context = {}
+            session.context["speaker_id"] = speaker_id
+            session.context["speaker_name"] = speaker_name
+            session.context["speaker_score"] = 1.0
+            return True
+
+    from tater_voice import native_satellite
+
+    try:
+        applied = native_satellite.run_on_runtime_loop(apply_identity(), timeout=3.0)
+    except Exception as exc:
+        logger.debug("[Reachy Core] Could not apply Face ID voice context for %s: %s", selector, exc)
+        return
+    if applied:
+        state["injected_session_id"] = session_id
+        logger.info("[Reachy Core] Applied Face ID voice context selector=%s person=%s", selector, speaker_name)
+
+
+def _face_id_tick() -> None:
+    now = time.time()
+    reachys = _connected_reachys()
+    connected = {_text(row.get("selector")) for row in reachys}
+    with _FACE_STATE_LOCK:
+        for selector in list(_FACE_STATES):
+            if selector not in connected:
+                _FACE_STATES.pop(selector, None)
+
+    for row in reachys:
+        selector = _text(row.get("selector"))
+        if not selector:
+            continue
+        with _FACE_STATE_LOCK:
+            state = _face_state(selector)
+            settings = _refresh_face_settings(row, state, now=now)
+            face_settings = settings.get("face_id") if isinstance(settings.get("face_id"), dict) else {}
+            idle_settings = settings.get("idle_life") if isinstance(settings.get("idle_life"), dict) else {}
+            reachy_settings = settings.get("reachy") if isinstance(settings.get("reachy"), dict) else {}
+            enabled = all(
+                (
+                    _as_bool(face_settings.get("enabled"), False),
+                    _as_bool(idle_settings.get("enabled"), False),
+                    _as_bool(reachy_settings.get("allow_vision_snapshots"), False),
+                    _as_bool(row.get("capabilities", {}).get("camera_snapshot"), False),
+                )
+            )
+            visible = enabled and _face_visible(row, now=now)
+            if not visible:
+                _clear_face_person(state)
+                state["tracking_visible"] = False
+                state["next_scan_at"] = 0.0
+                continue
+            if not _as_bool(state.get("tracking_visible"), False):
+                state["tracking_visible"] = True
+                state["next_scan_at"] = 0.0
+            if _as_float(state.get("expires_at"), 0.0) and now >= _as_float(state.get("expires_at"), 0.0):
+                _clear_face_person(state)
+
+            voice = row.get("voice") if isinstance(row.get("voice"), dict) else {}
+            if (
+                _as_bool(face_settings.get("conversation_identity_enabled"), True)
+                and _as_bool(voice.get("active"), False)
+                and _text(state.get("person_id"))
+            ):
+                _inject_face_identity(selector, _text(voice.get("session_id")), state)
+
+            if (
+                _face_id_ready(row, now=now)
+                and not _as_bool(state.get("scan_active"), False)
+                and now >= _as_float(state.get("next_scan_at"), 0.0)
+                and not _client_busy(row)
+            ):
+                state["scan_active"] = True
+                worker = threading.Thread(
+                    target=_recognize_face_worker,
+                    args=(selector, _device_name(row)),
+                    name=f"reachy-face-id-{selector}",
+                    daemon=True,
+                )
+                worker.start()
+
+
 def run(stop_event=None) -> None:
-    """Keep the installed core lifecycle active; control remains request-driven."""
+    """Manage Reachy settings plus low-latency Face ID presence and identity."""
     logger.info("[Reachy Core] Started; waiting for compatible Reachy satellites.")
     try:
         while not (stop_event and getattr(stop_event, "is_set", lambda: False)()):
+            try:
+                _face_id_tick()
+            except Exception:
+                logger.exception("[Reachy Core] Face ID background tick failed")
             wait = getattr(stop_event, "wait", None) if stop_event is not None else None
             if callable(wait):
-                wait(5.0)
+                wait(_FACE_POLL_SECONDS)
             else:
-                time.sleep(5.0)
+                time.sleep(_FACE_POLL_SECONDS)
     finally:
+        with _FACE_STATE_LOCK:
+            _FACE_STATES.clear()
         logger.info("[Reachy Core] Stopped.")
