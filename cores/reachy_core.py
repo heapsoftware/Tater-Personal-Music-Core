@@ -15,7 +15,7 @@ from datetime import datetime
 from typing import Any, Dict, List
 
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
     "Control Reachy Tater Satellite and Reachy Tater Embedded behavior directly "
@@ -369,14 +369,18 @@ def _face_id_card(row: Dict[str, Any], values: Dict[str, Any]) -> Dict[str, Any]
         ),
         _field(
             "scan_interval_seconds",
-            "Good-Face Recheck Interval",
+            "Unmatched Face Retry Interval",
             "number",
             _as_float(values.get("scan_interval_seconds"), 60),
             minimum=15,
             maximum=3600,
             step=15,
             suffix="sec",
-            description="GPU Face ID runs at most this often, and only while the local good-face gate is open.",
+            description=(
+                "When no linked Person matches, GPU Face ID retries at most this often and only while "
+                "the local good-face gate is open. A successful match remains active without more checks "
+                "until Reachy loses visual tracking."
+            ),
         ),
         _field(
             "greeting_cooldown_seconds",
@@ -1137,8 +1141,15 @@ def _face_id_tick() -> None:
             if not _as_bool(state.get("tracking_visible"), False):
                 state["tracking_visible"] = True
                 state["next_scan_at"] = 0.0
-            if _as_float(state.get("expires_at"), 0.0) and now >= _as_float(state.get("expires_at"), 0.0):
-                _clear_face_person(state)
+            if _text(state.get("person_id")):
+                # Keep one successful match for the full continuous tracking
+                # session. The satellite's fresh face-visible signal owns the
+                # boundary; losing it clears the match and reacquisition scans
+                # immediately. Refresh the safety expiry while status is fresh.
+                state["expires_at"] = now + max(
+                    30.0,
+                    _as_float(face_settings.get("context_ttl_seconds"), 300.0),
+                )
 
             voice = row.get("voice") if isinstance(row.get("voice"), dict) else {}
             if (
@@ -1150,6 +1161,7 @@ def _face_id_tick() -> None:
 
             if (
                 _face_id_ready(row, now=now)
+                and not _text(state.get("person_id"))
                 and not _as_bool(state.get("scan_active"), False)
                 and now >= _as_float(state.get("next_scan_at"), 0.0)
                 and not _client_busy(row)

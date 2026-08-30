@@ -223,6 +223,75 @@ def test_reachy_core_matches_a_visible_person_with_shared_face_id(monkeypatch) -
     assert state["expires_at"] > time.time()
 
 
+def test_matched_person_is_not_rechecked_until_tracking_is_lost(monkeypatch) -> None:
+    selector = "native:reachy-session-lock"
+    row = {
+        **_client(),
+        "selector": selector,
+        "capabilities": {
+            **_client()["capabilities"],
+            "camera_snapshot": True,
+        },
+        "last_seen_ts": time.time(),
+        "last_status": {
+            "reachy": {"face_visible": True, "face_id_ready": True}
+        },
+        "voice": {"active": False},
+        "media_session": {"active": False},
+        "audio_overlay": {"active": False},
+    }
+    state = reachy_core._face_state(selector)
+    state.update(
+        {
+            "settings": _settings_response()["settings"],
+            "next_settings_at": float("inf"),
+            "next_scan_at": 0.0,
+            "scan_active": False,
+            "person_id": "person-1",
+            "person_name": "Spud Lord",
+            "identity_ids": ["face-1"],
+            "expires_at": 1.0,
+            "tracking_visible": True,
+        }
+    )
+    started = []
+
+    class FakeThread:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self) -> None:
+            started.append(self.kwargs)
+
+    monkeypatch.setattr(reachy_core, "_connected_reachys", lambda: [row])
+    monkeypatch.setattr(reachy_core.threading, "Thread", FakeThread)
+
+    try:
+        reachy_core._face_id_tick()
+
+        assert started == []
+        assert state["person_id"] == "person-1"
+        assert state["expires_at"] > time.time()
+
+        row["last_status"]["reachy"]["face_visible"] = False
+        row["last_status"]["reachy"]["face_id_ready"] = False
+        row["last_seen_ts"] = time.time()
+        reachy_core._face_id_tick()
+
+        assert state["person_id"] == ""
+        assert state["tracking_visible"] is False
+
+        row["last_status"]["reachy"]["face_visible"] = True
+        row["last_status"]["reachy"]["face_id_ready"] = True
+        row["last_seen_ts"] = time.time()
+        reachy_core._face_id_tick()
+
+        assert len(started) == 1
+        assert state["scan_active"] is True
+    finally:
+        reachy_core._FACE_STATES.pop(selector, None)
+
+
 def test_reachy_core_requires_reachys_local_good_face_signal() -> None:
     now = time.time()
     row = {
