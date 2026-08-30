@@ -1,14 +1,13 @@
 # verba/weather_forecast.py
 import asyncio
+import json
 import logging
-import re
 from datetime import datetime, date
 from typing import Any, Dict, Optional, Tuple, List
 
 from dotenv import load_dotenv
 
 from verba_base import ToolVerba
-from helpers import get_tater_name
 from tateros import integration_store as integration_store_module
 from verba_diagnostics import needs_from_diagnosis
 from verba_result import action_failure, action_success
@@ -46,6 +45,28 @@ _DEFAULT_LOCATION_ALIASES = {
     "where i am",
     "where we are",
 }
+
+WEATHER_INTENT_SCHEMA_VERSION = 1
+_WEATHER_REQUEST_TYPES = {"current", "forecast"}
+_WEATHER_MEASUREMENTS = {
+    "general",
+    "condition",
+    "temperature",
+    "humidity",
+    "wind",
+    "rain",
+    "snow",
+    "air_quality",
+    "pollen",
+    "alerts",
+}
+_WEATHER_LOCATION_SCOPES = {"local_outdoor", "local_area", "named_place"}
+_WEATHER_DAY_HINTS = {"current", "today", "tonight", "tomorrow", "weekend"}
+_WEATHER_TEMPERATURE_FOCUS = {"current", "high", "low", "both"}
+
+
+class WeatherIntentError(ValueError):
+    """Raised when the required AI weather interpretation cannot be produced safely."""
 
 
 def _weather_api_module():
@@ -95,24 +116,20 @@ class WeatherForecastPlugin(ToolVerba):
 
     name = "weather_forecast"
     verba_name = "Weather Forecast"
-    version = "1.1.12"
+    version = "1.2.1"
     min_tater_version = "59"
     routing_keywords = [
-        "weather",
+        "weatherapi",
+        "weather api",
+        "weather forecast",
         "forecast",
-        "temperature",
-        "temp",
-        "humidity",
-        "wind",
-        "rain",
-        "snow",
-        "storm",
-        "aqi",
-        "pollen",
+        "weather alerts",
+        "air quality forecast",
+        "pollen forecast",
     ]
-    description = "Get WeatherAPI.com conditions and forecasts. Home, here, outside, near me, and similar local wording always use the configured default location; override it only when the user explicitly names a real city, ZIP code, or latitude/longitude. Prefer Environment Core for live local sensor readings when its environment_conditions tool is available."
-    verba_dec = "Fetch WeatherAPI.com weather through Tater integrations and answer only what the user asked (LLM-guided)."
-    when_to_use = "Use for forecasts, WeatherAPI conditions, or weather in an explicitly named geographic location. Local phrases such as home, here, outside, and near me mean the configured default location, not a literal search query."
+    description = "Get current weather conditions and forecasts from WeatherAPI.com for the configured home location or any named place."
+    verba_dec = "Get WeatherAPI.com conditions and forecasts for the configured home location or any named geographic place."
+    when_to_use = "Use for current or future weather at home, outside, here, or near me, and for weather in a named city or geographic place. Handles conditions, temperature, rain, snow, wind, humidity, hourly and daily forecasts, alerts, air quality, UV, and pollen. Every request is interpreted by AI with no regex fallback."
     common_needs = ["weather request (e.g., current, tonight, tomorrow, multi-day)"]
     missing_info_prompts = [
         "What weather do you want (current conditions, tonight, tomorrow, or multi-day forecast)?",
@@ -120,7 +137,7 @@ class WeatherForecastPlugin(ToolVerba):
     pretty_name = "Checking the Weather"
     settings_category = None
 
-    usage = '{"function":"weather_forecast","arguments":{"request":"Weather request in natural language. Do not add a location unless the user explicitly names a city, ZIP code, or latitude/longitude; home, here, outside, and near me use the configured default."}}'
+    usage = '{"function":"weather_forecast","arguments":{"request":"What is the temperature in Chicago right now?"}}'
 
     required_settings = {}
 
@@ -135,15 +152,7 @@ class WeatherForecastPlugin(ToolVerba):
     def _normalize_request_text(self, text: str) -> str:
         if not text:
             return ""
-        cleaned = str(text).strip()
-        # strip common mention tokens (Discord/Mentions)
-        cleaned = re.sub(r"<@!?\\d+>", "", cleaned)
-        first, _ = get_tater_name()
-        if first:
-            cleaned = re.sub(rf"\\b{re.escape(first)}\\b", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"[@,:;.!]+", " ", cleaned)
-        cleaned = re.sub(r"\\s+", " ", cleaned).strip()
-        return cleaned
+        return " ".join(str(text).strip().split())
 
     def _with_request_from_fallback(self, args: Dict[str, Any], fallback_text: str) -> Tuple[Dict[str, Any], str]:
         args2 = dict(args or {})
@@ -202,6 +211,15 @@ class WeatherForecastPlugin(ToolVerba):
                 say_hint="Ask which forecast details the user wants; default location will be used if set.",
             )
 
+        if "weather request interpretation failed" in low:
+            return action_failure(
+                code="weather_interpretation_failed",
+                message=msg,
+                diagnosis=self._diagnosis(),
+                needs=["Please try the weather request again."],
+                say_hint="Explain that the weather request could not be interpreted safely and ask the user to try again.",
+            )
+
         if "no location provided" in low:
             return action_failure(
                 code="missing_location",
@@ -255,13 +273,11 @@ class WeatherForecastPlugin(ToolVerba):
 
     @staticmethod
     def _normalize_location_value(value: Any) -> str:
-        text = str(value or "").strip()
+        text = " ".join(str(value or "").strip().split())
         if not text:
             return ""
-        text = re.sub(r"\s+", " ", text)
-        text = re.sub(r"[?!.]+$", "", text).strip()
-        text = re.sub(r"\s+(?:right now|currently|today)$", "", text, flags=re.IGNORECASE).strip()
-        lowered = text.lower()
+        text = text.rstrip("?!. ")
+        lowered = text.casefold()
         if lowered in _DEFAULT_LOCATION_ALIASES:
             return ""
         return text
@@ -271,8 +287,9 @@ class WeatherForecastPlugin(ToolVerba):
         if not text:
             return "No weather available."
         out = str(text)
-        out = re.sub(r"[`*_]{1,3}", "", out)
-        out = re.sub(r"\s+", " ", out).strip()
+        for token in ("`", "*", "_"):
+            out = out.replace(token, "")
+        out = " ".join(out.split())
         return out[:450]
 
     @staticmethod
@@ -311,87 +328,171 @@ class WeatherForecastPlugin(ToolVerba):
         }
         return mapping.get(idx)
 
-    # -------------------- Request parsing --------------------
+    # -------------------- AI weather intent --------------------
 
-    def _extract_location_override(self, request: str) -> Optional[str]:
-        """
-        Default location comes from plugin settings.
-        Only override if the user clearly specifies a location.
+    @staticmethod
+    def _decode_ai_object(content: Any) -> Dict[str, Any]:
+        text = str(content or "").strip()
+        if text.startswith("```") and text.endswith("```"):
+            lines = text.splitlines()
+            if len(lines) >= 3:
+                text = "\n".join(lines[1:-1]).strip()
+        try:
+            parsed = json.loads(text)
+        except Exception as exc:
+            raise WeatherIntentError("The weather interpretation returned invalid JSON.") from exc
+        if not isinstance(parsed, dict):
+            raise WeatherIntentError("The weather interpretation did not return an object.")
+        return parsed
 
-        Supports:
-          - lat,lon anywhere
-          - US ZIP anywhere
-          - trailing "in/for/at <location>"
-        """
-        if not request:
-            return None
-        text = request.strip()
+    @staticmethod
+    def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+        try:
+            number = int(value)
+        except Exception:
+            number = int(default)
+        return max(minimum, min(number, maximum))
 
-        m2 = re.search(r"(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)", text)
-        if m2:
-            return f"{m2.group(1)},{m2.group(2)}"
+    async def _interpret_weather_request_ai(
+        self,
+        *,
+        request_text: str,
+        args: Dict[str, Any],
+        settings: Dict[str, Any],
+        llm_client: Any,
+    ) -> Dict[str, Any]:
+        if llm_client is None:
+            raise WeatherIntentError("AI weather interpretation is unavailable.")
+        if not request_text and not any(
+            args.get(key) not in (None, "")
+            for key in ("location", "area", "sensor", "provider", "days", "date", "hours", "units")
+        ):
+            raise WeatherIntentError("No weather request was provided.")
 
-        m3 = re.search(r"\b(\d{5})(?:-\d{4})?\b", text)
-        if m3:
-            return m3.group(0)
+        today = date.today().isoformat()
+        timezone_name = datetime.now().astimezone().tzname() or "local timezone"
+        prompt_payload = {
+            "weather_intent_schema_version": WEATHER_INTENT_SCHEMA_VERSION,
+            "request": request_text,
+            "explicit_arguments": {
+                key: args.get(key)
+                for key in ("location", "area", "sensor", "provider", "days", "date", "hours", "units")
+                if args.get(key) not in (None, "")
+            },
+            "configured_default_location": self._normalize_location_value(settings.get("DEFAULT_LOCATION")),
+            "configured_default_days": settings.get("DEFAULT_DAYS"),
+            "configured_default_units": settings.get("DEFAULT_UNITS"),
+            "today": today,
+            "timezone": timezone_name,
+        }
+        system_prompt = (
+            "Convert the user's weather request into one strict JSON object. Do not answer the weather question. "
+            "Ignore chat mentions, user names, assistant names, and punctuation when deciding the location. "
+            "Never infer or invent a named place. A named place is allowed only when the user or explicit arguments clearly provide "
+            "a city, region, country, postal code, airport, landmark, or latitude/longitude. "
+            "Words such as home, here, outside, outdoors, local, near me, my location, and where I am always mean location_scope=local_outdoor "
+            "and location=null. A room, named local area, or sensor means location_scope=local_area. Preserve explicit arguments unless they conflict with those rules. "
+            "Return exactly these keys: request_type, measurement, location_scope, location, area, sensor, provider, date, day, days, hours, units, temperature_focus. "
+            "request_type is current or forecast. measurement is general, condition, temperature, humidity, wind, rain, snow, "
+            "air_quality, pollen, or alerts. location_scope is local_outdoor, local_area, or named_place. location is a string only for named_place. "
+            "date is YYYY-MM-DD or null. Resolve relative dates using today. day is current, today, tonight, tomorrow, weekend, or null. "
+            "days is an integer from 1 to 14. hours is an integer from 0 to 48. units is us, metric, or null. "
+            "temperature_focus is current, high, low, both, or null. Use forecast for future times, highs, lows, tonight, tomorrow, or later. "
+            "Output JSON only."
+        )
+        try:
+            response = await llm_client.chat(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": json.dumps(prompt_payload, ensure_ascii=False)},
+                ],
+                temperature=0.0,
+                max_tokens=360,
+                timeout_ms=25_000,
+            )
+        except Exception as exc:
+            raise WeatherIntentError("The AI weather interpretation failed.") from exc
 
-        m = re.search(r"\b(?:in|for|at)\s+([A-Za-z0-9 .,'-]+)\s*$", text, flags=re.IGNORECASE)
-        if m:
-            loc = self._normalize_location_value(m.group(1))
-            if not loc:
-                return None
-            if loc.lower() in ("the morning", "morning", "the afternoon", "afternoon", "today", "tomorrow"):
-                return None
-            return loc
+        raw = self._decode_ai_object((response.get("message") or {}).get("content"))
+        request_type = str(raw.get("request_type") or "").strip().lower()
+        measurement = str(raw.get("measurement") or "").strip().lower()
+        location_scope = str(raw.get("location_scope") or "").strip().lower()
+        day_hint = str(raw.get("day") or "").strip().lower() or None
+        units = str(raw.get("units") or "").strip().lower() or None
+        temperature_focus = str(raw.get("temperature_focus") or "").strip().lower() or None
+        location = self._normalize_location_value(raw.get("location"))
+        date_text = str(raw.get("date") or "").strip() or None
 
-        return None
+        if request_type not in _WEATHER_REQUEST_TYPES:
+            raise WeatherIntentError("The AI weather interpretation returned an invalid request type.")
+        if measurement not in _WEATHER_MEASUREMENTS:
+            raise WeatherIntentError("The AI weather interpretation returned an invalid measurement.")
+        if location_scope not in _WEATHER_LOCATION_SCOPES:
+            raise WeatherIntentError("The AI weather interpretation returned an invalid location scope.")
+        if day_hint not in _WEATHER_DAY_HINTS:
+            day_hint = None
+        if units not in {"us", "metric"}:
+            units = None
+        if temperature_focus not in _WEATHER_TEMPERATURE_FOCUS:
+            temperature_focus = None
+        if date_text and self._parse_date(date_text) is None:
+            raise WeatherIntentError("The AI weather interpretation returned an invalid date.")
 
-    def _interpret_request(self, request: str, default_days: int, default_hours: int) -> Dict[str, Any]:
-        """
-        Turns a natural request into query intent:
-          - days: forecast window (1..14)
-          - date: optional YYYY-MM-DD if user wrote it
-          - hours: optional hourly peek (0..48)
-        """
-        request_l = (request or "").lower().strip()
+        explicit_location_present = args.get("location") not in (None, "")
+        explicit_location = self._normalize_location_value(args.get("location"))
+        if explicit_location_present:
+            if explicit_location:
+                location_scope = "named_place"
+                location = explicit_location
+            else:
+                location_scope = "local_outdoor"
+                location = ""
+        elif location_scope == "local_outdoor":
+            location = ""
+        elif location_scope == "local_area":
+            raise WeatherIntentError("Local room and sensor weather requests require Environment Core.")
+        elif not location:
+            raise WeatherIntentError("The AI weather interpretation selected a named place without a location.")
 
-        days = default_days
-        hours = default_hours
-        date_str = None
+        if args.get("date") not in (None, ""):
+            explicit_date = str(args.get("date") or "").strip()
+            if self._parse_date(explicit_date) is None:
+                raise WeatherIntentError("The explicit weather date is invalid.")
+            date_text = explicit_date
+        if args.get("units") not in (None, ""):
+            explicit_units = str(args.get("units") or "").strip().lower()
+            if explicit_units not in {"us", "metric"}:
+                raise WeatherIntentError("The explicit weather units must be us or metric.")
+            units = explicit_units
 
-        # Current-only cues
-        if any(x in request_l for x in ["right now", "currently", "current weather", "now"]):
-            days = max(1, min(days, 2))
-
-        # Tomorrow
-        if "tomorrow" in request_l:
-            days = max(days, 2)
-
-        # Weekend
-        if "weekend" in request_l:
-            days = max(days, 3)
-
-        # "next X days" / "X day forecast"
-        m = re.search(r"\b(\d{1,2})\s*-\s*day\b|\b(\d{1,2})\s*day\s*forecast\b|\bnext\s+(\d{1,2})\s+days\b", request_l)
-        if m:
-            n = next((g for g in m.groups() if g), None)
-            if n:
-                try:
-                    days = max(1, min(int(n), 14))
-                except Exception:
-                    pass
-
-        # explicit date
-        mdate = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", request_l)
-        if mdate:
-            date_str = mdate.group(1)
-            days = max(days, 3)
-
-        # Hourly
-        if "hourly" in request_l or "next hour" in request_l or "next few hours" in request_l:
-            hours = max(hours, 12)
-
-        return {"days": days, "date": date_str, "hours": hours}
+        days = self._bounded_int(
+            args.get("days") if args.get("days") not in (None, "") else raw.get("days"),
+            settings.get("DEFAULT_DAYS") or 3,
+            1,
+            14,
+        )
+        hours = self._bounded_int(
+            args.get("hours") if args.get("hours") not in (None, "") else raw.get("hours"),
+            settings.get("SHOW_HOURLY_PEEK") or 0,
+            0,
+            48,
+        )
+        return {
+            "schema_version": WEATHER_INTENT_SCHEMA_VERSION,
+            "request_type": request_type,
+            "measurement": measurement,
+            "location_scope": location_scope,
+            "location": location or None,
+            "area": str(raw.get("area") or "").strip() or None,
+            "sensor": str(raw.get("sensor") or "").strip() or None,
+            "provider": str(raw.get("provider") or "").strip() or None,
+            "date": date_text,
+            "day": day_hint,
+            "days": days,
+            "hours": hours,
+            "units": units or str(settings.get("DEFAULT_UNITS") or "us").lower(),
+            "temperature_focus": temperature_focus,
+        }
 
     # -------------------- Facts builder (for LLM) --------------------
 
@@ -519,56 +620,13 @@ class WeatherForecastPlugin(ToolVerba):
             f"Wind up to {maxwind} {wind_unit}. Rain {rain_chance}% (snow {snow_chance}%)."
         )
 
-    @staticmethod
-    def _requested_temp_focus(request_text: str) -> str:
-        req = str(request_text or "").lower()
-        asks_high = bool(re.search(r"\b(high|highs|max|maximum|hi)\b", req))
-        asks_low = bool(re.search(r"\b(low|lows|min|minimum|lo)\b", req))
-        if asks_high and asks_low:
-            return "both"
-        if asks_high:
-            return "high"
-        if asks_low:
-            return "low"
-        return "none"
-
-    @staticmethod
-    def _request_prefers_temp_only(request_text: str) -> bool:
-        req = str(request_text or "").lower().strip()
-        if not req:
-            return True
-        asks_temp = bool(re.search(r"\b(temp|temperature|degrees?)\b", req))
-        if not asks_temp:
-            return False
-        detail_tokens = (
-            "forecast",
-            "tomorrow",
-            "today",
-            "hourly",
-            "rain",
-            "snow",
-            "wind",
-            "humidity",
-            "aqi",
-            "pollen",
-            "alert",
-            "warning",
-            "watch",
-            "advisory",
-            "condition",
-            "feels like",
-            "next ",
-            "week",
-        )
-        return not any(token in req for token in detail_tokens)
-
     # -------------------- Deterministic answer builder --------------------
 
     def _deterministic_answer(
         self,
         *,
         data: Dict[str, Any],
-        request_text: str,
+        intent: Dict[str, Any],
         units: str,
         wanted_date: Optional[date],
         days: int,
@@ -576,7 +634,10 @@ class WeatherForecastPlugin(ToolVerba):
     ) -> str:
         temp_unit = "°F" if units == "us" else "°C"
         wind_unit = "mph" if units == "us" else "kph"
-        req = (request_text or "").lower()
+        request_type = str(intent.get("request_type") or "current")
+        measurement = str(intent.get("measurement") or "general")
+        day_hint = str(intent.get("day") or "")
+        temp_focus = str(intent.get("temperature_focus") or "current")
 
         loc = data.get("location") or {}
         loc_name = ", ".join(
@@ -598,7 +659,6 @@ class WeatherForecastPlugin(ToolVerba):
         current_temp_line = f"Current temperature in {loc_name} is {temp}{temp_unit}.".strip()
 
         forecast_days = ((data.get("forecast") or {}).get("forecastday") or [])
-        temp_focus = self._requested_temp_focus(req)
 
         target_day = None
         target_label = ""
@@ -608,32 +668,42 @@ class WeatherForecastPlugin(ToolVerba):
                 None,
             )
             target_label = wanted_date.isoformat()
-        elif "tomorrow" in req and len(forecast_days) >= 2:
+        elif day_hint == "tomorrow" and len(forecast_days) >= 2:
             target_day = forecast_days[1]
             target_label = "tomorrow"
-        elif "today" in req and len(forecast_days) >= 1:
+        elif day_hint in {"today", "tonight"} and len(forecast_days) >= 1:
             target_day = forecast_days[0]
-            target_label = "today"
-        elif temp_focus != "none" and len(forecast_days) >= 1:
+            target_label = day_hint
+        elif request_type == "forecast" and len(forecast_days) >= 1:
             target_day = forecast_days[0]
             target_label = "today"
 
-        if temp_focus != "none" and isinstance(target_day, dict):
+        if measurement == "temperature" and request_type == "forecast" and isinstance(target_day, dict):
             day_data = target_day.get("day") or {}
             hi = day_data.get("maxtemp_f") if units == "us" else day_data.get("maxtemp_c")
             lo = day_data.get("mintemp_f") if units == "us" else day_data.get("mintemp_c")
             if temp_focus == "high" and hi is not None:
                 answer = f"The high for {target_label} in {loc_name} is {hi}{temp_unit}."
-                return re.sub(r"\s+", " ", answer).strip()[:max_chars]
+                return " ".join(answer.split())[:max_chars]
             if temp_focus == "low" and lo is not None:
                 answer = f"The low for {target_label} in {loc_name} is {lo}{temp_unit}."
-                return re.sub(r"\s+", " ", answer).strip()[:max_chars]
+                return " ".join(answer.split())[:max_chars]
             if temp_focus == "both" and hi is not None and lo is not None:
                 answer = f"For {target_label} in {loc_name}, the high is {hi}{temp_unit} and the low is {lo}{temp_unit}."
-                return re.sub(r"\s+", " ", answer).strip()[:max_chars]
+                return " ".join(answer.split())[:max_chars]
 
-        if self._request_prefers_temp_only(req):
-            return re.sub(r"\s+", " ", current_temp_line).strip()[:max_chars]
+        if request_type == "current":
+            if measurement == "temperature":
+                answer = current_temp_line
+            elif measurement == "humidity":
+                answer = f"Current humidity in {loc_name} is {humidity}%."
+            elif measurement == "wind":
+                answer = f"Current wind in {loc_name} is {wind} {wind_unit}."
+            elif measurement == "condition":
+                answer = f"Current conditions in {loc_name}: {cond}."
+            else:
+                answer = current_line
+            return " ".join(answer.split())[:max_chars]
 
         day_lines: List[str] = []
         for fd in forecast_days[: max(1, min(days, 3))]:
@@ -648,36 +718,29 @@ class WeatherForecastPlugin(ToolVerba):
                 answer = f"Forecast for {wanted_date.isoformat()} in {loc_name}: {self._format_one_day_plain(match, units)}"
             else:
                 answer = f"I could not find forecast data for {wanted_date.isoformat()} in {loc_name}."
-        elif any(token in req for token in ("current", "right now", "currently", "now")):
-            answer = current_line
-        elif "today" in req and len(forecast_days) >= 1:
+        elif day_hint in {"today", "tonight"} and len(forecast_days) >= 1:
             answer = f"Today in {loc_name}: {self._format_one_day_plain(forecast_days[0], units)}"
-        elif "tomorrow" in req and len(forecast_days) >= 2:
+        elif day_hint == "tomorrow" and len(forecast_days) >= 2:
             answer = f"Tomorrow in {loc_name}: {self._format_one_day_plain(forecast_days[1], units)}"
         elif day_lines:
-            asks_forecast = any(token in req for token in ("forecast", "today", "tomorrow", "week", "next "))
-            if asks_forecast:
-                answer = f"Forecast in {loc_name}: " + " ".join(day_lines[: max(1, min(days, 2))])
-            else:
-                answer = current_temp_line
+            answer = f"Forecast in {loc_name}: " + " ".join(day_lines[: max(1, min(days, 2))])
         else:
-            answer = current_temp_line
+            answer = f"I could not find forecast data for {loc_name}."
 
         alert_list = ((data.get("alerts") or {}).get("alert") or [])
-        asks_alerts = any(token in req for token in ("alert", "warning", "watch", "advisory"))
-        if asks_alerts and isinstance(alert_list, list) and alert_list:
+        if measurement == "alerts" and isinstance(alert_list, list) and alert_list:
             headline = str((alert_list[0] or {}).get("headline") or (alert_list[0] or {}).get("event") or "").strip()
             if headline:
                 answer += f" Alert: {headline}."
 
-        answer = re.sub(r"\s+", " ", answer).strip()
-        return answer[:max_chars]
+        return " ".join(answer.split())[:max_chars]
 
     async def _llm_guided_answer(
         self,
         *,
         llm_client: Any,
         request_text: str,
+        intent: Dict[str, Any],
         facts_block: str,
         max_chars: int,
         fallback_text: str,
@@ -690,6 +753,7 @@ class WeatherForecastPlugin(ToolVerba):
 
         prompt_payload = {
             "user_request": request,
+            "interpreted_weather_intent": intent,
             "weather_facts": facts,
             "max_chars": max_chars,
         }
@@ -700,19 +764,20 @@ class WeatherForecastPlugin(ToolVerba):
                     "Answer weather questions using ONLY the provided weather_facts.\n"
                     "Return only what the user requested.\n"
                     "Rules:\n"
+                    "- Treat interpreted_weather_intent as authoritative for scope, location, time, and measurement.\n"
                     "- If user asks for today's high/low, return only that value.\n"
                     "- Do not include extra forecast days unless explicitly requested.\n"
                     "- Keep answer concise (normally one sentence).\n"
                     "- No markdown, no bullets, no JSON, no tool calls."
                 ),
             },
-            {"role": "user", "content": str(prompt_payload)},
+            {"role": "user", "content": json.dumps(prompt_payload, ensure_ascii=False)},
         ]
         try:
             response = await llm_client.chat(
                 messages=messages,
                 max_tokens=max(80, min(260, int(max_chars // 2) + 80)),
-                temperature=0.1,
+                temperature=0.0,
             )
             answer = str((response.get("message", {}) or {}).get("content", "")).strip()
         except Exception:
@@ -724,14 +789,11 @@ class WeatherForecastPlugin(ToolVerba):
         if "```" in answer:
             answer = answer.replace("```", " ").strip()
 
-        decision_match = re.match(
-            r"^\s*(FINAL[\s_-]*ANSWER|NEED[\s_-]*USER[\s_-]*INFO)\s*:\s*(.+)$",
-            answer,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        if decision_match:
-            answer = str(decision_match.group(2) or "").strip()
-        elif re.match(r"^\s*RETRY[\s_-]*TOOL\s*:", answer, flags=re.IGNORECASE):
+        prefix, separator, remainder = answer.partition(":")
+        normalized_prefix = " ".join(prefix.replace("_", " ").replace("-", " ").upper().split())
+        if separator and normalized_prefix in {"FINAL ANSWER", "NEED USER INFO"}:
+            answer = remainder.strip()
+        elif separator and normalized_prefix == "RETRY TOOL":
             return fallback
 
         if not answer:
@@ -739,7 +801,7 @@ class WeatherForecastPlugin(ToolVerba):
         if answer.startswith("{") and ("function" in answer and "arguments" in answer):
             return fallback
 
-        answer = re.sub(r"\s+", " ", answer).strip()
+        answer = " ".join(answer.split())
         if not answer:
             return fallback
         return answer[: max(60, int(max_chars or 650))]
@@ -753,60 +815,29 @@ class WeatherForecastPlugin(ToolVerba):
             return "Weather is not configured. Please set your WeatherAPI.com API key in Settings > Integrations > WeatherAPI.com."
 
         args = args or {}
-
-        # Explicit structured arguments (preferred)
-        location = self._normalize_location_value(args.get("location"))
-        days = args.get("days")
-        date_str = (args.get("date") or "").strip() or None
-        hours = args.get("hours")
-        units = (args.get("units") or "").strip().lower()
-
-        explicit_args = bool(location) or any(
-            k in args for k in ("days", "date", "hours", "units")
-        )
-
         request_text = (args.get("request") or "").strip()
-
-        # Back-compat: if no explicit args provided, parse the raw request text
-        if not explicit_args and request_text:
-            location_override = self._normalize_location_value(
-                self._extract_location_override(request_text)
+        try:
+            intent = await self._interpret_weather_request_ai(
+                request_text=request_text,
+                args=args,
+                settings=settings,
+                llm_client=llm_client,
             )
-            if location_override:
-                location = location_override
-            parsed = self._interpret_request(
-                request_text,
-                default_days=settings["DEFAULT_DAYS"],
-                default_hours=settings["SHOW_HOURLY_PEEK"],
-            )
-            days = parsed.get("days")
-            date_str = parsed.get("date")
-            hours = parsed.get("hours")
+        except WeatherIntentError as exc:
+            return f"Weather request interpretation failed: {exc}"
 
-        used_default_location = False
-        if not location:
+        location = self._normalize_location_value(intent.get("location"))
+        used_default_location = intent.get("location_scope") == "local_outdoor"
+        if used_default_location:
             location = self._normalize_location_value(settings["DEFAULT_LOCATION"])
-            used_default_location = True
 
         if not location:
             return "No location provided and no default location is configured."
 
-        # Normalize days/hours/units
-        try:
-            days = int(days) if days is not None else int(settings["DEFAULT_DAYS"])
-        except Exception:
-            days = int(settings["DEFAULT_DAYS"])
-        days = max(1, min(days, 14))
-
-        try:
-            hours = int(hours) if hours is not None else int(settings["SHOW_HOURLY_PEEK"])
-        except Exception:
-            hours = int(settings["SHOW_HOURLY_PEEK"])
-        hours = max(0, min(hours, 48))
-
-        if units not in ("us", "metric"):
-            units = settings["DEFAULT_UNITS"]
-
+        days = self._bounded_int(intent.get("days"), settings["DEFAULT_DAYS"], 1, 14)
+        hours = self._bounded_int(intent.get("hours"), settings["SHOW_HOURLY_PEEK"], 0, 48)
+        units = str(intent.get("units") or settings["DEFAULT_UNITS"]).lower()
+        date_str = str(intent.get("date") or "").strip() or None
         wanted_date = self._parse_date(date_str) if date_str else None
         if wanted_date:
             today = date.today()
@@ -843,35 +874,21 @@ class WeatherForecastPlugin(ToolVerba):
         )
 
         if not request_text:
-            if not explicit_args:
-                request_text = "current temperature"
-            else:
-                req_bits = []
-                if wanted_date:
-                    req_bits.append(f"forecast for {wanted_date.isoformat()}")
-                elif days:
-                    req_bits.append(f"{days}-day forecast")
-                else:
-                    req_bits.append("weather forecast")
-                if hours:
-                    req_bits.append(f"next {hours} hours")
-                loc_label = location if location else "default location"
-                request_text = f"{' and '.join(req_bits)} in {loc_label}"
+            request_text = json.dumps(intent, ensure_ascii=False)
         if not facts:
             return "No weather data returned."
         deterministic = self._deterministic_answer(
             data=data,
-            request_text=request_text,
+            intent=intent,
             units=units,
             wanted_date=wanted_date,
             days=days,
             max_chars=max_chars,
         )
-        if self._request_prefers_temp_only(request_text) or self._requested_temp_focus(request_text) != "none":
-            return deterministic
         return await self._llm_guided_answer(
             llm_client=llm_client,
             request_text=request_text,
+            intent=intent,
             facts_block=facts,
             max_chars=max_chars,
             fallback_text=deterministic,

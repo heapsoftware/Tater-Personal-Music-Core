@@ -1364,9 +1364,9 @@
     {
       "id": "temperature_status",
       "name": "Temperature Status",
-      "version": "1.0.1",
+      "version": "1.0.3",
       "min_tater_version": "98.4",
-      "description": "Read temperature from Ecobee/HomeKit, Home Assistant, Hue, Shelly, UniFi Protect, and other integrations.",
+      "description": "Read a specifically named local room, thermostat, device, or temperature sensor; never handle general weather or geographic locations.",
       "portals": [
         "voice_core",
         "homeassistant",
@@ -1389,7 +1389,7 @@
         "integration"
       ],
       "entry": "verba/temperature_status.py",
-      "sha256": "4d17e39ffcb9913d2068435cc9fd25c4dfbef6dc8ee42c85c214af7b889d64e0"
+      "sha256": "15e2df25d58ea342d5d14e8ca00d29a95c646770eb7fe9fa58e6fb003461536a"
     },
     {
       "id": "unifi_network_health",
@@ -1507,9 +1507,9 @@
     {
       "id": "weather_forecast",
       "name": "Weather Forecast",
-      "version": "1.1.12",
+      "version": "1.2.1",
       "min_tater_version": "59",
-      "description": "Fetch WeatherAPI.com weather through Tater integrations and answer only what the user asked (LLM-guided).",
+      "description": "Get WeatherAPI.com conditions and forecasts for the configured home location or any named geographic place.",
       "portals": [
         "discord",
         "webui",
@@ -1528,7 +1528,7 @@
       "settings_category": null,
       "tags": [],
       "entry": "verba/weather_forecast.py",
-      "sha256": "a2697958d2135064eeca18dc500736cc435c0f87d4e938972a97e79e9d19a99a"
+      "sha256": "ef71b53fa58d6a872845f65bbd73245bc8fd2a62cfd51fc2829c793dce1c5a21"
     },
     {
       "id": "webdav_browser",

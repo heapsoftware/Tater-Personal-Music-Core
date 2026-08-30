@@ -129,6 +129,7 @@ class StandaloneCategoryVerbaTests(unittest.TestCase):
                     {
                         "camera_control": "1.0.3",
                         "device_control": "1.0.4",
+                        "temperature_status": "1.0.3",
                     }.get(verba_id, "1.0.1"),
                 )
                 self.assertEqual(row["min_tater_version"], "98.4")

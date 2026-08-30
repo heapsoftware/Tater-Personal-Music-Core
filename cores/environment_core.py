@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
+import math
 import re
 import time
 from datetime import datetime, timezone
@@ -15,9 +17,9 @@ from urllib.parse import parse_qsl, quote
 from helpers import extract_json, redis_client
 from tateros import integration_store as integration_store_module
 
-__version__ = "1.4.20"
+__version__ = "1.6.1"
 MIN_TATER_VERSION = "59"
-CORE_DESCRIPTION = "Local environment telemetry receiver for weather stations and configured sensor integrations."
+CORE_DESCRIPTION = "AI-interpreted weather orchestration across local sensors, configured providers, forecasts, and named-place lookups."
 TAGS = ["environment", "weather", "ecowitt", "telemetry"]
 
 logger = logging.getLogger("environment_core")
@@ -233,6 +235,34 @@ HYDRA_CURRENT_PRIMARY_KEYS = {
     "lightning": ("lightning_num", "lightning"),
 }
 
+WEATHER_INTENT_SCHEMA_VERSION = 1
+HYDRA_INTENT_REQUEST_TYPES = {"current", "forecast"}
+HYDRA_INTENT_LOCATION_SCOPES = {"local_outdoor", "local_area", "named_place"}
+HYDRA_INTENT_MEASUREMENTS = {
+    "general",
+    "condition",
+    "temperature",
+    "humidity",
+    "wind",
+    "rain",
+    "snow",
+    "pressure",
+    "solar",
+    "air_quality",
+    "lightning",
+    "pollen",
+    "alerts",
+    "battery",
+    "system",
+    "other",
+}
+HYDRA_INTENT_DAY_HINTS = {"current", "today", "tonight", "tomorrow", "weekend"}
+HYDRA_INTENT_TEMPERATURE_FOCUS = {"current", "high", "low", "both"}
+
+
+class EnvironmentIntentError(ValueError):
+    """Raised when the required AI environment interpretation is unavailable or invalid."""
+
 
 def _text(value: Any) -> str:
     if isinstance(value, (bytes, bytearray)):
@@ -263,6 +293,8 @@ def _as_float(value: Any) -> Optional[float]:
     if value is None or isinstance(value, bool):
         return None
     try:
+        if isinstance(value, (int, float)):
+            return float(value)
         return float(_text(value))
     except Exception:
         return None
@@ -2555,18 +2587,32 @@ def _normalize_weatherapi_forecast(data: Dict[str, Any], settings: Dict[str, Any
     return readings
 
 
-def _poll_weather_api(client: Any = None) -> Dict[str, Any]:
+def _weather_api_snapshot_for_location(
+    location: str,
+    args: Optional[Dict[str, Any]] = None,
+    client: Any = None,
+) -> Tuple[Dict[str, Any], str]:
     configured, message = _weather_api_configured(client)
     if not configured:
-        return {"ok": False, "provider": "weather_api", "message": message}
+        return {}, message
     module = _integration_module("weather_api")
     if module is None:
-        return {"ok": False, "provider": "weather_api", "message": "WeatherAPI.com integration is not enabled."}
+        return {}, "WeatherAPI.com integration is not enabled."
+    request_args = args if isinstance(args, dict) else {}
     try:
-        weather_settings = module.read_weatherapi_settings(client)
+        weather_settings = dict(module.read_weatherapi_settings(client) or {})
+        requested_units = _clean_key(request_args.get("units"))
+        if requested_units in {"us", "metric"}:
+            weather_settings["DEFAULT_UNITS"] = requested_units
+        days = _as_int(
+            request_args.get("limit") or weather_settings.get("DEFAULT_DAYS"),
+            weather_settings.get("DEFAULT_DAYS") or 3,
+            minimum=1,
+            maximum=14,
+        )
         data, error = module.fetch_weatherapi_forecast(
-            location=weather_settings.get("DEFAULT_LOCATION"),
-            days=weather_settings.get("DEFAULT_DAYS"),
+            location=location,
+            days=days,
             include_aqi=weather_settings.get("INCLUDE_AQI"),
             include_pollen=weather_settings.get("INCLUDE_POLLEN"),
             include_alerts=weather_settings.get("INCLUDE_ALERTS"),
@@ -2574,13 +2620,13 @@ def _poll_weather_api(client: Any = None) -> Dict[str, Any]:
             client=client,
         )
     except Exception as exc:
-        logger.warning("[Environment] WeatherAPI.com poll failed: %s", exc)
-        return {"ok": False, "provider": "weather_api", "message": str(exc)}
+        logger.warning("[Environment] WeatherAPI.com lookup failed: %s", exc)
+        return {}, str(exc)
     if error:
-        logger.warning("[Environment] WeatherAPI.com poll failed: %s", error)
-        return {"ok": False, "provider": "weather_api", "message": error}
+        logger.warning("[Environment] WeatherAPI.com lookup failed: %s", error)
+        return {}, _text(error)
     if not isinstance(data, dict) or not data:
-        return {"ok": False, "provider": "weather_api", "message": "WeatherAPI.com returned no forecast data."}
+        return {}, "WeatherAPI.com returned no forecast data."
     readings = _normalize_weatherapi_forecast(data, weather_settings)
     location = data.get("location") if isinstance(data.get("location"), dict) else {}
     source_name = ", ".join(
@@ -2605,7 +2651,27 @@ def _poll_weather_api(client: Any = None) -> Dict[str, Any]:
     if last_updated_epoch:
         snapshot["sample_time"] = last_updated_epoch
         snapshot["sample_time_text"] = _format_ts(last_updated_epoch)
+    return snapshot, ""
+
+
+def _poll_weather_api(client: Any = None) -> Dict[str, Any]:
+    module = _integration_module("weather_api")
+    if module is None:
+        return {"ok": False, "provider": "weather_api", "message": "WeatherAPI.com integration is not enabled."}
+    try:
+        weather_settings = module.read_weatherapi_settings(client)
+    except Exception as exc:
+        return {"ok": False, "provider": "weather_api", "message": str(exc)}
+    snapshot, error = _weather_api_snapshot_for_location(
+        _text(weather_settings.get("DEFAULT_LOCATION")),
+        {"limit": weather_settings.get("DEFAULT_DAYS")},
+        client,
+    )
+    if error:
+        return {"ok": False, "provider": "weather_api", "message": error}
     _store_snapshot(snapshot, client, provider_key="weather_api")
+    source_name = _text(snapshot.get("model")) or "WeatherAPI.com"
+    readings = snapshot.get("readings") if isinstance(snapshot.get("readings"), list) else []
     logger.info("[Environment] WeatherAPI.com poll stored %d readings.", len(readings))
     return {
         "ok": True,
@@ -2828,6 +2894,8 @@ def _combined_snapshot(provider_snapshots: Dict[str, Dict[str, Any]]) -> Dict[st
             next_row.setdefault("provider_label", _provider_label(provider))
             next_row.setdefault("source_id", source_id)
             next_row.setdefault("source_name", single.get("model") or single.get("stationtype") or _provider_label(provider))
+            next_row.setdefault("_source_received_at", single.get("received_at"))
+            next_row.setdefault("_source_sample_time", single.get("sample_time") or single.get("received_at"))
             enriched_readings.append(next_row)
         single["readings"] = enriched_readings
         single["providers"] = [_snapshot_provider_summary(single)]
@@ -2856,6 +2924,8 @@ def _combined_snapshot(provider_snapshots: Dict[str, Dict[str, Any]]) -> Dict[st
             next_row.setdefault("provider_label", _provider_label(provider))
             next_row.setdefault("source_id", snapshot.get("source_id") or provider)
             next_row.setdefault("source_name", _provider_label(provider))
+            next_row.setdefault("_source_received_at", received)
+            next_row.setdefault("_source_sample_time", sample or received)
             readings.append(next_row)
 
     readings.sort(
@@ -3461,6 +3531,34 @@ def _weather_condition_icon(kind: str, *, x: int, y: int, scale: float = 1.0, in
     return cloud_svg
 
 
+def _tater_mascot_svg(
+    *,
+    x: int,
+    y: int,
+    scale: float = 1.0,
+    body: str = "#d7a15b",
+    outline: str = "#744425",
+    leaf: str = "#82b96b",
+    ink: str = "#2a1b13",
+) -> str:
+    """Return a small, friendly Tater mark for Environment Core artwork."""
+    transform = f"translate({x} {y}) scale({scale:.3f})"
+    return f"""
+<g transform="{transform}">
+  <path d="M58 18 C44 -3 24 2 19 17 C35 18 47 24 58 36" fill="{html_escape(leaf)}" stroke="{html_escape(outline)}" stroke-width="4" stroke-linejoin="round"/>
+  <path d="M62 18 C75 -4 97 2 101 18 C84 18 72 25 61 37" fill="{html_escape(leaf)}" stroke="{html_escape(outline)}" stroke-width="4" stroke-linejoin="round"/>
+  <path d="M60 34 C29 31 10 53 13 83 C15 113 35 132 63 130 C94 128 111 106 108 76 C106 47 88 32 60 34 Z" fill="{html_escape(body)}" stroke="{html_escape(outline)}" stroke-width="5"/>
+  <ellipse cx="39" cy="62" rx="5" ry="7" fill="{html_escape(ink)}"/>
+  <ellipse cx="78" cy="62" rx="5" ry="7" fill="{html_escape(ink)}"/>
+  <circle cx="27" cy="80" r="7" fill="#df8068" opacity="0.48"/>
+  <circle cx="91" cy="80" r="7" fill="#df8068" opacity="0.48"/>
+  <path d="M43 84 C51 94 68 94 76 84" fill="none" stroke="{html_escape(ink)}" stroke-width="5" stroke-linecap="round"/>
+  <circle cx="84" cy="103" r="4" fill="{html_escape(outline)}" opacity="0.34"/>
+  <circle cx="33" cy="107" r="3" fill="{html_escape(outline)}" opacity="0.28"/>
+</g>
+""".strip()
+
+
 def _weather_day_label(value: Any) -> str:
     text = _text(value)
     if not text:
@@ -3492,7 +3590,8 @@ def _weather_current_card_data_uri(condition_snapshot: Dict[str, Any], *, live_s
     wind = _reading_display(live, "windspeedmph", _category_display(live, "wind", _reading_display(condition_snapshot, "weather_api_wind_kph")))
     accent = theme["accent"]
     ink = theme["ink"]
-    icon = _weather_condition_icon(theme["kind"], x=620, y=40, scale=0.92, ink="#ffffff", accent=accent)
+    icon = _weather_condition_icon(theme["kind"], x=590, y=18, scale=0.68, ink="#ffffff", accent=accent)
+    tater = _tater_mascot_svg(x=756, y=126, scale=1.05)
     svg = f"""
 <svg xmlns="http://www.w3.org/2000/svg" width="960" height="360" viewBox="0 0 960 360">
   <defs>
@@ -3507,11 +3606,13 @@ def _weather_current_card_data_uri(condition_snapshot: Dict[str, Any], *, live_s
   </defs>
   <rect width="960" height="360" rx="34" fill="url(#bg)"/>
   <circle cx="850" cy="18" r="180" fill="url(#shine)"/>
-  <text x="54" y="76" fill="{html_escape(ink)}" font-family="Inter, Arial, sans-serif" font-size="26" font-weight="700" opacity="0.82">Current Conditions</text>
+  <path d="M0 326 C155 305 274 348 432 325 C608 299 731 348 960 315 L960 360 L0 360 Z" fill="#5a3824" opacity="0.38"/>
+  <text x="54" y="76" fill="{html_escape(ink)}" font-family="Inter, Arial, sans-serif" font-size="26" font-weight="700" opacity="0.86">Tater Weather  ·  Current Conditions</text>
   <text x="54" y="182" fill="{html_escape(ink)}" font-family="Inter, Arial, sans-serif" font-size="96" font-weight="800">{html_escape(temp)}</text>
   <text x="58" y="238" fill="{html_escape(ink)}" font-family="Inter, Arial, sans-serif" font-size="36" font-weight="750">{html_escape(condition)}</text>
   <text x="60" y="296" fill="{html_escape(ink)}" font-family="Inter, Arial, sans-serif" font-size="24" opacity="0.86">Feels {html_escape(feels)}   Humidity {html_escape(humidity)}   Wind {html_escape(wind)}</text>
-  <g>{icon}</g>
+  <g opacity="0.94">{icon}</g>
+  {tater}
 </svg>
 """.strip()
     return "data:image/svg+xml;charset=utf-8," + quote(svg)
@@ -3530,7 +3631,7 @@ def _weather_forecast_cards_data_uri(snapshot: Dict[str, Any], *, units: str) ->
         condition_text = _text(condition.get("text")) or "Forecast"
         theme = _weather_condition_theme(condition_text)
         x = 36 + index * (card_w + gap)
-        y = 34
+        y = 52
         high = _weatherapi_temp(day, "maxtemp_f", "maxtemp_c", units)
         low = _weatherapi_temp(day, "mintemp_f", "mintemp_c", units)
         rain = f"{_text(day.get('daily_chance_of_rain')) or '0'}%"
@@ -3541,6 +3642,7 @@ def _weather_forecast_cards_data_uri(snapshot: Dict[str, Any], *, units: str) ->
   <g>
     <rect x="{x}" y="{y}" width="{card_w}" height="292" rx="28" fill="{html_escape(theme['top'])}"/>
     <rect x="{x}" y="{y}" width="{card_w}" height="292" rx="28" fill="{html_escape(theme['bottom'])}" opacity="0.58"/>
+    <rect x="{x + 1}" y="{y + 1}" width="{card_w - 2}" height="290" rx="27" fill="none" stroke="#f4dfb5" stroke-opacity="0.24" stroke-width="2"/>
     <text x="{x + 26}" y="{y + 44}" fill="{html_escape(theme['ink'])}" font-family="Inter, Arial, sans-serif" font-size="26" font-weight="800">{html_escape(_weather_day_label(item.get('date')))}</text>
     <text x="{x + card_w - 24}" y="{y + 44}" text-anchor="end" fill="{html_escape(theme['ink'])}" font-family="Inter, Arial, sans-serif" font-size="18" opacity="0.82">{html_escape(_text(item.get('date'))[5:] or '')}</text>
     <g opacity="0.95">{icon}</g>
@@ -3553,16 +3655,27 @@ def _weather_forecast_cards_data_uri(snapshot: Dict[str, Any], *, units: str) ->
         )
 
     if not cards:
+        tater = _tater_mascot_svg(x=465, y=92, scale=0.86)
         cards.append(
-            """
-  <text x="540" y="180" text-anchor="middle" fill="#edf3f0" font-family="Inter, Arial, sans-serif" font-size="28" font-weight="700">Waiting for forecast data</text>
+            f"""
+  {tater}
+  <text x="540" y="275" text-anchor="middle" fill="#f6ead4" font-family="Inter, Arial, sans-serif" font-size="28" font-weight="700">Tater is waiting for forecast data</text>
 """.strip()
         )
 
     svg = f"""
 <svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
-  <rect width="{width}" height="{height}" rx="28" fill="#101820"/>
-  <text x="38" y="24" fill="#edf3f0" font-family="Inter, Arial, sans-serif" font-size="22" font-weight="800">Daily Forecast</text>
+  <title>Tater forecast patch</title>
+  <defs>
+    <linearGradient id="forecast-bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#17130f"/>
+      <stop offset="1" stop-color="#2b1c13"/>
+    </linearGradient>
+  </defs>
+  <rect width="{width}" height="{height}" rx="28" fill="url(#forecast-bg)"/>
+  <path d="M0 326 C180 302 330 350 510 324 C700 298 854 348 1080 316 L1080 360 L0 360 Z" fill="#583722" opacity="0.36"/>
+  <path d="M39 33 C46 17 59 18 62 29 C53 29 46 32 39 40 C34 23 21 23 17 34 C26 34 33 36 39 43" fill="#82b96b"/>
+  <text x="76" y="35" fill="#f6ead4" font-family="Inter, Arial, sans-serif" font-size="23" font-weight="800">Tater Forecast Patch</text>
   {''.join(cards)}
 </svg>
 """.strip()
@@ -3687,42 +3800,176 @@ def _weatherapi_air_rows(snapshot: Dict[str, Any]) -> List[Dict[str, str]]:
 
 
 def _chart_time_label(snapshot: Dict[str, Any]) -> str:
-    ts = _as_float(snapshot.get("sample_time")) or _as_float(snapshot.get("received_at"))
+    ts = _trend_timestamp(snapshot)
     if not ts:
         return "-"
     return datetime.fromtimestamp(ts).strftime("%H:%M")
 
 
-def _trend_points(history: List[Dict[str, Any]], key: str, *, samples: int = 72) -> List[Dict[str, Any]]:
-    points: List[Dict[str, Any]] = []
-    for item in reversed(history[: max(1, int(samples))]):
+def _trend_timestamp(snapshot: Dict[str, Any]) -> Optional[float]:
+    sample_time = _as_float(snapshot.get("sample_time"))
+    received_at = _as_float(snapshot.get("received_at"))
+    for value in (sample_time, received_at):
+        if value is not None and math.isfinite(value) and value > 0:
+            return value
+    return None
+
+
+def _trend_identity(snapshot: Dict[str, Any], row: Dict[str, Any]) -> Tuple[str, str]:
+    provider = _clean_key(row.get("provider") or snapshot.get("provider") or "environment")
+    source_id = _text(row.get("source_id") or snapshot.get("source_id"))
+    return provider, source_id
+
+
+def _valid_trend_value(row: Dict[str, Any], key: str) -> Optional[float]:
+    raw_value = row.get("value")
+    raw_text = str(raw_value).strip().lower() if raw_value is not None else ""
+    if raw_text in {"", "-", "--", "none", "null", "nan", "inf", "+inf", "-inf", "unknown", "unavailable"}:
+        return None
+    value = _as_float(raw_value)
+    if value is None or not math.isfinite(value):
+        return None
+
+    token = _clean_key(key)
+    category = _clean_key(row.get("category"))
+    unit = _text(row.get("unit")).lower().replace("°", "")
+    bounds: Optional[Tuple[float, float]] = None
+    if category == "temperature" or "temp" in token:
+        bounds = (-100.0, 80.0) if unit == "c" else (-150.0, 180.0)
+    elif category == "humidity" or "humidity" in token or "moisture" in token:
+        bounds = (0.0, 100.0)
+    elif category == "wind" or token.startswith("wind") or "gust" in token:
+        bounds = (0.0, 500.0 if "kph" in unit else 300.0)
+    elif category == "rain" or "rain" in token:
+        upper = 3000.0 if unit.startswith("mm") else 120.0
+        bounds = (0.0, upper)
+    elif category == "lightning" or "lightning" in token:
+        bounds = (0.0, 100000.0 if token.endswith("num") else 500.0)
+    if bounds is not None and not bounds[0] <= value <= bounds[1]:
+        return None
+    return value
+
+
+def _without_isolated_trend_spikes(points: List[Dict[str, Any]], key: str) -> List[Dict[str, Any]]:
+    """Drop only clear one-off sensor errors; sustained changes remain untouched."""
+    if len(points) < 3:
+        return points
+    token = _clean_key(key)
+    category = _clean_key(points[-1].get("category"))
+    unit = _text(points[-1].get("unit")).lower().replace("°", "")
+    if category == "temperature" or "temp" in token:
+        threshold = 8.0 if unit == "c" else 15.0
+    elif category == "humidity" or "humidity" in token:
+        threshold = 28.0
+    else:
+        return points
+
+    filtered: List[Dict[str, Any]] = []
+    for index, point in enumerate(points):
+        if index == 0 or index == len(points) - 1:
+            filtered.append(point)
+            continue
+        neighbors = points[max(0, index - 2) : index] + points[index + 1 : min(len(points), index + 3)]
+        neighbor_values = sorted(
+            value
+            for value in (_as_float(item.get("value")) for item in neighbors)
+            if value is not None and math.isfinite(value)
+        )
+        if len(neighbor_values) < 2:
+            filtered.append(point)
+            continue
+        middle = len(neighbor_values) // 2
+        median = (
+            neighbor_values[middle]
+            if len(neighbor_values) % 2
+            else (neighbor_values[middle - 1] + neighbor_values[middle]) / 2.0
+        )
+        value = _as_float(point.get("value"))
+        neighbor_support = sum(1 for neighbor in neighbor_values if abs(neighbor - median) <= threshold / 3.0)
+        if value is not None and abs(value - median) > threshold and neighbor_support >= 2:
+            continue
+        filtered.append(point)
+    return filtered
+
+
+def _trend_points(
+    history: List[Dict[str, Any]],
+    key: str,
+    *,
+    samples: int = 72,
+    provider: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    requested_provider = _clean_key(provider)
+    target_identity: Optional[Tuple[str, str]] = None
+    for item in history:
         row = _reading(item, key)
         if not row:
             continue
-        value = _as_float(row.get("value"))
-        if value is None:
+        identity = _trend_identity(item, row)
+        if requested_provider and identity[0] != requested_provider:
+            continue
+        if _trend_timestamp(item) is None or _valid_trend_value(row, key) is None:
+            continue
+        target_identity = identity
+        break
+    if target_identity is None:
+        return []
+
+    points_by_time: Dict[float, Dict[str, Any]] = {}
+    for item in reversed(history):
+        row = _reading(item, key)
+        if not row or _trend_identity(item, row) != target_identity:
+            continue
+        timestamp = _trend_timestamp(item)
+        value = _valid_trend_value(row, key)
+        if timestamp is None or value is None:
             continue
         unit = _text(row.get("unit"))
-        points.append(
-            {
-                "label": _chart_time_label(item),
-                "value": round(value, 3),
-                "display": _value_label(value, unit),
-            }
-        )
-    return points
+        points_by_time[timestamp] = {
+            "label": datetime.fromtimestamp(timestamp).strftime("%H:%M"),
+            "timestamp": timestamp,
+            "value": round(value, 3),
+            "display": _value_label(value, unit),
+            "unit": unit,
+            "category": _clean_key(row.get("category")),
+            "provider": target_identity[0],
+            "source": _text(row.get("source_name") or item.get("model")) or _provider_label(target_identity[0]),
+        }
+    ordered = [points_by_time[timestamp] for timestamp in sorted(points_by_time)]
+    cleaned = _without_isolated_trend_spikes(ordered, key)
+    return cleaned[-max(1, int(samples)) :]
 
 
 def _chart_color(token: str) -> str:
     colors = {
-        "temperature": "#ef8a4c",
-        "humidity": "#5bd6c6",
-        "wind": "#79a7ff",
-        "rain": "#5aa9e6",
-        "lightning": "#f4d35e",
-        "solar": "#f6ae2d",
+        "temperature": "#ed9250",
+        "humidity": "#72c8ac",
+        "wind": "#78add7",
+        "rain": "#64aee2",
+        "lightning": "#f1cf5b",
+        "solar": "#efad3f",
     }
-    return colors.get(token, "#5bd6c6")
+    return colors.get(token, "#72c8ac")
+
+
+def _smooth_chart_path(coords: List[Tuple[float, float]]) -> str:
+    if not coords:
+        return ""
+    if len(coords) == 1:
+        return f"M {coords[0][0]:.2f} {coords[0][1]:.2f}"
+    path = [f"M {coords[0][0]:.2f} {coords[0][1]:.2f}"]
+    for index in range(len(coords) - 1):
+        p0 = coords[index - 1] if index > 0 else coords[index]
+        p1 = coords[index]
+        p2 = coords[index + 1]
+        p3 = coords[index + 2] if index + 2 < len(coords) else p2
+        low_y, high_y = sorted((p1[1], p2[1]))
+        c1x = p1[0] + (p2[0] - p0[0]) / 6.0
+        c1y = max(low_y, min(high_y, p1[1] + (p2[1] - p0[1]) / 6.0))
+        c2x = p2[0] - (p3[0] - p1[0]) / 6.0
+        c2y = max(low_y, min(high_y, p2[1] - (p3[1] - p1[1]) / 6.0))
+        path.append(f"C {c1x:.2f} {c1y:.2f} {c2x:.2f} {c2y:.2f} {p2[0]:.2f} {p2[1]:.2f}")
+    return " ".join(path)
 
 
 def _line_chart_data_uri(title: str, points: List[Dict[str, Any]], *, unit: str = "", color: str = "#5bd6c6") -> str:
@@ -3734,8 +3981,13 @@ def _line_chart_data_uri(title: str, points: List[Dict[str, Any]], *, unit: str 
     bottom = 58
     plot_w = width - left - right
     plot_h = height - top - bottom
-    values = [_as_float(point.get("value")) for point in points]
-    values = [value for value in values if value is not None]
+    clean_points = []
+    for point in points:
+        value = _as_float(point.get("value"))
+        if value is not None and math.isfinite(value):
+            clean_points.append(point)
+    values = [float(point["value"]) for point in clean_points]
+    tater_mark = _tater_mascot_svg(x=22, y=8, scale=0.27)
 
     def label_value(value: float) -> str:
         return _value_label(value, unit)
@@ -3743,9 +3995,17 @@ def _line_chart_data_uri(title: str, points: List[Dict[str, Any]], *, unit: str 
     if not values:
         svg = f"""
 <svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
-  <rect width="{width}" height="{height}" rx="16" fill="#101820"/>
-  <text x="{left}" y="52" fill="#edf3f0" font-family="Inter, Arial, sans-serif" font-size="26" font-weight="700">{html_escape(title)}</text>
-  <text x="{left}" y="142" fill="#8b9c9f" font-family="Inter, Arial, sans-serif" font-size="20">Waiting for trend data</text>
+  <title>{html_escape('Tater trend chart: ' + title)}</title>
+  <defs>
+    <linearGradient id="empty-bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#17130f"/>
+      <stop offset="1" stop-color="#2a1d15"/>
+    </linearGradient>
+  </defs>
+  <rect width="{width}" height="{height}" rx="20" fill="url(#empty-bg)"/>
+  {tater_mark}
+  <text x="{left + 4}" y="38" fill="#f6ead4" font-family="Inter, Arial, sans-serif" font-size="24" font-weight="700">{html_escape(title)}</text>
+  <text x="{left}" y="142" fill="#b8aa92" font-family="Inter, Arial, sans-serif" font-size="20">Waiting for the next real sensor reading</text>
 </svg>
 """.strip()
         return "data:image/svg+xml;charset=utf-8," + quote(svg)
@@ -3758,15 +4018,15 @@ def _line_chart_data_uri(title: str, points: List[Dict[str, Any]], *, unit: str 
     span = max(max_v - min_v, 0.000001)
 
     def x_for(index: int) -> float:
-        if len(points) <= 1:
+        if len(clean_points) <= 1:
             return left + plot_w / 2
-        return left + (index / (len(points) - 1)) * plot_w
+        return left + (index / (len(clean_points) - 1)) * plot_w
 
     def y_for(value: float) -> float:
         return top + plot_h - ((value - min_v) / span) * plot_h
 
     coords: List[Tuple[float, float]] = []
-    for index, point in enumerate(points):
+    for index, point in enumerate(clean_points):
         value = _as_float(point.get("value"))
         if value is None:
             continue
@@ -3775,19 +4035,20 @@ def _line_chart_data_uri(title: str, points: List[Dict[str, Any]], *, unit: str 
     if not coords:
         return _line_chart_data_uri(title, [], unit=unit, color=color)
 
-    path = " ".join(f"{'M' if index == 0 else 'L'} {x:.2f} {y:.2f}" for index, (x, y) in enumerate(coords))
+    path = _smooth_chart_path(coords)
     first_x, _first_y = coords[0]
     last_x, last_y = coords[-1]
     area_path = f"{path} L {last_x:.2f} {top + plot_h:.2f} L {first_x:.2f} {top + plot_h:.2f} Z"
-    first_label = _text(points[0].get("label"))
-    last_label = _text(points[-1].get("label"))
-    latest_value = _as_float(points[-1].get("value")) or 0.0
-    latest_display = _text(points[-1].get("display")) or label_value(latest_value)
+    first_label = _text(clean_points[0].get("label"))
+    last_label = _text(clean_points[-1].get("label"))
+    latest_value = _as_float(clean_points[-1].get("value"))
+    latest_value = latest_value if latest_value is not None else 0.0
+    latest_display = _text(clean_points[-1].get("display")) or label_value(latest_value)
     high_label = label_value(max(values))
     low_label = label_value(min(values))
     mid_y = top + plot_h / 2
     grid_lines = "\n".join(
-        f'<line x1="{left}" y1="{y:.2f}" x2="{left + plot_w}" y2="{y:.2f}" stroke="#26323d" stroke-width="1"/>'
+        f'<line x1="{left}" y1="{y:.2f}" x2="{left + plot_w}" y2="{y:.2f}" stroke="#4b3a2c" stroke-width="1"/>'
         for y in (top, mid_y, top + plot_h)
     )
     dots = "\n".join(
@@ -3797,24 +4058,31 @@ def _line_chart_data_uri(title: str, points: List[Dict[str, Any]], *, unit: str 
 
     svg = f"""
 <svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
+  <title>{html_escape('Tater trend chart: ' + title)}</title>
   <defs>
+    <linearGradient id="chart-bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#17130f"/>
+      <stop offset="1" stop-color="#2a1d15"/>
+    </linearGradient>
     <linearGradient id="area" x1="0" x2="0" y1="0" y2="1">
       <stop offset="0" stop-color="{html_escape(color)}" stop-opacity="0.30"/>
       <stop offset="1" stop-color="{html_escape(color)}" stop-opacity="0.02"/>
     </linearGradient>
   </defs>
-  <rect width="{width}" height="{height}" rx="16" fill="#101820"/>
-  <text x="{left}" y="30" fill="#edf3f0" font-family="Inter, Arial, sans-serif" font-size="22" font-weight="700">{html_escape(title)}</text>
-  <text x="{width - right}" y="30" text-anchor="end" fill="#edf3f0" font-family="Inter, Arial, sans-serif" font-size="20" font-weight="700">{html_escape(latest_display)}</text>
+  <rect width="{width}" height="{height}" rx="20" fill="url(#chart-bg)"/>
+  <path d="M0 254 C145 238 268 270 410 252 C562 233 676 270 800 247 L800 280 L0 280 Z" fill="#583722" opacity="0.20"/>
+  {tater_mark}
+  <text x="{left + 4}" y="30" fill="#f6ead4" font-family="Inter, Arial, sans-serif" font-size="22" font-weight="700">{html_escape(title)}</text>
+  <text x="{width - right}" y="30" text-anchor="end" fill="#f6ead4" font-family="Inter, Arial, sans-serif" font-size="20" font-weight="700">{html_escape(latest_display)}</text>
   {grid_lines}
   <path d="{html_escape(area_path)}" fill="url(#area)"/>
   <path d="{html_escape(path)}" fill="none" stroke="{html_escape(color)}" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
   {dots}
-  <circle cx="{last_x:.2f}" cy="{last_y:.2f}" r="5.2" fill="#edf3f0" stroke="{html_escape(color)}" stroke-width="3"/>
-  <text x="{left}" y="{height - 28}" fill="#8b9c9f" font-family="Inter, Arial, sans-serif" font-size="16">{html_escape(first_label)}</text>
-  <text x="{width - right}" y="{height - 28}" text-anchor="end" fill="#8b9c9f" font-family="Inter, Arial, sans-serif" font-size="16">{html_escape(last_label)}</text>
-  <text x="{left}" y="{height - 8}" fill="#8b9c9f" font-family="Inter, Arial, sans-serif" font-size="15">Low {html_escape(low_label)}</text>
-  <text x="{width - right}" y="{height - 8}" text-anchor="end" fill="#8b9c9f" font-family="Inter, Arial, sans-serif" font-size="15">High {html_escape(high_label)}</text>
+  <circle cx="{last_x:.2f}" cy="{last_y:.2f}" r="5.2" fill="#f6ead4" stroke="{html_escape(color)}" stroke-width="3"/>
+  <text x="{left}" y="{height - 28}" fill="#b8aa92" font-family="Inter, Arial, sans-serif" font-size="16">{html_escape(first_label)}</text>
+  <text x="{width - right}" y="{height - 28}" text-anchor="end" fill="#b8aa92" font-family="Inter, Arial, sans-serif" font-size="16">{html_escape(last_label)}</text>
+  <text x="{left}" y="{height - 8}" fill="#b8aa92" font-family="Inter, Arial, sans-serif" font-size="15">Low {html_escape(low_label)}</text>
+  <text x="{width - right}" y="{height - 8}" text-anchor="end" fill="#b8aa92" font-family="Inter, Arial, sans-serif" font-size="15">High {html_escape(high_label)}</text>
 </svg>
 """.strip()
     return "data:image/svg+xml;charset=utf-8," + quote(svg)
@@ -3828,21 +4096,18 @@ def _trend_image_field(
     *,
     color_token: str,
     samples: int = 72,
+    provider: Optional[str] = "ecowitt",
 ) -> Dict[str, Any]:
-    unit = ""
-    for item in history:
-        row = _reading(item, key)
-        if row:
-            unit = _text(row.get("unit"))
-            break
-    points = _trend_points(history, key, samples=samples)
+    points = _trend_points(history, key, samples=samples, provider=provider)
+    unit = _text(points[-1].get("unit")) if points else ""
+    source = _text(points[-1].get("source")) if points else _provider_label(provider)
     return {
         "key": f"chart_{_clean_key(key)}",
         "label": label,
         "type": "image",
         "src": _line_chart_data_uri(label, points, unit=unit, color=_chart_color(color_token)),
         "alt": label,
-        "caption": f"{len(points)} recent sample{'s' if len(points) != 1 else ''}",
+        "caption": f"{len(points)} actual reading{'s' if len(points) != 1 else ''} · gaps and bad samples ignored · {source}",
         "description": description,
         "read_only": True,
     }
@@ -3853,11 +4118,11 @@ def _trend_card(*, card_id: str, title: str, detail: str, fields: List[Dict[str,
         "id": card_id,
         "group": "trend",
         "title": title,
-        "subtitle": "Recent history",
+        "subtitle": "Clean sensor history",
         "detail": detail,
         "sections": [
             {
-                "label": "Graphs",
+                "label": "Tater Trends",
                 "inline": True,
                 "fields": fields,
             }
@@ -3994,6 +4259,7 @@ def _environment_manager_ui(
     overview_badges = [
         {"label": "Live" if has_snapshot and not is_stale else "Stale" if has_snapshot else "Waiting", "tone": "good" if has_snapshot and not is_stale else "warning"},
         {"label": f"{source_count} source{'s' if source_count != 1 else ''}" if source_count else "No sources", "tone": "muted"},
+        {"label": "Tater Weather", "tone": "muted"},
     ]
     if battery_rows:
         overview_badges.append({"label": "Low Battery" if low_battery_count else "Batteries OK", "tone": "danger" if low_battery_count else "good"})
@@ -4001,7 +4267,7 @@ def _environment_manager_ui(
         {
             "id": "overview:current_conditions",
             "group": "overview",
-            "title": "Current Conditions",
+            "title": "Tater Weather Now",
             "subtitle": _reading_display(current_condition_snapshot, "weather_api_condition", "Live weather"),
             "sections": current_condition_sections,
         }
@@ -4009,9 +4275,9 @@ def _environment_manager_ui(
         else None
     )
     forecast_visual_card = {
-        "id": f"forecast:{forecast_provider}:cards",
-        "group": "forecast",
-        "title": "Daily Forecast",
+            "id": f"forecast:{forecast_provider}:cards",
+            "group": "forecast",
+            "title": "Tater Forecast Patch",
         "subtitle": _provider_label(forecast_provider),
         "sections": [
             {
@@ -4196,10 +4462,10 @@ def _environment_manager_ui(
         {
             "id": "overview",
             "group": "overview",
-            "title": "Live Environment",
+            "title": "Tater's Weather Patch",
             "subtitle": f"{source_count} active source{'s' if source_count != 1 else ''}" if source_count else "Waiting for telemetry",
             "detail": (
-                f"Last sample {_age_label(received_at)}."
+                f"The patch was last checked {_age_label(received_at)}."
                 if has_snapshot
                 else f"Point Ecowitt custom server uploads at {webhook_path}."
             ),
@@ -4508,7 +4774,7 @@ def _environment_manager_ui(
             _trend_card(
                 card_id="trend:temperature",
                 title="Temperature Graphs",
-                detail="Outdoor and indoor temperature over recent Ecowitt uploads.",
+                detail="Outdoor and indoor temperature from one consistent station. Missing and isolated bad readings are ignored.",
                 fields=[
                     _trend_image_field(history, "tempf", "Outdoor Temperature", "Recent outdoor temperature trend.", color_token="temperature"),
                     _trend_image_field(history, "tempinf", "Indoor Temperature", "Recent indoor temperature trend.", color_token="temperature"),
@@ -4517,7 +4783,7 @@ def _environment_manager_ui(
             _trend_card(
                 card_id="trend:wind",
                 title="Wind Graphs",
-                detail="Sustained wind, gusts, and daily maximum gust over recent uploads.",
+                detail="Sustained wind, gusts, and daily maximum gust using only genuine readings from one station.",
                 fields=[
                     _trend_image_field(history, "windspeedmph", "Wind Speed", "Recent sustained wind speed.", color_token="wind"),
                     _trend_image_field(history, "windgustmph", "Wind Gust", "Recent wind gust readings.", color_token="wind"),
@@ -4527,7 +4793,7 @@ def _environment_manager_ui(
             _trend_card(
                 card_id="trend:rain",
                 title="Rain Graphs",
-                detail="Rain rate and daily accumulation over recent uploads.",
+                detail="Rain rate and daily accumulation with empty or invalid samples left out of the trail.",
                 fields=[
                     _trend_image_field(history, "rainratein", "Rain Rate", "Recent rain rate trend.", color_token="rain"),
                     _trend_image_field(history, "rrain_piezo", "Piezo Rain Rate", "Recent piezo rain rate trend.", color_token="rain"),
@@ -4538,7 +4804,7 @@ def _environment_manager_ui(
             _trend_card(
                 card_id="trend:lightning",
                 title="Lightning Graphs",
-                detail="Lightning strike count and distance when supported by the station.",
+                detail="Lightning strike count and distance when supported, without invented points between readings.",
                 fields=[
                     _trend_image_field(history, "lightning_num", "Lightning Strikes", "Recent reported lightning strike count.", color_token="lightning"),
                     _trend_image_field(history, "lightning", "Lightning Distance", "Recent distance to lightning activity.", color_token="lightning"),
@@ -4549,14 +4815,14 @@ def _environment_manager_ui(
 
     return {
         "kind": "settings_manager",
-        "title": "Environment Core",
+        "title": "Environment Core · Tater Weather",
         "stats_refresh_button": True,
         "stats_refresh_label": "Refresh",
-        "empty_message": "No environment telemetry has been received yet.",
+        "empty_message": "Tater is waiting for the first environment reading.",
         "manager_tabs": [
             {"key": "overview", "label": "Overview", "source": "items", "item_group": "overview"},
             {"key": "forecast", "label": "Forecast", "source": "items", "item_group": "forecast"},
-            {"key": "trends", "label": "Graphs", "source": "items", "item_group": "trend"},
+            {"key": "trends", "label": "Tater Trends", "source": "items", "item_group": "trend"},
             {"key": "add_source", "label": "Add Sensor", "source": "add_form"},
             {"key": "sources", "label": "Sources", "source": "items", "item_group": "source", "selector": True},
             {"key": "settings", "label": "Settings", "source": "items", "item_group": "settings"},
@@ -4864,8 +5130,8 @@ def _hydra_reading_matches(row: Dict[str, Any], args: Dict[str, Any]) -> bool:
     return True
 
 
-def _hydra_reading_row(row: Dict[str, Any]) -> Dict[str, str]:
-    return {
+def _hydra_reading_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
         "label": _text(row.get("label")),
         "value": _text(row.get("display")) or _value_label(row.get("value"), _text(row.get("unit"))),
         "area": _text(row.get("area")),
@@ -4873,6 +5139,13 @@ def _hydra_reading_row(row: Dict[str, Any]) -> Dict[str, str]:
         "provider": _text(row.get("provider_label")) or _provider_label(row.get("provider")),
         "source": _text(row.get("source_name")) or _text(row.get("source_id")),
     }
+    observed_at = _hydra_row_observed_at(row)
+    if observed_at is not None:
+        out["observed_at"] = observed_at
+        out["last_sample"] = _age_label(observed_at)
+    if "_source_stale" in row:
+        out["stale"] = _as_bool(row.get("_source_stale"), False)
+    return out
 
 
 def _hydra_relevant_readings(snapshot: Dict[str, Any], args: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -4960,24 +5233,121 @@ def _hydra_filter_context(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _hydra_intent_category(request_type: str, measurement: str) -> str:
+    if request_type == "forecast":
+        return "forecast"
+    return {
+        "general": "weather",
+        "air_quality": "air",
+        "alerts": "condition",
+        "pollen": "air",
+        "snow": "rain",
+    }.get(measurement, measurement)
+
+
+def _hydra_ai_json_object(content: Any) -> Dict[str, Any]:
+    raw = _text(content)
+    parsed_text = extract_json(raw) or raw
+    try:
+        parsed = json.loads(parsed_text)
+    except Exception as exc:
+        raise EnvironmentIntentError("The environment interpretation returned invalid JSON.") from exc
+    if not isinstance(parsed, dict):
+        raise EnvironmentIntentError("The environment interpretation did not return an object.")
+    return parsed
+
+
 def _hydra_normalized_filter_args(raw: Dict[str, Any], original: Dict[str, Any]) -> Dict[str, Any]:
     source = raw if isinstance(raw, dict) else {}
-    out: Dict[str, Any] = {}
-    for key in ("area", "room", "location", "category", "provider", "source", "integration", "sensor", "query", "date", "day"):
-        value = source.get(key)
-        if value is None:
-            continue
-        text = _text(value)
-        if text:
-            out[key] = text
-    limit = source.get("limit", original.get("limit") if isinstance(original, dict) else None)
-    if limit not in (None, ""):
-        out["limit"] = _hydra_limit(limit)
-    if "limit" not in out and isinstance(original, dict) and original.get("limit") not in (None, ""):
-        out["limit"] = _hydra_limit(original.get("limit"))
-    hours = source.get("hours", original.get("hours") if isinstance(original, dict) else None)
+    original = original if isinstance(original, dict) else {}
+    request_type = _clean_key(source.get("request_type"))
+    measurement = _clean_key(source.get("measurement"))
+    location_scope = _clean_key(source.get("location_scope"))
+    day_hint = _clean_key(source.get("day"))
+    temperature_focus = _clean_key(source.get("temperature_focus"))
+
+    if request_type not in HYDRA_INTENT_REQUEST_TYPES:
+        raise EnvironmentIntentError("The environment interpretation returned an invalid request type.")
+    if measurement not in HYDRA_INTENT_MEASUREMENTS:
+        raise EnvironmentIntentError("The environment interpretation returned an invalid measurement.")
+    if location_scope not in HYDRA_INTENT_LOCATION_SCOPES:
+        raise EnvironmentIntentError("The environment interpretation returned an invalid location scope.")
+    if day_hint not in HYDRA_INTENT_DAY_HINTS:
+        day_hint = ""
+    if temperature_focus not in HYDRA_INTENT_TEMPERATURE_FOCUS:
+        temperature_focus = ""
+
+    out: Dict[str, Any] = {
+        "request_type": request_type,
+        "measurement": measurement,
+        "location_scope": location_scope,
+        "category": _hydra_intent_category(request_type, measurement),
+    }
+    for key in ("provider", "sensor"):
+        value = _text(source.get(key))
+        if value:
+            out[key] = value
+
+    location = _text(source.get("location"))
+    area = _text(source.get("area"))
+    if location_scope == "named_place":
+        if not location:
+            raise EnvironmentIntentError("The environment interpretation selected a named place without a location.")
+        out["location"] = location
+    elif location_scope == "local_area":
+        if not area and not _text(out.get("sensor")):
+            raise EnvironmentIntentError("The environment interpretation selected a local area without naming the area or sensor.")
+        if area:
+            out["area"] = area
+    else:
+        out["area"] = "outside"
+
+    date_text = _text(source.get("date"))
+    if date_text:
+        try:
+            datetime.strptime(date_text, "%Y-%m-%d")
+        except Exception as exc:
+            raise EnvironmentIntentError("The environment interpretation returned an invalid date.") from exc
+        out["date"] = date_text
+    if day_hint:
+        out["day"] = day_hint
+    if temperature_focus:
+        out["temperature_focus"] = temperature_focus
+
+    units = _clean_key(source.get("units"))
+    if units in {"us", "metric"}:
+        out["units"] = units
+    hours = source.get("hours")
     if hours not in (None, ""):
-        out["hours"] = _hydra_limit(hours, default=12)
+        out["hours"] = _as_int(hours, 12, minimum=0, maximum=48)
+    limit = source.get("limit", source.get("days"))
+    if limit not in (None, ""):
+        out["limit"] = _hydra_limit(limit, default=7)
+
+    # Explicit structured arguments are authoritative after the AI has interpreted the request.
+    for key in ("category", "provider", "source", "integration", "sensor", "date", "day", "units"):
+        value = _text(original.get(key))
+        if value:
+            out[key] = value
+    for key in ("hours", "limit"):
+        if original.get(key) not in (None, ""):
+            out[key] = _as_int(original.get(key), out.get(key) or 12, minimum=0 if key == "hours" else 1, maximum=48 if key == "hours" else 80)
+    out["weather_intent"] = {
+        "schema_version": WEATHER_INTENT_SCHEMA_VERSION,
+        "request_type": request_type,
+        "measurement": measurement,
+        "location_scope": location_scope,
+        "location": location or None,
+        "area": area or None,
+        "sensor": _text(out.get("sensor")) or None,
+        "provider": _text(out.get("provider")) or None,
+        "date": date_text or None,
+        "day": day_hint or None,
+        "hours": out.get("hours"),
+        "days": out.get("limit"),
+        "units": _text(out.get("units")) or None,
+        "temperature_focus": temperature_focus or None,
+    }
     return out
 
 
@@ -4989,26 +5359,37 @@ async def _hydra_ai_normalize_environment_args(
     origin: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     request_text = _hydra_request_text(args, origin)
-    if llm_client is None or not request_text:
-        return dict(args or {})
+    if llm_client is None:
+        raise EnvironmentIntentError("AI environment interpretation is unavailable.")
+    if not request_text and not any(
+        _text((args or {}).get(key))
+        for key in ("area", "room", "location", "category", "provider", "source", "integration", "sensor", "query", "date", "day")
+    ):
+        raise EnvironmentIntentError("No environment request was provided.")
 
     context = _hydra_filter_context(payload)
     user_payload = {
+        "weather_intent_schema_version": WEATHER_INTENT_SCHEMA_VERSION,
         "request": request_text,
         "current_tool_arguments": dict(args or {}),
         "available_environment_context": context,
+        "today": datetime.now().astimezone().date().isoformat(),
+        "timezone": datetime.now().astimezone().tzname() or "local timezone",
     }
     system_prompt = (
-        "You normalize a user's natural-language request into Environment Core filters. "
-        "Return only one JSON object. Do not answer the user. "
-        "Allowed keys: area, category, provider, sensor, query, date, day, hours, limit. Use an empty string to omit a filter. "
-        "Allowed categories include weather, condition, temperature, humidity, wind, rain, pressure, solar, air, lightning, battery, system, and other. "
-        "Use category weather for broad current weather or conditions requests. "
-        "Use category forecast for forecasts, tomorrow, tonight, this week, rain chance later, or future weather requests. "
-        "For forecast requests, include date when the user gives or implies a specific YYYY-MM-DD date; otherwise leave date empty. "
-        "Use provider only when the user clearly names a specific integration/provider. "
-        "Use query only for a real sensor label/name the user asked for; do not put generic words like weather, current, conditions, outside, or local in query. "
-        "Prefer the available areas, categories, providers, and sensor labels from the payload."
+        "Convert the user's environment or weather request into one strict JSON object. Do not answer the request. "
+        "Ignore chat mentions, user names, assistant names, and punctuation when interpreting the location. Never infer or invent a named place. "
+        "A named place is allowed only when the user or explicit arguments clearly provide a city, region, country, postal code, airport, "
+        "landmark, or latitude/longitude. Words such as home, here, outside, outdoors, local, near me, my location, and where I am mean "
+        "location_scope=local_outdoor and location=null. A room, yard, patio, named local area, or sensor means location_scope=local_area. "
+        "Preserve explicit tool arguments and use available context to match real area, sensor, and provider names. "
+        "Return exactly these keys: request_type, measurement, location_scope, location, area, sensor, provider, date, day, days, hours, units, temperature_focus. "
+        "request_type is current or forecast. measurement is general, condition, temperature, humidity, wind, rain, snow, pressure, solar, "
+        "air_quality, lightning, pollen, alerts, battery, system, or other. location_scope is local_outdoor, local_area, or named_place. "
+        "location is populated only for named_place. area or sensor is required for local_area. date is YYYY-MM-DD or null and relative dates "
+        "must be resolved using today. day is current, today, tonight, tomorrow, weekend, or null. days is 1-14, hours is 0-48, units is "
+        "us, metric, or null, and temperature_focus is current, high, low, both, or null. Use forecast for future times, highs, lows, tonight, "
+        "tomorrow, or later. Output JSON only."
     )
     try:
         response = await llm_client.chat(
@@ -5022,16 +5403,10 @@ async def _hydra_ai_normalize_environment_args(
         )
     except Exception as exc:
         logger.warning("[Environment] AI filter normalization failed: %s", exc)
-        return dict(args or {})
+        raise EnvironmentIntentError("The AI environment interpretation failed.") from exc
 
-    raw = _text((response.get("message") or {}).get("content"))
-    parsed_text = extract_json(raw) or raw
-    try:
-        parsed = json.loads(parsed_text)
-    except Exception as exc:
-        logger.warning("[Environment] AI filter normalization returned invalid JSON: %s", exc)
-        return dict(args or {})
-    return _hydra_normalized_filter_args(parsed if isinstance(parsed, dict) else {}, dict(args or {}))
+    parsed = _hydra_ai_json_object((response.get("message") or {}).get("content"))
+    return _hydra_normalized_filter_args(parsed, dict(args or {}))
 
 
 def _hydra_environment_payload(client: Any = None) -> Dict[str, Any]:
@@ -5053,6 +5428,45 @@ def _hydra_environment_payload(client: Any = None) -> Dict[str, Any]:
         "received_at": received_at,
         "stale": stale,
     }
+
+
+def _hydra_named_place_location(args: Dict[str, Any]) -> str:
+    intent = args.get("weather_intent") if isinstance(args.get("weather_intent"), dict) else {}
+    if _clean_key(intent.get("location_scope") or args.get("location_scope")) != "named_place":
+        return ""
+    return _text(intent.get("location") or args.get("location"))
+
+
+def _hydra_payload_with_weatherapi_location(
+    args: Dict[str, Any],
+    payload: Dict[str, Any],
+    client: Any,
+) -> Tuple[Dict[str, Any], str]:
+    location = _hydra_named_place_location(args)
+    if not location:
+        return payload, ""
+    provider = _clean_key(args.get("provider"))
+    if provider and provider != "weather_api":
+        return {}, f"{_provider_label(provider)} cannot look up named geographic locations through Environment Core yet."
+    snapshot, error = _weather_api_snapshot_for_location(location, args, client)
+    if error:
+        return {}, error
+    provider_snapshots = dict(payload.get("provider_snapshots") or {})
+    provider_snapshots["weather_api"] = snapshot
+    settings = dict(payload.get("settings") or {})
+    settings["forecast_provider"] = "weather_api"
+    updated = dict(payload)
+    updated.update(
+        {
+            "provider_snapshots": provider_snapshots,
+            "snapshot": _combined_snapshot({"weather_api": snapshot}),
+            "settings": settings,
+            "received_at": snapshot.get("received_at"),
+            "stale": False,
+            "resolved_location": _text(snapshot.get("model")) or location,
+        }
+    )
+    return updated, ""
 
 
 def _hydra_forecast_requested(args: Dict[str, Any]) -> bool:
@@ -5120,7 +5534,9 @@ def _hydra_forecast_payload(args: Dict[str, Any], client: Any, payload: Dict[str
             "summary_for_user": f"{provider_label} forecast data is not available yet. {detail}",
         }
 
-    units = _weatherapi_units(client)
+    units = _clean_key(args.get("units"))
+    if units not in {"us", "metric"}:
+        units = _weatherapi_units(client)
     daily_rows = _weatherapi_daily_rows(forecast_snapshot, units=units)
     date_filter = _text(args.get("date"))
     if date_filter:
@@ -5180,19 +5596,59 @@ def _hydra_primary_current_reading(snapshot: Dict[str, Any], category: str) -> O
     ]
     if not rows:
         return None
-    for key in HYDRA_CURRENT_PRIMARY_KEYS.get(wanted, ()):
-        match = next((row for row in rows if _clean_key(row.get("key")) == key), None)
-        if match is not None:
-            return match
-
-    def fallback_order(row: Dict[str, Any]) -> Tuple[int, int, str]:
+    def fallback_order(row: Dict[str, Any]) -> Tuple[int, int, int, str]:
         area = _clean_key(row.get("area"))
         label = _clean_key(row.get("label"))
+        outdoor = int(not (area in {"outside", "outdoors", "outdoor", "forecast"} or "outdoor" in label))
         indoor = int(area in {"inside", "indoor"} or "indoor" in label)
         derived = int(any(token in label for token in ("dew_point", "feels_like", "heat_index", "wind_chill")))
-        return indoor, derived, label
+        key = _clean_key(row.get("key"))
+        key_rank = next(
+            (index for index, preferred in enumerate(HYDRA_CURRENT_PRIMARY_KEYS.get(wanted, ())) if key == preferred),
+            len(HYDRA_CURRENT_PRIMARY_KEYS.get(wanted, ())),
+        )
+        return outdoor + (indoor * 3), derived, key_rank, label
 
     return min(rows, key=fallback_order)
+
+
+def _hydra_row_observed_at(row: Dict[str, Any], snapshot: Optional[Dict[str, Any]] = None) -> Optional[float]:
+    fallback = snapshot if isinstance(snapshot, dict) else {}
+    return (
+        _as_float(row.get("_source_sample_time"))
+        or _as_float(row.get("_source_received_at"))
+        or _as_float(fallback.get("sample_time"))
+        or _as_float(fallback.get("received_at"))
+    )
+
+
+def _hydra_is_stale_timestamp(value: Any, settings: Dict[str, Any]) -> bool:
+    timestamp = _as_float(value)
+    if timestamp is None:
+        return True
+    stale_after_s = int(settings.get("stale_after_minutes") or DEFAULT_STALE_AFTER_MINUTES) * 60
+    return (time.time() - timestamp) > stale_after_s
+
+
+def _hydra_row_is_outdoor(row: Dict[str, Any]) -> bool:
+    key = _clean_key(row.get("key"))
+    if key in {"tempf", "humidity", "windspeedmph", "rainratein", "baromrelin", "weather_api_condition"}:
+        return True
+    haystack = " ".join(
+        _clean_key(row.get(field))
+        for field in ("area", "label", "source_name", "source_id")
+    )
+    return any(
+        token in haystack
+        for token in ("outside", "outdoor", "forecast", "weather", "back_yard", "front_yard", "patio", "porch", "deck")
+    )
+
+
+def _hydra_snapshot_selection(snapshot: Dict[str, Any], fallback: str = "") -> str:
+    provider = _clean_key(snapshot.get("provider"))
+    if provider and provider != "environment":
+        return f"provider:{provider}"
+    return fallback or _text(snapshot.get("source_id"))
 
 
 def _hydra_configured_current_snapshot(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -5202,29 +5658,76 @@ def _hydra_configured_current_snapshot(payload: Dict[str, Any]) -> Dict[str, Any
     selected_sensors = payload.get("selected_sensors") if isinstance(payload.get("selected_sensors"), list) else []
     live_source = _text(settings.get("current_live_source")) or "provider:ecowitt"
     condition_source = _text(settings.get("current_condition_source")) or "provider:weather_api"
-    live_snapshot = _display_snapshot_for_source(
+    requested_live_snapshot = _display_snapshot_for_source(
         live_source,
         combined,
         provider_snapshots,
         selected_sensors,
     )
-    condition_snapshot = _display_snapshot_for_source(
+    requested_condition_snapshot = _display_snapshot_for_source(
         condition_source,
         combined,
         provider_snapshots,
         selected_sensors,
     )
-    if not live_snapshot:
-        live_snapshot = condition_snapshot or combined
-    if not condition_snapshot:
-        condition_snapshot = live_snapshot
+
+    fallback_snapshots: List[Tuple[str, Dict[str, Any]]] = []
+    for provider in LATEST_PROVIDER_KEYS:
+        snapshot = provider_snapshots.get(provider)
+        if isinstance(snapshot, dict) and snapshot:
+            fallback_snapshots.append((f"provider:{provider}", snapshot))
+    for provider, snapshot in provider_snapshots.items():
+        if provider not in LATEST_PROVIDER_KEYS and isinstance(snapshot, dict) and snapshot:
+            fallback_snapshots.append((f"provider:{_clean_key(provider)}", snapshot))
+    if combined:
+        fallback_snapshots.append(("provider:environment", combined))
 
     readings: List[Dict[str, Any]] = []
+    reading_sources: Dict[str, Dict[str, Any]] = {}
     for category in HYDRA_CURRENT_PRIMARY_KEYS:
-        source_snapshot = condition_snapshot if category == "condition" else live_snapshot
-        row = _hydra_primary_current_reading(source_snapshot, category)
-        if row is not None:
-            readings.append(dict(row))
+        primary_source = condition_source if category == "condition" else live_source
+        primary_snapshot = requested_condition_snapshot if category == "condition" else requested_live_snapshot
+        candidates: List[Tuple[str, Dict[str, Any]]] = []
+        if primary_snapshot:
+            candidates.append((primary_source, primary_snapshot))
+        for candidate_source, candidate_snapshot in fallback_snapshots:
+            if all(candidate_snapshot is not existing for _, existing in candidates):
+                candidates.append((candidate_source, candidate_snapshot))
+
+        matches: List[Tuple[bool, str, Dict[str, Any], Dict[str, Any], Optional[float]]] = []
+        for candidate_source, candidate_snapshot in candidates:
+            row = _hydra_primary_current_reading(candidate_snapshot, category)
+            if row is None:
+                continue
+            if category != "condition" and not live_source.startswith("sensor:") and not _hydra_row_is_outdoor(row):
+                continue
+            observed_at = _hydra_row_observed_at(row, candidate_snapshot)
+            matches.append(
+                (
+                    _hydra_is_stale_timestamp(observed_at, settings),
+                    candidate_source,
+                    candidate_snapshot,
+                    row,
+                    observed_at,
+                )
+            )
+        if not matches:
+            continue
+        fresh = next((match for match in matches if not match[0]), None)
+        stale, resolved_source, resolved_snapshot, row, observed_at = fresh or matches[0]
+        next_row = dict(row)
+        next_row["_source_received_at"] = _as_float(resolved_snapshot.get("received_at")) or observed_at
+        next_row["_source_sample_time"] = observed_at
+        next_row["_source_stale"] = stale
+        readings.append(next_row)
+        reading_sources[category] = {
+            "requested_selection": primary_source,
+            "resolved_selection": _hydra_snapshot_selection(resolved_snapshot, resolved_source),
+            "label": _text(resolved_snapshot.get("model")) or _text(resolved_snapshot.get("stationtype")) or _provider_label(resolved_snapshot.get("provider")),
+            "fallback_used": resolved_snapshot is not primary_snapshot,
+            "stale": stale,
+            "last_sample": _age_label(observed_at),
+        }
 
     def source_label(snapshot: Dict[str, Any], source: str) -> str:
         return (
@@ -5234,21 +5737,30 @@ def _hydra_configured_current_snapshot(payload: Dict[str, Any]) -> Dict[str, Any
             or source
         )
 
-    received_values = [
-        value
-        for value in (_as_float(live_snapshot.get("received_at")), _as_float(condition_snapshot.get("received_at")))
-        if value is not None
-    ]
-    received_at = max(received_values) if received_values else _as_float(combined.get("received_at")) or time.time()
+    reading_values = [_hydra_row_observed_at(row) for row in readings]
+    received_values = [value for value in reading_values if value is not None]
+    received_at = min(received_values) if received_values else _as_float(combined.get("received_at")) or time.time()
+    live_resolved = reading_sources.get("temperature") or next(
+        (reading_sources.get(category) for category in HYDRA_CURRENT_PRIMARY_KEYS if category != "condition" and reading_sources.get(category)),
+        {},
+    )
+    condition_resolved = reading_sources.get("condition") or live_resolved
     current_sources = {
         "readings": {
             "selection": live_source,
-            "label": source_label(live_snapshot, live_source),
+            "resolved_selection": _text(live_resolved.get("resolved_selection")) or live_source,
+            "label": _text(live_resolved.get("label")) or source_label(requested_live_snapshot, live_source),
+            "fallback_used": _as_bool(live_resolved.get("fallback_used"), not bool(requested_live_snapshot)),
+            "stale": _as_bool(live_resolved.get("stale"), True),
         },
         "conditions": {
             "selection": condition_source,
-            "label": source_label(condition_snapshot, condition_source),
+            "resolved_selection": _text(condition_resolved.get("resolved_selection")) or condition_source,
+            "label": _text(condition_resolved.get("label")) or source_label(requested_condition_snapshot, condition_source),
+            "fallback_used": _as_bool(condition_resolved.get("fallback_used"), not bool(requested_condition_snapshot)),
+            "stale": _as_bool(condition_resolved.get("stale"), True),
         },
+        "by_measurement": reading_sources,
     }
     return {
         "provider": "environment",
@@ -5283,14 +5795,28 @@ def _environment_conditions_kernel(args: Dict[str, Any], client: Any = None, pay
         for key in ("area", "room", "location"):
             if _clean_key(effective_args.get(key)) in HYDRA_DEFAULT_CURRENT_AREA_ALIASES:
                 effective_args.pop(key, None)
-    readings = [_hydra_reading_row(row) for row in _hydra_relevant_readings(snapshot, effective_args)]
-    last = _age_label(snapshot.get("received_at") or payload.get("received_at"))
-    stale = bool(payload.get("stale"))
+    matching_rows = _hydra_relevant_readings(snapshot, effective_args)
+    settings = payload.get("settings") if isinstance(payload.get("settings"), dict) else {}
+    reading_timestamps = [_hydra_row_observed_at(row, snapshot) for row in matching_rows]
+    observed_values = [value for value in reading_timestamps if value is not None]
+    oldest_observed = min(observed_values) if observed_values else _as_float(snapshot.get("received_at") or payload.get("received_at"))
+    stale = any(
+        _as_bool(row.get("_source_stale"), _hydra_is_stale_timestamp(_hydra_row_observed_at(row, snapshot), settings))
+        for row in matching_rows
+    ) if matching_rows else False
+    readings = [_hydra_reading_row(row) for row in matching_rows]
+    for reading, row in zip(readings, matching_rows):
+        reading["stale"] = _as_bool(
+            row.get("_source_stale"),
+            _hydra_is_stale_timestamp(_hydra_row_observed_at(row, snapshot), settings),
+        )
+    last = _age_label(oldest_observed)
     current_sources = snapshot.get("current_sources") if isinstance(snapshot.get("current_sources"), dict) else {}
     readings_source = current_sources.get("readings") if isinstance(current_sources.get("readings"), dict) else {}
     source_label = _text(readings_source.get("label"))
+    fallback_note = " using a configured fallback" if _as_bool(readings_source.get("fallback_used"), False) else ""
     prefix = (
-        f"Current Environment readings from {source_label} were last updated {last}"
+        f"Current Environment readings from {source_label}{fallback_note} were last updated {last}"
         if use_configured_sources and source_label
         else f"Environment readings were last updated {last}"
     ) + (" and may be stale." if stale else ".")
@@ -5347,7 +5873,7 @@ def get_hydra_kernel_tools(*, platform: str = "", **_kwargs) -> List[Dict[str, A
     return [
         {
             "id": "environment_conditions",
-            "description": "Read local current weather from Environment Core using the same configured Current Card Readings Source and Artwork Source shown in its UI. Use this first for weather here, at home, outside, current temperature, humidity, wind, or rain. Explicit room, sensor, or integration requests search matching sources, while tomorrow/tonight/weekly forecasts use the configured forecast provider.",
+            "description": "Primary tool for weather and environmental questions. Use it for current conditions at home or outside, readings in a room or from a named local sensor, weather in any named city or geographic place, and forecasts. Pass the user's complete request unchanged in request. It AI-interprets the request, uses fresh configured sensors for local readings, and uses the configured weather provider for named places and forecasts.",
             "usage": '{"function":"environment_conditions","arguments":{"request":"What is the temperature outside right now?"}}',
         },
         {
@@ -5389,6 +5915,20 @@ async def run_hydra_kernel_tool(
                 llm_client=llm_client,
                 origin=origin,
             )
+            if _hydra_named_place_location(normalized_args):
+                environment_payload, lookup_error = await asyncio.to_thread(
+                    _hydra_payload_with_weatherapi_location,
+                    normalized_args,
+                    environment_payload,
+                    client,
+                )
+                if lookup_error:
+                    return {
+                        "tool": "environment_conditions",
+                        "ok": False,
+                        "error": lookup_error,
+                        "summary_for_user": f"I could not look up weather for the requested location. {lookup_error}",
+                    }
             return _environment_conditions_kernel(normalized_args, client, payload=environment_payload)
         if func in {"environment_sensors", "environment_sensor_status", "environment_sources"}:
             environment_payload = _hydra_environment_payload(client)
@@ -5399,6 +5939,14 @@ async def run_hydra_kernel_tool(
                 origin=origin,
             )
             return _environment_sensors_kernel(normalized_args, client, payload=environment_payload)
+    except EnvironmentIntentError as exc:
+        return {
+            "tool": func or "environment",
+            "ok": False,
+            "error": str(exc),
+            "code": "environment_interpretation_failed",
+            "summary_for_user": "I could not interpret that environment or weather request safely. Please try again.",
+        }
     except Exception as exc:
         return {
             "tool": func or "environment",
