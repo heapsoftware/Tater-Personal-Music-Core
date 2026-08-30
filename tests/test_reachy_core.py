@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import threading
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,15 @@ SPEC = importlib.util.spec_from_file_location("reachy_core_under_test", CORE_PAT
 assert SPEC is not None and SPEC.loader is not None
 reachy_core = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(reachy_core)
+
+
+def test_reachy_core_exposes_runnable_shop_contract() -> None:
+    stop_event = threading.Event()
+    stop_event.set()
+
+    reachy_core.run(stop_event=stop_event)
+
+    assert callable(reachy_core.run)
 
 
 def _client(*, supported: bool = True) -> dict:

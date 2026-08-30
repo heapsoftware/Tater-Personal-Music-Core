@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 from typing import Any, Dict, List
 
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
     "Control Reachy Tater Satellite and Reachy Tater Embedded behavior directly "
@@ -29,6 +31,8 @@ CORE_WEBUI_TAB = {
 _SETTINGS_CAPABILITY = "reachy_settings"
 _SETTINGS_PROTOCOL_VERSION = 1
 _SUPPORTED_SECTIONS = {"motion", "watch", "idle_life", "reachy"}
+
+logger = logging.getLogger("reachy_core")
 
 
 def _text(value: Any) -> str:
@@ -553,3 +557,17 @@ def handle_htmlui_tab_action(
         }
 
     raise KeyError(f"Unknown Reachy Core action: {action_name or 'missing'}")
+
+
+def run(stop_event=None) -> None:
+    """Keep the installed core lifecycle active; control remains request-driven."""
+    logger.info("[Reachy Core] Started; waiting for compatible Reachy satellites.")
+    try:
+        while not (stop_event and getattr(stop_event, "is_set", lambda: False)()):
+            wait = getattr(stop_event, "wait", None) if stop_event is not None else None
+            if callable(wait):
+                wait(5.0)
+            else:
+                time.sleep(5.0)
+    finally:
+        logger.info("[Reachy Core] Stopped.")
