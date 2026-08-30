@@ -92,6 +92,17 @@ def test_reachy_core_builds_settings_cards_for_compatible_reachy(monkeypatch) ->
     idle_fields = {field["key"]: field["value"] for field in forms[-1]["fields"]}
     assert idle_fields["enabled"] is True
     assert idle_fields["look_around_enabled"] is True
+    reachy_tab = result["ui"]["manager_tabs"][0]
+    assert reachy_tab["source"] == "grouped_items"
+    assert [group["label"] for group in reachy_tab["groups"]] == [
+        "Overview",
+        "Vision & Head",
+        "Tracking",
+        "Motion & Music",
+        "Idle Life",
+    ]
+    assert forms[0]["group"].endswith("::overview")
+    assert forms[-1]["group"].endswith("::idle_life")
 
 
 def test_reachy_core_shows_update_needed_for_old_reachy(monkeypatch) -> None:

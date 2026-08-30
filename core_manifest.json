@@ -154,7 +154,7 @@
       "id": "reachy",
       "name": "Reachy Core",
       "module_key": "reachy_core",
-      "version": "1.0.1",
+      "version": "1.1.0",
       "min_tater_version": "99.5",
       "description": "Control Reachy Tater Satellite and Reachy Tater Embedded behavior directly from Tater, including tracking, motion, music reactions, vision, head leveling, and Idle Life.",
       "settings_category": "Reachy Core Settings",
@@ -169,7 +169,7 @@
         "motion"
       ],
       "entry": "cores/reachy_core.py",
-      "sha256": "9596deecd74fa6e8aa976a8586d9236c113daa347444913d1f988cc5cd6d6132"
+      "sha256": "2cbac4ecdb27d5ddc3140a17fca1570a5bf26f134da0050928f37543a2b3a255"
     },
     {
       "id": "rss",

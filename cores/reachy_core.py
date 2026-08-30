@@ -8,7 +8,7 @@ import time
 from typing import Any, Dict, List
 
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
     "Control Reachy Tater Satellite and Reachy Tater Embedded behavior directly "
@@ -124,6 +124,10 @@ def _card_id(selector: str, section: str) -> str:
     )
 
 
+def _section_group(selector: str, section: str) -> str:
+    return f"{selector}::{section}"
+
+
 def _parse_card_id(value: Any) -> tuple[str, str]:
     try:
         parsed = json.loads(_text(value))
@@ -179,7 +183,7 @@ def _device_card_base(
     selector = _text(row.get("selector"))
     return {
         "id": _card_id(selector, section),
-        "group": selector,
+        "group": _section_group(selector, section),
         "title": title,
         "subtitle": subtitle,
         "save_action": "reachy_save_settings",
@@ -328,7 +332,7 @@ def _status_card(row: Dict[str, Any], response: Dict[str, Any]) -> Dict[str, Any
     app_version = _text(app.get("version")) or _text(row.get("firmware_version")) or "unknown"
     return {
         "id": _card_id(selector, "all"),
-        "group": selector,
+        "group": _section_group(selector, "overview"),
         "title": _device_name(row),
         "subtitle": f"Reachy Tater {app_kind.title()} · app {app_version}",
         "detail": _text(status.get("connection_error")) or "Connected through Tater's authenticated native satellite link.",
@@ -362,7 +366,7 @@ def _unsupported_card(row: Dict[str, Any]) -> Dict[str, Any]:
     selector = _text(row.get("selector"))
     return {
         "id": _card_id(selector, "unsupported"),
-        "group": selector,
+        "group": _section_group(selector, "overview"),
         "title": _device_name(row),
         "subtitle": "Reachy app update required",
         "detail": (
@@ -380,7 +384,7 @@ def _error_card(row: Dict[str, Any], error: str) -> Dict[str, Any]:
     selector = _text(row.get("selector"))
     return {
         "id": _card_id(selector, "error"),
-        "group": selector,
+        "group": _section_group(selector, "overview"),
         "title": _device_name(row),
         "subtitle": "Reachy settings are temporarily unavailable",
         "detail": error or "The Reachy app did not answer the settings request.",
@@ -398,6 +402,37 @@ def _read_settings(row: Dict[str, Any]) -> Dict[str, Any]:
     return response
 
 
+def _device_manager_tab(
+    row: Dict[str, Any],
+    index: int,
+    *,
+    sections: List[str],
+) -> Dict[str, Any]:
+    selector = _text(row.get("selector"))
+    labels = {
+        "overview": "Overview",
+        "reachy": "Vision & Head",
+        "watch": "Tracking",
+        "motion": "Motion & Music",
+        "idle_life": "Idle Life",
+    }
+    return {
+        "key": f"reachy-{index + 1}",
+        "label": _device_name(row),
+        "source": "grouped_items",
+        "groups": [
+            {
+                "key": section,
+                "label": labels[section],
+                "item_group": _section_group(selector, section),
+                "selector": False,
+                "empty_message": f"No {labels[section].lower()} settings are available.",
+            }
+            for section in sections
+        ],
+    }
+
+
 def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
     del redis_client
     reachys = _connected_reachys()
@@ -407,17 +442,11 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
     items: List[Dict[str, Any]] = []
 
     for index, row in enumerate(reachys):
-        selector = _text(row.get("selector"))
-        tabs.append(
-            {
-                "key": f"reachy-{index + 1}",
-                "label": _device_name(row),
-                "source": "items",
-                "item_group": selector,
-            }
-        )
         if not row.get("settings_supported"):
             forms.append(_unsupported_card(row))
+            tabs.append(
+                _device_manager_tab(row, index, sections=["overview"])
+            )
             continue
         try:
             response = _read_settings(row)
@@ -431,8 +460,18 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
                     _idle_life_card(row, settings.get("idle_life") if isinstance(settings.get("idle_life"), dict) else {}),
                 ]
             )
+            tabs.append(
+                _device_manager_tab(
+                    row,
+                    index,
+                    sections=["overview", "reachy", "watch", "motion", "idle_life"],
+                )
+            )
         except Exception as exc:
             forms.append(_error_card(row, _text(exc)))
+            tabs.append(
+                _device_manager_tab(row, index, sections=["overview"])
+            )
 
     for row in reachys:
         items.append(
