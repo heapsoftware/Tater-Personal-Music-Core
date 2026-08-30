@@ -154,7 +154,7 @@
       "id": "reachy",
       "name": "Reachy Core",
       "module_key": "reachy_core",
-      "version": "1.2.1",
+      "version": "1.2.2",
       "min_tater_version": "99.5",
       "description": "Control Reachy Tater Satellite and Reachy Tater Embedded behavior directly from Tater, including tracking, motion, music reactions, vision, head leveling, Idle Life, and Face ID greetings backed by Tater People.",
       "settings_category": "Reachy Core Settings",
@@ -171,7 +171,7 @@
         "people"
       ],
       "entry": "cores/reachy_core.py",
-      "sha256": "bd569e6c41e562eca3a11e84b7d4b4abeb40f98aee15ed13b09637176188e968"
+      "sha256": "57106b07cccca516355ddda08d36cfd530ff209eaf05c59dc2943aead815da74"
     },
     {
       "id": "rss",

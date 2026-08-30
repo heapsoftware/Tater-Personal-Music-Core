@@ -15,7 +15,7 @@ from datetime import datetime
 from typing import Any, Dict, List
 
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
     "Control Reachy Tater Satellite and Reachy Tater Embedded behavior directly "
@@ -355,7 +355,11 @@ def _face_id_card(row: Dict[str, Any], values: Dict[str, Any]) -> Dict[str, Any]
             "Greet Recognized People",
             "checkbox",
             _as_bool(values.get("greetings_enabled"), True),
-            description="Say a short varied hello using the matched Person's display name.",
+            description=(
+                "Say one varied hello using the matched Person's display name when a new "
+                "tracking session identifies them. Reachy will not greet them again until "
+                "visual tracking is lost and later reacquired."
+            ),
         ),
         _field(
             "conversation_identity_enabled",
@@ -381,16 +385,6 @@ def _face_id_card(row: Dict[str, Any], values: Dict[str, Any]) -> Dict[str, Any]
                 "the local good-face gate is open. A successful match remains active without more checks "
                 "until Reachy loses visual tracking."
             ),
-        ),
-        _field(
-            "greeting_cooldown_seconds",
-            "Repeat Greeting Cooldown",
-            "number",
-            _as_float(values.get("greeting_cooldown_seconds"), 1800),
-            minimum=60,
-            maximum=86400,
-            step=60,
-            suffix="sec",
         ),
         _field(
             "context_ttl_seconds",
@@ -757,7 +751,12 @@ def _face_state(selector: str) -> Dict[str, Any]:
                 "person_name": "",
                 "identity_ids": [],
                 "expires_at": 0.0,
-                "last_greeted": {},
+                "greeting_pending": False,
+                "greeting_active": False,
+                "pending_greeting_text": "",
+                "pending_greeting_template": "",
+                "next_greeting_at": 0.0,
+                "last_greeting_template": "",
                 "alias_person_id": "",
                 "injected_session_id": "",
                 "tracking_visible": False,
@@ -772,6 +771,11 @@ def _clear_face_person(state: Dict[str, Any]) -> None:
     state["identity_ids"] = []
     state["expires_at"] = 0.0
     state["injected_session_id"] = ""
+    state["greeting_pending"] = False
+    state["greeting_active"] = False
+    state["pending_greeting_text"] = ""
+    state["pending_greeting_template"] = ""
+    state["next_greeting_at"] = 0.0
 
 
 def _face_visible(row: Dict[str, Any], *, now: float) -> bool:
@@ -900,14 +904,34 @@ def _current_client(selector: str) -> Dict[str, Any]:
     return {}
 
 
-def _speak_face_greeting(selector: str, name: str) -> bool:
+def _face_person_active(selector: str, person_id: str) -> bool:
+    with _FACE_STATE_LOCK:
+        state = _FACE_STATES.get(selector)
+        return bool(
+            state
+            and _as_bool(state.get("tracking_visible"), False)
+            and _text(state.get("person_id")) == person_id
+        )
+
+
+def _queue_face_greeting(state: Dict[str, Any], person_name: str) -> None:
+    previous = _text(state.get("last_greeting_template"))
+    choices = [template for template in _GREETING_TEMPLATES if template != previous]
+    template = random.choice(choices or list(_GREETING_TEMPLATES))
+    state["greeting_pending"] = True
+    state["greeting_active"] = False
+    state["pending_greeting_text"] = template.format(name=person_name)
+    state["pending_greeting_template"] = template
+    state["next_greeting_at"] = 0.0
+
+
+def _speak_face_greeting(selector: str, person_id: str, text_value: str) -> bool:
     row = _current_client(selector)
-    if not row or _client_busy(row):
+    if not row or _client_busy(row) or not _face_person_active(selector, person_id):
         return False
     from tater_voice import native_satellite, voice_pipeline
     from tater_voice.voice_pipeline import backends
 
-    text_value = random.choice(_GREETING_TEMPLATES).format(name=name)
     text_value = voice_pipeline._sanitize_spoken_response_text(text_value)[:220].strip()
     if not text_value:
         return False
@@ -922,7 +946,11 @@ def _speak_face_greeting(selector: str, name: str) -> bool:
         synthesize(),
         timeout=180.0,
     )
-    if not audio_bytes or _client_busy(_current_client(selector)):
+    if (
+        not audio_bytes
+        or _client_busy(_current_client(selector))
+        or not _face_person_active(selector, person_id)
+    ):
         return False
     session_id = f"reachy-face-greeting-{uuid.uuid4().hex}"
     audio_url = voice_pipeline._store_tts_url(selector, session_id, audio_bytes, audio_format)
@@ -938,10 +966,41 @@ def _speak_face_greeting(selector: str, name: str) -> bool:
             "[Reachy Core] Queued Face ID greeting selector=%s backend=%s person=%s",
             selector,
             backend or "default",
-            name,
+            person_id,
         )
         return True
     return False
+
+
+def _greet_face_worker(
+    selector: str,
+    person_id: str,
+    text_value: str,
+    template: str,
+) -> None:
+    spoken = False
+    try:
+        spoken = _speak_face_greeting(selector, person_id, text_value)
+    except Exception as exc:
+        logger.debug("[Reachy Core] Face ID greeting failed for %s: %s", selector, exc)
+    finally:
+        with _FACE_STATE_LOCK:
+            state = _FACE_STATES.get(selector)
+            if (
+                not state
+                or _text(state.get("person_id")) != person_id
+                or _text(state.get("pending_greeting_template")) != template
+            ):
+                return
+            state["greeting_active"] = False
+            if spoken:
+                state["greeting_pending"] = False
+                state["pending_greeting_text"] = ""
+                state["pending_greeting_template"] = ""
+                state["next_greeting_at"] = 0.0
+                state["last_greeting_template"] = template
+            else:
+                state["next_greeting_at"] = time.time() + 5.0
 
 
 def _recognize_face_worker(selector: str, device_name: str) -> None:
@@ -991,7 +1050,6 @@ def _recognize_face_worker(selector: str, device_name: str) -> None:
         error = _text(exc)
 
     now = time.time()
-    greet_name = ""
     with _FACE_STATE_LOCK:
         state = _face_state(selector)
         state["scan_active"] = False
@@ -1015,27 +1073,16 @@ def _recognize_face_worker(selector: str, device_name: str) -> None:
             state["expires_at"] = now + max(30.0, _as_float(face_settings.get("context_ttl_seconds"), 300.0))
             if changed:
                 state["injected_session_id"] = ""
-            last_greeted = state.get("last_greeted") if isinstance(state.get("last_greeted"), dict) else {}
-            cooldown = max(60.0, _as_float(face_settings.get("greeting_cooldown_seconds"), 1800.0))
-            if (
-                _as_bool(face_settings.get("greetings_enabled"), True)
-                and not _quiet_hours_active(idle_settings)
-                and now - _as_float(last_greeted.get(person_id), 0.0) >= cooldown
-                and not _client_busy(row)
-            ):
-                greet_name = person_name
+                if (
+                    _as_bool(face_settings.get("greetings_enabled"), True)
+                    and not _quiet_hours_active(idle_settings)
+                ):
+                    _queue_face_greeting(state, person_name)
         elif len(people_found) > 1 or max_faces_in_frame > 0:
             _clear_face_person(state)
 
     if error:
         logger.debug("[Reachy Core] Face ID scan failed for %s: %s", selector, error)
-    if greet_name and _speak_face_greeting(selector, greet_name):
-        with _FACE_STATE_LOCK:
-            state = _face_state(selector)
-            if _text(state.get("person_name")) == greet_name:
-                greeted = state.get("last_greeted") if isinstance(state.get("last_greeted"), dict) else {}
-                greeted[_text(state.get("person_id"))] = time.time()
-                state["last_greeted"] = greeted
 
 
 def _ensure_voice_alias(selector: str, state: Dict[str, Any]) -> str:
@@ -1158,6 +1205,38 @@ def _face_id_tick() -> None:
                 and _text(state.get("person_id"))
             ):
                 _inject_face_identity(selector, _text(voice.get("session_id")), state)
+
+            greetings_enabled = _as_bool(face_settings.get("greetings_enabled"), True)
+            if not greetings_enabled:
+                state["greeting_pending"] = False
+                state["pending_greeting_text"] = ""
+                state["pending_greeting_template"] = ""
+            greeting_text = _text(state.get("pending_greeting_text"))
+            greeting_template = _text(state.get("pending_greeting_template"))
+            if (
+                greetings_enabled
+                and _text(state.get("person_id"))
+                and _as_bool(state.get("greeting_pending"), False)
+                and not _as_bool(state.get("greeting_active"), False)
+                and greeting_text
+                and greeting_template
+                and now >= _as_float(state.get("next_greeting_at"), 0.0)
+                and not _quiet_hours_active(idle_settings)
+                and not _client_busy(row)
+            ):
+                state["greeting_active"] = True
+                greeting_worker = threading.Thread(
+                    target=_greet_face_worker,
+                    args=(
+                        selector,
+                        _text(state.get("person_id")),
+                        greeting_text,
+                        greeting_template,
+                    ),
+                    name=f"reachy-face-greeting-{selector}",
+                    daemon=True,
+                )
+                greeting_worker.start()
 
             if (
                 _face_id_ready(row, now=now)

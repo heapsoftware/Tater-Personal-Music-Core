@@ -221,6 +221,8 @@ def test_reachy_core_matches_a_visible_person_with_shared_face_id(monkeypatch) -
     assert state["person_name"] == "Spud Lord"
     assert state["identity_ids"] == ["face-1"]
     assert state["expires_at"] > time.time()
+    assert state["greeting_pending"] is True
+    assert "Spud Lord" in state["pending_greeting_text"]
 
 
 def test_matched_person_is_not_rechecked_until_tracking_is_lost(monkeypatch) -> None:
@@ -288,6 +290,78 @@ def test_matched_person_is_not_rechecked_until_tracking_is_lost(monkeypatch) -> 
 
         assert len(started) == 1
         assert state["scan_active"] is True
+    finally:
+        reachy_core._FACE_STATES.pop(selector, None)
+
+
+def test_random_greeting_runs_once_per_tracking_session(monkeypatch) -> None:
+    selector = "native:reachy-greeting-session"
+    row = {
+        **_client(),
+        "selector": selector,
+        "capabilities": {
+            **_client()["capabilities"],
+            "camera_snapshot": True,
+        },
+        "last_seen_ts": time.time(),
+        "last_status": {
+            "reachy": {"face_visible": True, "face_id_ready": True}
+        },
+        "voice": {"active": False},
+        "media_session": {"active": False},
+        "audio_overlay": {"active": False},
+    }
+    state = reachy_core._face_state(selector)
+    state.update(
+        {
+            "settings": _settings_response()["settings"],
+            "next_settings_at": float("inf"),
+            "person_id": "person-1",
+            "person_name": "Spud Lord",
+            "identity_ids": ["face-1"],
+            "tracking_visible": True,
+        }
+    )
+    reachy_core._queue_face_greeting(state, "Spud Lord")
+    first_text = state["pending_greeting_text"]
+    spoken = []
+
+    class ImmediateThread:
+        def __init__(self, *, target, args, **_kwargs):
+            self.target = target
+            self.args = args
+
+        def start(self) -> None:
+            self.target(*self.args)
+
+    monkeypatch.setattr(reachy_core, "_connected_reachys", lambda: [row])
+    monkeypatch.setattr(reachy_core.threading, "Thread", ImmediateThread)
+    monkeypatch.setattr(
+        reachy_core,
+        "_speak_face_greeting",
+        lambda *args: spoken.append(args) or True,
+    )
+
+    try:
+        reachy_core._face_id_tick()
+        reachy_core._face_id_tick()
+
+        assert len(spoken) == 1
+        assert state["greeting_pending"] is False
+        assert state["last_greeting_template"]
+
+        row["last_status"]["reachy"]["face_visible"] = False
+        row["last_status"]["reachy"]["face_id_ready"] = False
+        row["last_seen_ts"] = time.time()
+        reachy_core._face_id_tick()
+        assert state["person_id"] == ""
+
+        state["person_id"] = "person-1"
+        state["person_name"] = "Spud Lord"
+        state["tracking_visible"] = True
+        reachy_core._queue_face_greeting(state, "Spud Lord")
+
+        assert state["pending_greeting_text"] != first_text
     finally:
         reachy_core._FACE_STATES.pop(selector, None)
 
