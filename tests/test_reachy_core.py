@@ -70,11 +70,8 @@ def _settings_response() -> dict:
             "idle_life": {"enabled": True, "look_around_enabled": True},
             "face_id": {
                 "enabled": True,
-                "capture_mode": "clip",
                 "greetings_enabled": True,
                 "conversation_identity_enabled": True,
-                "scan_interval_seconds": 60,
-                "greeting_cooldown_seconds": 1800,
                 "context_ttl_seconds": 300,
             },
         },
@@ -82,6 +79,11 @@ def _settings_response() -> dict:
 
 
 def test_reachy_core_builds_settings_cards_for_compatible_reachy(monkeypatch) -> None:
+    fake_people = types.ModuleType("people")
+    fake_people.load_store = lambda *_args, **_kwargs: {
+        "people": [{"id": "person-1", "display_name": "Spud Lord"}]
+    }
+    monkeypatch.setitem(sys.modules, "people", fake_people)
     monkeypatch.setattr(
         reachy_core,
         "_native_snapshot",
@@ -104,8 +106,10 @@ def test_reachy_core_builds_settings_cards_for_compatible_reachy(monkeypatch) ->
         "Motion and Music",
         "Idle Life",
         "Face ID",
+        "Add a Face",
     ]
-    idle_fields = {field["key"]: field["value"] for field in forms[-2]["fields"]}
+    idle_card = next(form for form in forms if form["title"] == "Idle Life")
+    idle_fields = {field["key"]: field["value"] for field in idle_card["fields"]}
     assert idle_fields["enabled"] is True
     assert idle_fields["look_around_enabled"] is True
     reachy_tab = result["ui"]["manager_tabs"][0]
@@ -120,13 +124,19 @@ def test_reachy_core_builds_settings_cards_for_compatible_reachy(monkeypatch) ->
     ]
     assert forms[0]["group"].endswith("::overview")
     assert forms[-1]["group"].endswith("::face_id")
-    face_fields = {field["key"]: field for field in forms[-1]["fields"]}
+    face_card = next(form for form in forms if form["title"] == "Face ID")
+    face_fields = {field["key"]: field for field in face_card["fields"]}
     assert face_fields["enabled"]["value"] is True
-    assert face_fields["capture_mode"]["value"] == "clip"
-    assert face_fields["capture_mode"]["options"] == [
-        {"value": "snapshot", "label": "Snapshot"},
-        {"value": "clip", "label": "Short Clip"},
-    ]
+    assert "capture_mode" not in face_fields
+    assert "scan_interval_seconds" not in face_fields
+    enrollment = forms[-1]
+    enrollment_fields = {field["key"]: field for field in enrollment["fields"]}
+    assert enrollment["save_action"] == "reachy_face_enroll"
+    assert enrollment_fields["person_id"]["options"][-1] == {
+        "value": "person-1",
+        "label": "Spud Lord",
+    }
+    assert enrollment_fields["face_image"]["camera_capture"] is True
 
 
 def test_reachy_core_shows_update_needed_for_old_reachy(monkeypatch) -> None:
@@ -182,6 +192,132 @@ def test_reachy_core_surfaces_native_errors(monkeypatch) -> None:
         )
 
 
+def _face_upload(payload: bytes = b"jpeg-data") -> dict:
+    return {
+        "filename": "face.jpg",
+        "content_type": "image/jpeg",
+        "size": len(payload),
+        "data_b64": base64.b64encode(payload).decode("ascii"),
+    }
+
+
+def test_reachy_core_adds_uploaded_face_to_selected_person(monkeypatch) -> None:
+    fake_people = types.ModuleType("people")
+    fake_people.load_store = lambda *_args, **_kwargs: {
+        "people": [{"id": "person-1", "display_name": "Spud Lord"}]
+    }
+    fake_face_identity = types.ModuleType("face_identity")
+    record_values = []
+
+    def recognize_image(image_bytes, **kwargs):
+        assert image_bytes == b"jpeg-data"
+        record_values.append(kwargs.get("record"))
+        return {
+            "status": "unrecognized",
+            "identity_ids": ["face-new"] if kwargs.get("record") else [],
+            "person_ids": [],
+            "people": [],
+            "faces_detected": 1,
+        }
+
+    saved = []
+    fake_face_identity.recognize_image = recognize_image
+    fake_face_identity.identity_rows = lambda *_args, **_kwargs: {}
+    fake_face_identity.save_profile = lambda identity_id, **kwargs: saved.append(
+        (identity_id, kwargs)
+    ) or {"id": identity_id, "person_id": kwargs["person_id"]}
+    fake_face_identity.person_name = lambda *_args, **_kwargs: ""
+    monkeypatch.setitem(sys.modules, "people", fake_people)
+    monkeypatch.setitem(sys.modules, "face_identity", fake_face_identity)
+
+    result = reachy_core.handle_htmlui_tab_action(
+        action="reachy_face_enroll",
+        payload={
+            "id": reachy_core._card_id("native:reachy-office", "face_enrollment"),
+            "values": {"person_id": "person-1", "face_image": _face_upload()},
+        },
+        redis_client="redis-test",
+    )
+
+    assert result["ok"] is True
+    assert result["identity_id"] == "face-new"
+    assert result["person_name"] == "Spud Lord"
+    assert record_values == [False, True]
+    assert saved == [
+        (
+            "face-new",
+            {
+                "person_id": "person-1",
+                "person_link_supplied": True,
+                "redis_client": "redis-test",
+            },
+        )
+    ]
+
+
+def test_reachy_core_rejects_face_photo_with_multiple_people(monkeypatch) -> None:
+    fake_people = types.ModuleType("people")
+    fake_people.load_store = lambda *_args, **_kwargs: {
+        "people": [{"id": "person-1", "display_name": "Spud Lord"}]
+    }
+    fake_face_identity = types.ModuleType("face_identity")
+    record_values = []
+
+    def recognize_image(*_args, **kwargs):
+        record_values.append(kwargs.get("record"))
+        return {"status": "unrecognized", "identity_ids": [], "faces_detected": 2}
+
+    fake_face_identity.recognize_image = recognize_image
+    monkeypatch.setitem(sys.modules, "people", fake_people)
+    monkeypatch.setitem(sys.modules, "face_identity", fake_face_identity)
+
+    with pytest.raises(ValueError, match="More than one face"):
+        reachy_core.handle_htmlui_tab_action(
+            action="reachy_face_enroll",
+            payload={
+                "id": reachy_core._card_id("native:reachy-office", "face_enrollment"),
+                "values": {"person_id": "person-1", "face_image": _face_upload()},
+            },
+        )
+
+    assert record_values == [False]
+
+
+def test_reachy_core_does_not_reassign_a_face_linked_to_another_person(monkeypatch) -> None:
+    fake_people = types.ModuleType("people")
+    fake_people.load_store = lambda *_args, **_kwargs: {
+        "people": [
+            {"id": "person-1", "display_name": "Spud Lord"},
+            {"id": "person-2", "display_name": "Tater Tot"},
+        ]
+    }
+    fake_face_identity = types.ModuleType("face_identity")
+    record_values = []
+
+    def recognize_image(*_args, **kwargs):
+        record_values.append(kwargs.get("record"))
+        return {"status": "recognized", "identity_ids": ["face-2"], "faces_detected": 1}
+
+    fake_face_identity.recognize_image = recognize_image
+    fake_face_identity.identity_rows = lambda *_args, **_kwargs: {
+        "face-2": {"id": "face-2", "person_id": "person-2"}
+    }
+    fake_face_identity.person_name = lambda *_args, **_kwargs: "Tater Tot"
+    monkeypatch.setitem(sys.modules, "people", fake_people)
+    monkeypatch.setitem(sys.modules, "face_identity", fake_face_identity)
+
+    with pytest.raises(ValueError, match="already linked to Tater Tot"):
+        reachy_core.handle_htmlui_tab_action(
+            action="reachy_face_enroll",
+            payload={
+                "id": reachy_core._card_id("native:reachy-office", "face_enrollment"),
+                "values": {"person_id": "person-1", "face_image": _face_upload()},
+            },
+        )
+
+    assert record_values == [False]
+
+
 def test_reachy_core_matches_a_visible_person_with_shared_face_id(monkeypatch) -> None:
     selector = "native:reachy-office"
     state = reachy_core._face_state(selector)
@@ -202,15 +338,21 @@ def test_reachy_core_matches_a_visible_person_with_shared_face_id(monkeypatch) -
         "audio_overlay": {"active": False},
     }
     fake_face_identity = types.ModuleType("face_identity")
-    fake_face_identity.recognize_image = lambda *_args, **_kwargs: {
-        "status": "recognized",
-        "identity_ids": ["face-1"],
-        "person_ids": ["person-1"],
-        "people": ["Spud Lord"],
-        "faces_detected": 1,
-    }
+    record_values = []
+
+    def recognize_image(*_args, **kwargs):
+        record_values.append(kwargs.get("record"))
+        return {
+            "status": "recognized",
+            "identity_ids": ["face-1"],
+            "person_ids": ["person-1"],
+            "people": ["Spud Lord"],
+            "faces_detected": 1,
+        }
+
+    fake_face_identity.recognize_image = recognize_image
     monkeypatch.setitem(sys.modules, "face_identity", fake_face_identity)
-    monkeypatch.setattr(reachy_core, "_capture_face_frames", lambda *_args: [b"jpeg"])
+    monkeypatch.setattr(reachy_core, "_capture_face_image", lambda *_args: b"jpeg")
     monkeypatch.setattr(reachy_core, "_current_client", lambda *_args: row)
     monkeypatch.setattr(reachy_core, "_speak_face_greeting", lambda *_args: False)
 
@@ -221,8 +363,95 @@ def test_reachy_core_matches_a_visible_person_with_shared_face_id(monkeypatch) -
     assert state["person_name"] == "Spud Lord"
     assert state["identity_ids"] == ["face-1"]
     assert state["expires_at"] > time.time()
+    assert state["face_scan_complete"] is True
     assert state["greeting_pending"] is True
     assert "Spud Lord" in state["pending_greeting_text"]
+    assert record_values == [False]
+
+
+@pytest.mark.parametrize(
+    ("existing_identity_ids", "expected_record_values"),
+    [
+        (["face-existing-unknown"], [False]),
+        ([], [False]),
+    ],
+)
+def test_unknown_face_completes_tracking_session_without_saving_images(
+    monkeypatch,
+    existing_identity_ids,
+    expected_record_values,
+) -> None:
+    suffix = "existing" if existing_identity_ids else "new"
+    selector = f"native:reachy-unknown-{suffix}"
+    state = reachy_core._face_state(selector)
+    state.update(
+        {
+            "settings": _settings_response()["settings"],
+            "next_settings_at": float("inf"),
+            "scan_active": True,
+            "tracking_visible": True,
+        }
+    )
+    row = {
+        **_client(),
+        "selector": selector,
+        "capabilities": {
+            **_client()["capabilities"],
+            "camera_snapshot": True,
+        },
+        "last_seen_ts": time.time(),
+        "last_status": {
+            "reachy": {"face_visible": True, "face_id_ready": True}
+        },
+        "voice": {"active": False},
+        "media_session": {"active": False},
+        "audio_overlay": {"active": False},
+    }
+    record_values = []
+
+    fake_face_identity = types.ModuleType("face_identity")
+
+    def recognize_image(*_args, **kwargs):
+        record = bool(kwargs.get("record"))
+        record_values.append(record)
+        return {
+            "status": "unrecognized",
+            "identity_ids": (
+                ["face-new-unknown"] if record else list(existing_identity_ids)
+            ),
+            "person_ids": [],
+            "people": [],
+            "faces_detected": 1,
+        }
+
+    fake_face_identity.recognize_image = recognize_image
+    monkeypatch.setitem(sys.modules, "face_identity", fake_face_identity)
+    monkeypatch.setattr(reachy_core, "_capture_face_image", lambda *_args: b"jpeg")
+    monkeypatch.setattr(reachy_core, "_current_client", lambda *_args: row)
+
+    started = []
+
+    class FakeThread:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self) -> None:
+            started.append(self.kwargs)
+
+    monkeypatch.setattr(reachy_core, "_connected_reachys", lambda: [row])
+    monkeypatch.setattr(reachy_core.threading, "Thread", FakeThread)
+
+    try:
+        reachy_core._recognize_face_worker(selector, "Office Reachy")
+
+        assert record_values == expected_record_values
+        assert state["person_id"] == ""
+        assert state["face_scan_complete"] is True
+
+        reachy_core._face_id_tick()
+        assert started == []
+    finally:
+        reachy_core._FACE_STATES.pop(selector, None)
 
 
 def test_matched_person_is_not_rechecked_until_tracking_is_lost(monkeypatch) -> None:
@@ -282,6 +511,7 @@ def test_matched_person_is_not_rechecked_until_tracking_is_lost(monkeypatch) -> 
 
         assert state["person_id"] == ""
         assert state["tracking_visible"] is False
+        assert state["face_scan_complete"] is False
 
         row["last_status"]["reachy"]["face_visible"] = True
         row["last_status"]["reachy"]["face_id_ready"] = True
@@ -402,11 +632,11 @@ def test_reachy_core_does_not_request_camera_without_a_good_face(monkeypatch) ->
         },
     )
 
-    assert reachy_core._capture_face_frames("native:reachy-office", "snapshot") == []
+    assert reachy_core._capture_face_image("native:reachy-office") == b""
     assert requests == []
 
     row["last_status"]["reachy"]["face_id_ready"] = True
-    assert reachy_core._capture_face_frames("native:reachy-office", "snapshot") == [b"jpeg"]
+    assert reachy_core._capture_face_image("native:reachy-office") == b"jpeg"
     assert len(requests) == 1
 
 

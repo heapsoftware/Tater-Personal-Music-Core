@@ -15,7 +15,7 @@ from datetime import datetime
 from typing import Any, Dict, List
 
 
-__version__ = "1.2.2"
+__version__ = "1.2.4"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
     "Control Reachy Tater Satellite and Reachy Tater Embedded behavior directly "
@@ -50,8 +50,7 @@ _SUPPORTED_SECTIONS = {"motion", "watch", "idle_life", "face_id", "reachy"}
 _FACE_POLL_SECONDS = 0.2
 _FACE_SETTINGS_REFRESH_SECONDS = 20.0
 _FACE_PRESENCE_STALE_SECONDS = 20.0
-_FACE_CLIP_FRAME_COUNT = 4
-_FACE_CLIP_FRAME_INTERVAL_SECONDS = 0.85
+_FACE_SCAN_RETRY_SECONDS = 5.0
 _MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
 _FACE_STATE_LOCK = threading.RLock()
 _FACE_STATES: Dict[str, Dict[str, Any]] = {}
@@ -320,8 +319,8 @@ def _face_id_card(row: Dict[str, Any], values: Dict[str, Any]) -> Dict[str, Any]
         section="face_id",
         title="Face ID",
         subtitle=(
-            "Recognize one known person through Tater Face ID, greet them naturally, "
-            "and keep their linked People profile active while Reachy tracks them."
+            "Use one locally approved snapshot to recognize a person, greet them naturally, "
+            "and keep their linked People profile active for that tracking session."
         ),
     )
     card["fields"] = [
@@ -333,22 +332,9 @@ def _face_id_card(row: Dict[str, Any], values: Dict[str, Any]) -> Dict[str, Any]
             description=(
                 "Requires Idle Life, Reachy Vision snapshots, and Tater Face ID. "
                 "A Face ID profile must be linked to a Person before Reachy uses its name. "
-                "Reachy's local tracker must first hold a clear, centered face."
+                "Reachy's local tracker must first hold a clear, centered face. Recognition "
+                "is read-only and never saves known or unknown observations."
             ),
-        ),
-        _field(
-            "capture_mode",
-            "Capture Method",
-            "select",
-            _text(values.get("capture_mode")) or "snapshot",
-            description=(
-                "Snapshot is fastest. Short clip samples several live frames for a more reliable match; "
-                "no video file is stored, while Face ID keeps its normal identity observations."
-            ),
-            options=[
-                {"value": "snapshot", "label": "Snapshot"},
-                {"value": "clip", "label": "Short Clip"},
-            ],
         ),
         _field(
             "greetings_enabled",
@@ -372,21 +358,6 @@ def _face_id_card(row: Dict[str, Any], values: Dict[str, Any]) -> Dict[str, Any]
             ),
         ),
         _field(
-            "scan_interval_seconds",
-            "Unmatched Face Retry Interval",
-            "number",
-            _as_float(values.get("scan_interval_seconds"), 60),
-            minimum=15,
-            maximum=3600,
-            step=15,
-            suffix="sec",
-            description=(
-                "When no linked Person matches, GPU Face ID retries at most this often and only while "
-                "the local good-face gate is open. A successful match remains active without more checks "
-                "until Reachy loses visual tracking."
-            ),
-        ),
-        _field(
             "context_ttl_seconds",
             "Conversation Match Lifetime",
             "number",
@@ -399,6 +370,76 @@ def _face_id_card(row: Dict[str, Any], values: Dict[str, Any]) -> Dict[str, Any]
         ),
     ]
     return card
+
+
+def _people_rows(redis_client: Any = None) -> List[Dict[str, Any]]:
+    try:
+        import people
+
+        store = people.load_store(redis_client)
+    except Exception:
+        return []
+    rows = [dict(item) for item in list(store.get("people") or []) if isinstance(item, dict)]
+    rows.sort(key=lambda item: (_text(item.get("display_name")).lower(), _text(item.get("id"))))
+    return rows
+
+
+def _people_options(redis_client: Any = None) -> List[Dict[str, str]]:
+    options = [{"value": "", "label": "Choose a person"}]
+    for person in _people_rows(redis_client):
+        person_id = _text(person.get("id"))
+        display_name = _text(person.get("display_name"))
+        if person_id and display_name:
+            options.append({"value": person_id, "label": display_name})
+    return options
+
+
+def _face_enrollment_card(row: Dict[str, Any], redis_client: Any = None) -> Dict[str, Any]:
+    selector = _text(row.get("selector"))
+    people_options = _people_options(redis_client)
+    has_people = len(people_options) > 1
+    return {
+        "id": _card_id(selector, "face_enrollment"),
+        "group": _section_group(selector, "face_id"),
+        "title": "Add a Face",
+        "subtitle": (
+            "Choose an existing Tater Person, then upload a clear photo or take one "
+            "with this browser's camera."
+        ),
+        "save_action": "reachy_face_enroll",
+        "save_label": "Add Face to Person",
+        "fields": [
+            _field(
+                "person_id",
+                "Person",
+                "select",
+                "",
+                options=people_options,
+                description=(
+                    "The face will be added to this Person's Face ID profile."
+                    if has_people
+                    else "Create a Person in Tater's People settings first, then return here."
+                ),
+            ),
+            {
+                "key": "face_image",
+                "label": "Face Photo",
+                "type": "file",
+                "value": "",
+                "accept": "image/jpeg,image/png,image/webp",
+                "file_encoding": "base64",
+                "max_bytes": _MAX_SNAPSHOT_BYTES,
+                "camera_capture": True,
+                "camera_facing_mode": "user",
+                "disabled": not has_people,
+                "full_width": True,
+                "description": (
+                    "Use one clear, front-facing photo containing only this person. Live camera "
+                    "capture is offered when the page is opened over HTTPS or on localhost."
+                ),
+            },
+        ],
+    }
 
 
 def _tracking_card(row: Dict[str, Any], values: Dict[str, Any]) -> Dict[str, Any]:
@@ -573,7 +614,6 @@ def _device_manager_tab(
 
 
 def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
-    del redis_client
     reachys = _connected_reachys()
     compatible = [row for row in reachys if row.get("settings_supported")]
     forms: List[Dict[str, Any]] = []
@@ -598,6 +638,7 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
                     _motion_card(row, settings.get("motion") if isinstance(settings.get("motion"), dict) else {}),
                     _idle_life_card(row, settings.get("idle_life") if isinstance(settings.get("idle_life"), dict) else {}),
                     _face_id_card(row, settings.get("face_id") if isinstance(settings.get("face_id"), dict) else {}),
+                    _face_enrollment_card(row, redis_client),
                 ]
             )
             tabs.append(
@@ -663,6 +704,113 @@ def _checked_result(result: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def _decode_face_upload(value: Any) -> tuple[bytes, str, str]:
+    upload = value if isinstance(value, dict) else {}
+    filename = _text(upload.get("filename"))[:160] or "face-photo.jpg"
+    content_type = _text(upload.get("content_type")).lower().split(";", 1)[0]
+    allowed_types = {"image/jpeg", "image/jpg", "image/png", "image/webp"}
+    if content_type and content_type not in allowed_types:
+        raise ValueError("Choose a JPEG, PNG, or WebP face photo.")
+    encoded = _text(upload.get("data_b64"))
+    if not encoded:
+        raise ValueError("Choose a face photo or take one with the camera first.")
+    if len(encoded) > ((_MAX_SNAPSHOT_BYTES + 2) // 3) * 4 + 8:
+        raise ValueError("The face photo must be 8 MB or smaller.")
+    try:
+        image_bytes = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("The selected face photo could not be read.") from exc
+    if not image_bytes:
+        raise ValueError("The selected face photo is empty.")
+    if len(image_bytes) > _MAX_SNAPSHOT_BYTES:
+        raise ValueError("The face photo must be 8 MB or smaller.")
+    return image_bytes, filename, content_type or "image/jpeg"
+
+
+def _enroll_face_image(
+    selector: str,
+    values: Dict[str, Any],
+    redis_client: Any = None,
+) -> Dict[str, Any]:
+    person_id = _text(values.get("person_id"))
+    person = next(
+        (row for row in _people_rows(redis_client) if _text(row.get("id")) == person_id),
+        None,
+    )
+    if not person:
+        raise ValueError("Choose an existing Tater Person.")
+    person_name = _text(person.get("display_name")) or "this person"
+    image_bytes, filename, content_type = _decode_face_upload(values.get("face_image"))
+
+    try:
+        import face_identity
+    except Exception as exc:
+        raise ValueError("Tater Face ID is unavailable.") from exc
+
+    inspected = face_identity.recognize_image(
+        image_bytes,
+        source={
+            "kind": "reachy_core_enrollment",
+            "selector": selector,
+            "filename": filename,
+            "content_type": content_type,
+        },
+        record=False,
+        redis_client=redis_client,
+    )
+    if not isinstance(inspected, dict):
+        raise ValueError("Tater Face ID did not return a usable result.")
+    faces_detected = int(_as_float(inspected.get("faces_detected"), 0))
+    if faces_detected < 1:
+        warning = _text(inspected.get("warning"))
+        raise ValueError(warning or "No clear face was found. Try a closer, front-facing photo.")
+    if faces_detected > 1:
+        raise ValueError("More than one face was found. Use a photo containing only the selected person.")
+
+    existing_ids = [_text(item) for item in list(inspected.get("identity_ids") or []) if _text(item)]
+    if len(existing_ids) > 1:
+        raise ValueError("The photo matched more than one Face ID profile. Use a clearer photo.")
+    if existing_ids:
+        identities = face_identity.identity_rows(redis_client)
+        existing = identities.get(existing_ids[0]) if isinstance(identities, dict) else None
+        existing_person_id = _text(existing.get("person_id")) if isinstance(existing, dict) else ""
+        if existing_person_id and existing_person_id != person_id:
+            existing_name = _text(face_identity.person_name(existing_person_id, redis_client)) or "another Person"
+            raise ValueError(
+                f"This face is already linked to {existing_name}. Use that Person or review the face in People settings."
+            )
+
+    recorded = face_identity.recognize_image(
+        image_bytes,
+        event_id=f"reachy_enrollment_{uuid.uuid4().hex[:16]}",
+        seen_at=datetime.now().astimezone().isoformat(),
+        source={
+            "kind": "reachy_core_enrollment",
+            "selector": selector,
+            "filename": filename,
+            "content_type": content_type,
+        },
+        record=True,
+        redis_client=redis_client,
+    )
+    identity_ids = [_text(item) for item in list(recorded.get("identity_ids") or []) if _text(item)]
+    if len(identity_ids) != 1:
+        raise ValueError("Face ID could not save one clear face from this photo. Try another photo.")
+    identity = face_identity.save_profile(
+        identity_ids[0],
+        person_id=person_id,
+        person_link_supplied=True,
+        redis_client=redis_client,
+    )
+    return {
+        "ok": True,
+        "identity_id": _text(identity.get("id")) or identity_ids[0],
+        "person_id": person_id,
+        "person_name": person_name,
+        "message": f"Face added to {person_name}. Reachy can recognize them on the next tracking session.",
+    }
+
+
 def handle_htmlui_tab_action(
     *,
     action: str,
@@ -670,10 +818,14 @@ def handle_htmlui_tab_action(
     redis_client=None,
     **_kwargs,
 ) -> Dict[str, Any]:
-    del redis_client
     action_name = _text(action).lower()
     body = payload if isinstance(payload, dict) else {}
     selector, section = _parse_card_id(body.get("id"))
+
+    if action_name == "reachy_face_enroll":
+        if section != "face_enrollment":
+            raise ValueError("This Reachy card cannot add a face.")
+        return _enroll_face_image(selector, _payload_values(body), redis_client)
 
     if action_name == "reachy_save_settings":
         if section not in _SUPPORTED_SECTIONS:
@@ -747,6 +899,7 @@ def _face_state(selector: str) -> Dict[str, Any]:
                 "next_settings_at": 0.0,
                 "next_scan_at": 0.0,
                 "scan_active": False,
+                "face_scan_complete": False,
                 "person_id": "",
                 "person_name": "",
                 "identity_ids": [],
@@ -765,7 +918,11 @@ def _face_state(selector: str) -> Dict[str, Any]:
         return state
 
 
-def _clear_face_person(state: Dict[str, Any]) -> None:
+def _clear_face_person(
+    state: Dict[str, Any],
+    *,
+    reset_tracking_session: bool = True,
+) -> None:
     state["person_id"] = ""
     state["person_name"] = ""
     state["identity_ids"] = []
@@ -776,6 +933,8 @@ def _clear_face_person(state: Dict[str, Any]) -> None:
     state["pending_greeting_text"] = ""
     state["pending_greeting_template"] = ""
     state["next_greeting_at"] = 0.0
+    if reset_tracking_session:
+        state["face_scan_complete"] = False
 
 
 def _face_visible(row: Dict[str, Any], *, now: float) -> bool:
@@ -841,30 +1000,22 @@ def _decode_snapshot(result: Dict[str, Any]) -> bytes:
     return image
 
 
-def _capture_face_frames(selector: str, capture_mode: str) -> List[bytes]:
-    count = _FACE_CLIP_FRAME_COUNT if capture_mode == "clip" else 1
-    frames: List[bytes] = []
-    for index in range(count):
-        if index:
-            time.sleep(_FACE_CLIP_FRAME_INTERVAL_SECONDS)
-        if not _face_id_ready(_current_client(selector), now=time.time()):
-            break
-        try:
-            result = _native_request(
-                selector,
-                "camera.snapshot",
-                {"reason": "reachy_core_face_id", "frame": index + 1},
-                timeout=8.0,
-            )
-        except Exception as exc:
-            logger.debug("[Reachy Core] Camera snapshot failed for %s: %s", selector, exc)
-            continue
-        if not _face_id_ready(_current_client(selector), now=time.time()):
-            break
-        image = _decode_snapshot(result)
-        if image:
-            frames.append(image)
-    return frames
+def _capture_face_image(selector: str) -> bytes:
+    if not _face_id_ready(_current_client(selector), now=time.time()):
+        return b""
+    try:
+        result = _native_request(
+            selector,
+            "camera.snapshot",
+            {"reason": "reachy_core_face_id"},
+            timeout=8.0,
+        )
+    except Exception as exc:
+        logger.debug("[Reachy Core] Camera snapshot failed for %s: %s", selector, exc)
+        return b""
+    if not _face_id_ready(_current_client(selector), now=time.time()):
+        return b""
+    return _decode_snapshot(result)
 
 
 def _quiet_hours_active(idle_settings: Dict[str, Any]) -> bool:
@@ -1003,48 +1154,71 @@ def _greet_face_worker(
                 state["next_greeting_at"] = time.time() + 5.0
 
 
+def _face_result_summary(
+    result: Dict[str, Any],
+) -> tuple[List[str], Dict[str, Dict[str, Any]], int]:
+    identity_ids: List[str] = []
+    for identity_id in result.get("identity_ids") or []:
+        token = _text(identity_id)
+        if token and token not in identity_ids:
+            identity_ids.append(token)
+    people_found: Dict[str, Dict[str, Any]] = {}
+    person_ids = list(result.get("person_ids") or [])
+    names = list(result.get("people") or [])
+    for index, person_id in enumerate(person_ids):
+        token = _text(person_id)
+        name = _text(names[index] if index < len(names) else "")
+        if token and name:
+            people_found[token] = {"person_id": token, "person_name": name}
+    return (
+        identity_ids,
+        people_found,
+        max(0, int(_as_float(result.get("faces_detected"), 0.0))),
+    )
+
+
+def _raise_for_face_result(result: Dict[str, Any]) -> None:
+    status = _text(result.get("status")).lower()
+    if status in {"disabled", "not_ready", "error"}:
+        raise RuntimeError(
+            _text(result.get("warning")) or f"Face ID returned {status or 'an error'}"
+        )
+
+
 def _recognize_face_worker(selector: str, device_name: str) -> None:
     with _FACE_STATE_LOCK:
         state = _face_state(selector)
         settings = dict(state.get("settings") or {})
     face_settings = settings.get("face_id") if isinstance(settings.get("face_id"), dict) else {}
     idle_settings = settings.get("idle_life") if isinstance(settings.get("idle_life"), dict) else {}
-    capture_mode = "clip" if _text(face_settings.get("capture_mode")).lower() == "clip" else "snapshot"
-    interval = max(15.0, _as_float(face_settings.get("scan_interval_seconds"), 60.0))
     people_found: Dict[str, Dict[str, Any]] = {}
     identity_ids: List[str] = []
-    max_faces_in_frame = 0
+    faces_detected = 0
     analysis_completed = False
     error = ""
     try:
-        frames = _capture_face_frames(selector, capture_mode)
-        if not frames:
+        image = _capture_face_image(selector)
+        if not image:
             raise RuntimeError("Reachy did not return a camera frame")
         import face_identity
 
         event_id = f"reachy_core_{uuid.uuid4().hex}"
-        for image in frames:
-            result = face_identity.recognize_image(
-                image,
-                event_id=event_id,
-                source={"owner": "reachy_core", "selector": selector, "device_name": device_name},
-                record=True,
-            )
-            max_faces_in_frame = max(
-                max_faces_in_frame,
-                int(_as_float(result.get("faces_detected"), 0.0)),
-            )
-            for identity_id in result.get("identity_ids") or []:
-                token = _text(identity_id)
-                if token and token not in identity_ids:
-                    identity_ids.append(token)
-            person_ids = list(result.get("person_ids") or [])
-            names = list(result.get("people") or [])
-            for index, person_id in enumerate(person_ids):
-                token = _text(person_id)
-                name = _text(names[index] if index < len(names) else "")
-                if token and name:
-                    people_found[token] = {"person_id": token, "person_name": name}
+        source = {
+            "owner": "reachy_core",
+            "selector": selector,
+            "device_name": device_name,
+        }
+        result = face_identity.recognize_image(
+            image,
+            event_id=event_id,
+            source=source,
+            record=False,
+        )
+        _raise_for_face_result(result)
+        identity_ids, people_found, faces_detected = _face_result_summary(result)
+
+        # Reachy recognition is deliberately read-only. Known profiles match
+        # without a new observation, while unknown faces remain unsaved.
         analysis_completed = True
     except Exception as exc:
         error = _text(exc)
@@ -1053,16 +1227,15 @@ def _recognize_face_worker(selector: str, device_name: str) -> None:
     with _FACE_STATE_LOCK:
         state = _face_state(selector)
         state["scan_active"] = False
-        state["next_scan_at"] = now + (
-            interval if analysis_completed else min(5.0, interval)
-        )
+        state["next_scan_at"] = now + _FACE_SCAN_RETRY_SECONDS
         settings = state.get("settings") if isinstance(state.get("settings"), dict) else {}
         face_settings = settings.get("face_id") if isinstance(settings.get("face_id"), dict) else {}
         idle_settings = settings.get("idle_life") if isinstance(settings.get("idle_life"), dict) else {}
         row = _current_client(selector)
         if not row or not _face_visible(row, now=now) or not _as_bool(face_settings.get("enabled"), False):
             _clear_face_person(state)
-        elif len(people_found) == 1 and max_faces_in_frame <= 1:
+        elif analysis_completed and len(people_found) == 1 and faces_detected <= 1:
+            state["face_scan_complete"] = True
             person = next(iter(people_found.values()))
             person_id = _text(person.get("person_id"))
             person_name = _text(person.get("person_name"))
@@ -1078,8 +1251,9 @@ def _recognize_face_worker(selector: str, device_name: str) -> None:
                     and not _quiet_hours_active(idle_settings)
                 ):
                     _queue_face_greeting(state, person_name)
-        elif len(people_found) > 1 or max_faces_in_frame > 0:
-            _clear_face_person(state)
+        elif analysis_completed:
+            _clear_face_person(state, reset_tracking_session=False)
+            state["face_scan_complete"] = True
 
     if error:
         logger.debug("[Reachy Core] Face ID scan failed for %s: %s", selector, error)
@@ -1188,6 +1362,7 @@ def _face_id_tick() -> None:
             if not _as_bool(state.get("tracking_visible"), False):
                 state["tracking_visible"] = True
                 state["next_scan_at"] = 0.0
+                state["face_scan_complete"] = False
             if _text(state.get("person_id")):
                 # Keep one successful match for the full continuous tracking
                 # session. The satellite's fresh face-visible signal owns the
@@ -1240,6 +1415,7 @@ def _face_id_tick() -> None:
 
             if (
                 _face_id_ready(row, now=now)
+                and not _as_bool(state.get("face_scan_complete"), False)
                 and not _text(state.get("person_id"))
                 and not _as_bool(state.get("scan_active"), False)
                 and now >= _as_float(state.get("next_scan_at"), 0.0)
