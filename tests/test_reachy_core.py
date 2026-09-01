@@ -326,6 +326,8 @@ def test_reachy_core_matches_a_visible_person_with_shared_face_id(monkeypatch) -
             "settings": _settings_response()["settings"],
             "scan_active": True,
             "next_scan_at": 0.0,
+            "tracking_visible": True,
+            "face_currently_visible": True,
         }
     )
     row = {
@@ -509,6 +511,26 @@ def test_matched_person_is_not_rechecked_until_tracking_is_lost(monkeypatch) -> 
         row["last_seen_ts"] = time.time()
         reachy_core._face_id_tick()
 
+        assert state["person_id"] == "person-1"
+        assert state["tracking_visible"] is True
+        assert state["face_scan_complete"] is False
+        assert state["face_missing_since"] > 0.0
+
+        row["last_status"]["reachy"]["face_visible"] = True
+        row["last_status"]["reachy"]["face_id_ready"] = True
+        row["last_seen_ts"] = time.time()
+        reachy_core._face_id_tick()
+
+        assert state["person_id"] == "person-1"
+        assert state["face_missing_since"] == 0.0
+        assert started == []
+
+        row["last_status"]["reachy"]["face_visible"] = False
+        row["last_status"]["reachy"]["face_id_ready"] = False
+        row["last_seen_ts"] = time.time()
+        state["face_missing_since"] = time.time() - reachy_core._FACE_SESSION_LOSS_SECONDS - 1.0
+        reachy_core._face_id_tick()
+
         assert state["person_id"] == ""
         assert state["tracking_visible"] is False
         assert state["face_scan_complete"] is False
@@ -583,6 +605,20 @@ def test_random_greeting_runs_once_per_tracking_session(monkeypatch) -> None:
         row["last_status"]["reachy"]["face_visible"] = False
         row["last_status"]["reachy"]["face_id_ready"] = False
         row["last_seen_ts"] = time.time()
+        reachy_core._face_id_tick()
+        assert state["person_id"] == "person-1"
+
+        row["last_status"]["reachy"]["face_visible"] = True
+        row["last_status"]["reachy"]["face_id_ready"] = True
+        row["last_seen_ts"] = time.time()
+        reachy_core._face_id_tick()
+        assert state["person_id"] == "person-1"
+        assert len(spoken) == 1
+
+        row["last_status"]["reachy"]["face_visible"] = False
+        row["last_status"]["reachy"]["face_id_ready"] = False
+        row["last_seen_ts"] = time.time()
+        state["face_missing_since"] = time.time() - reachy_core._FACE_SESSION_LOSS_SECONDS - 1.0
         reachy_core._face_id_tick()
         assert state["person_id"] == ""
 

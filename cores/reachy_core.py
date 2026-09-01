@@ -15,7 +15,7 @@ from datetime import datetime
 from typing import Any, Dict, List
 
 
-__version__ = "1.2.4"
+__version__ = "1.2.5"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
     "Control Reachy Tater Satellite and Reachy Tater Embedded behavior directly "
@@ -50,6 +50,7 @@ _SUPPORTED_SECTIONS = {"motion", "watch", "idle_life", "face_id", "reachy"}
 _FACE_POLL_SECONDS = 0.2
 _FACE_SETTINGS_REFRESH_SECONDS = 20.0
 _FACE_PRESENCE_STALE_SECONDS = 20.0
+_FACE_SESSION_LOSS_SECONDS = 30.0
 _FACE_SCAN_RETRY_SECONDS = 5.0
 _MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
 _FACE_STATE_LOCK = threading.RLock()
@@ -343,8 +344,9 @@ def _face_id_card(row: Dict[str, Any], values: Dict[str, Any]) -> Dict[str, Any]
             _as_bool(values.get("greetings_enabled"), True),
             description=(
                 "Say one varied hello using the matched Person's display name when a new "
-                "tracking session identifies them. Reachy will not greet them again until "
-                "visual tracking is lost and later reacquired."
+                "tracking session identifies them. Brief tracker dropouts keep the same "
+                "session; Reachy must lose the face continuously for 30 seconds before "
+                "a later match can greet again."
             ),
         ),
         _field(
@@ -913,6 +915,8 @@ def _face_state(selector: str) -> Dict[str, Any]:
                 "alias_person_id": "",
                 "injected_session_id": "",
                 "tracking_visible": False,
+                "face_currently_visible": False,
+                "face_missing_since": 0.0,
             }
             _FACE_STATES[selector] = state
         return state
@@ -935,6 +939,8 @@ def _clear_face_person(
     state["next_greeting_at"] = 0.0
     if reset_tracking_session:
         state["face_scan_complete"] = False
+        state["face_currently_visible"] = False
+        state["face_missing_since"] = 0.0
 
 
 def _face_visible(row: Dict[str, Any], *, now: float) -> bool:
@@ -1061,6 +1067,7 @@ def _face_person_active(selector: str, person_id: str) -> bool:
         return bool(
             state
             and _as_bool(state.get("tracking_visible"), False)
+            and _as_bool(state.get("face_currently_visible"), False)
             and _text(state.get("person_id")) == person_id
         )
 
@@ -1232,7 +1239,11 @@ def _recognize_face_worker(selector: str, device_name: str) -> None:
         face_settings = settings.get("face_id") if isinstance(settings.get("face_id"), dict) else {}
         idle_settings = settings.get("idle_life") if isinstance(settings.get("idle_life"), dict) else {}
         row = _current_client(selector)
-        if not row or not _face_visible(row, now=now) or not _as_bool(face_settings.get("enabled"), False):
+        if (
+            not row
+            or not _as_bool(face_settings.get("enabled"), False)
+            or not _as_bool(state.get("tracking_visible"), False)
+        ):
             _clear_face_person(state)
         elif analysis_completed and len(people_found) == 1 and faces_detected <= 1:
             state["face_scan_complete"] = True
@@ -1354,11 +1365,32 @@ def _face_id_tick() -> None:
                 )
             )
             visible = enabled and _face_visible(row, now=now)
-            if not visible:
+            state["face_currently_visible"] = visible
+            if not enabled:
                 _clear_face_person(state)
                 state["tracking_visible"] = False
                 state["next_scan_at"] = 0.0
                 continue
+            if not visible:
+                if _as_bool(state.get("tracking_visible"), False):
+                    missing_since = _as_float(state.get("face_missing_since"), 0.0)
+                    if missing_since <= 0.0:
+                        state["face_missing_since"] = now
+                    elif now - missing_since >= _FACE_SESSION_LOSS_SECONDS:
+                        logger.info(
+                            "[Reachy Core] Ended Face ID tracking session after %.1fs without a face selector=%s",
+                            now - missing_since,
+                            selector,
+                        )
+                        _clear_face_person(state)
+                        state["tracking_visible"] = False
+                        state["next_scan_at"] = 0.0
+                else:
+                    _clear_face_person(state)
+                    state["tracking_visible"] = False
+                    state["next_scan_at"] = 0.0
+                continue
+            state["face_missing_since"] = 0.0
             if not _as_bool(state.get("tracking_visible"), False):
                 state["tracking_visible"] = True
                 state["next_scan_at"] = 0.0
