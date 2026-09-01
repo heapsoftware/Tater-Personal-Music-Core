@@ -15,7 +15,7 @@ from datetime import datetime
 from typing import Any, Dict, List
 
 
-__version__ = "1.2.5"
+__version__ = "1.2.6"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
     "Control Reachy Tater Satellite and Reachy Tater Embedded behavior directly "
@@ -333,8 +333,19 @@ def _face_id_card(row: Dict[str, Any], values: Dict[str, Any]) -> Dict[str, Any]
             description=(
                 "Requires Idle Life, Reachy Vision snapshots, and Tater Face ID. "
                 "A Face ID profile must be linked to a Person before Reachy uses its name. "
-                "Reachy's local tracker must first hold a clear, centered face. Recognition "
-                "is read-only and never saves known or unknown observations."
+                "Reachy's local tracker must first hold a clear, centered face."
+            ),
+        ),
+        _field(
+            "store_photos",
+            "Store Face ID Photos",
+            "checkbox",
+            _as_bool(values.get("store_photos"), False),
+            description=(
+                "Off keeps recognition read-only. When enabled, Reachy stores one cropped "
+                "face observation per genuine tracking session. Known matches strengthen "
+                "that Person's Face ID profile; unknown faces appear in People Face ID "
+                "for later review and sorting."
             ),
         ),
         _field(
@@ -1203,6 +1214,7 @@ def _recognize_face_worker(selector: str, device_name: str) -> None:
     faces_detected = 0
     analysis_completed = False
     error = ""
+    storage_error = ""
     try:
         image = _capture_face_image(selector)
         if not image:
@@ -1224,8 +1236,26 @@ def _recognize_face_worker(selector: str, device_name: str) -> None:
         _raise_for_face_result(result)
         identity_ids, people_found, faces_detected = _face_result_summary(result)
 
-        # Reachy recognition is deliberately read-only. Known profiles match
-        # without a new observation, while unknown faces remain unsaved.
+        # Inspect read-only first so an opt-in recording request never stores a
+        # multi-person scene. Recording repeats the analysis only once for the
+        # single good snapshot selected for this tracking session.
+        if _as_bool(face_settings.get("store_photos"), False) and faces_detected == 1:
+            try:
+                recorded = face_identity.recognize_image(
+                    image,
+                    event_id=event_id,
+                    source={**source, "kind": "reachy_face_id_observation"},
+                    record=True,
+                )
+                _raise_for_face_result(recorded)
+                stored_ids, stored_people, stored_faces = _face_result_summary(recorded)
+                if stored_faces != 1:
+                    raise RuntimeError("Face ID photo storage did not return exactly one face")
+                identity_ids = stored_ids or identity_ids
+                people_found = stored_people or people_found
+            except Exception as exc:
+                storage_error = _text(exc)
+
         analysis_completed = True
     except Exception as exc:
         error = _text(exc)
@@ -1268,6 +1298,12 @@ def _recognize_face_worker(selector: str, device_name: str) -> None:
 
     if error:
         logger.debug("[Reachy Core] Face ID scan failed for %s: %s", selector, error)
+    if storage_error:
+        logger.warning(
+            "[Reachy Core] Face ID matched but its optional photo could not be stored selector=%s error=%s",
+            selector,
+            storage_error,
+        )
 
 
 def _ensure_voice_alias(selector: str, state: Dict[str, Any]) -> str:

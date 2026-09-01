@@ -70,6 +70,7 @@ def _settings_response() -> dict:
             "idle_life": {"enabled": True, "look_around_enabled": True},
             "face_id": {
                 "enabled": True,
+                "store_photos": False,
                 "greetings_enabled": True,
                 "conversation_identity_enabled": True,
                 "context_ttl_seconds": 300,
@@ -127,6 +128,7 @@ def test_reachy_core_builds_settings_cards_for_compatible_reachy(monkeypatch) ->
     face_card = next(form for form in forms if form["title"] == "Face ID")
     face_fields = {field["key"]: field for field in face_card["fields"]}
     assert face_fields["enabled"]["value"] is True
+    assert face_fields["store_photos"]["value"] is False
     assert "capture_mode" not in face_fields
     assert "scan_interval_seconds" not in face_fields
     enrollment = forms[-1]
@@ -320,10 +322,12 @@ def test_reachy_core_does_not_reassign_a_face_linked_to_another_person(monkeypat
 
 def test_reachy_core_matches_a_visible_person_with_shared_face_id(monkeypatch) -> None:
     selector = "native:reachy-office"
+    settings = _settings_response()["settings"]
+    settings["face_id"]["store_photos"] = True
     state = reachy_core._face_state(selector)
     state.update(
         {
-            "settings": _settings_response()["settings"],
+            "settings": settings,
             "scan_active": True,
             "next_scan_at": 0.0,
             "tracking_visible": True,
@@ -368,7 +372,53 @@ def test_reachy_core_matches_a_visible_person_with_shared_face_id(monkeypatch) -
     assert state["face_scan_complete"] is True
     assert state["greeting_pending"] is True
     assert "Spud Lord" in state["pending_greeting_text"]
-    assert record_values == [False]
+    assert record_values == [False, True]
+
+
+def test_reachy_core_never_stores_a_multi_person_snapshot(monkeypatch) -> None:
+    selector = "native:reachy-multiple-faces"
+    settings = _settings_response()["settings"]
+    settings["face_id"]["store_photos"] = True
+    state = reachy_core._face_state(selector)
+    state.update(
+        {
+            "settings": settings,
+            "scan_active": True,
+            "tracking_visible": True,
+            "face_currently_visible": True,
+        }
+    )
+    row = {
+        **_client(),
+        "selector": selector,
+        "last_status": {"reachy": {"face_visible": True}},
+    }
+    record_values = []
+    fake_face_identity = types.ModuleType("face_identity")
+
+    def recognize_image(*_args, **kwargs):
+        record_values.append(kwargs.get("record"))
+        return {
+            "status": "unrecognized",
+            "identity_ids": [],
+            "person_ids": [],
+            "people": [],
+            "faces_detected": 2,
+        }
+
+    fake_face_identity.recognize_image = recognize_image
+    monkeypatch.setitem(sys.modules, "face_identity", fake_face_identity)
+    monkeypatch.setattr(reachy_core, "_capture_face_image", lambda *_args: b"jpeg")
+    monkeypatch.setattr(reachy_core, "_current_client", lambda *_args: row)
+
+    try:
+        reachy_core._recognize_face_worker(selector, "Office Reachy")
+
+        assert record_values == [False]
+        assert state["person_id"] == ""
+        assert state["face_scan_complete"] is True
+    finally:
+        reachy_core._FACE_STATES.pop(selector, None)
 
 
 @pytest.mark.parametrize(
