@@ -1340,6 +1340,27 @@
       "sha256": "a897de888195470593f228e1f1d1764e8d00e3493c3725c0dbe750835c4addb1"
     },
     {
+      "id": "tater_assistant_support",
+      "name": "Tater Assistant Support",
+      "version": "1.0.0",
+      "min_tater_version": "59",
+      "description": "Use when a Discord user asks how to install, configure, troubleshoot, use, or develop Tater Assistant, Tater Shop packages, or Tater Integrations, including questions that require checking their README files or source code.",
+      "portals": [
+        "discord"
+      ],
+      "notifier": false,
+      "settings_category": "Tater Discord Support",
+      "tags": [
+        "discord",
+        "support",
+        "documentation",
+        "github",
+        "tater-assistant"
+      ],
+      "entry": "verba/tater_assistant_support.py",
+      "sha256": "e09cda7e756126f38db15744acabeb7febd2fd98b74b30d6253ce03a5a7be1a4"
+    },
+    {
       "id": "tater_gits_add_feed",
       "name": "Tater Gits Add Feed",
       "version": "1.0.3",
@@ -1360,6 +1381,28 @@
       "tags": [],
       "entry": "verba/tater_gits_add_feed.py",
       "sha256": "de8722439862f92b10d47bc098dfdcc1367beadc8439812b29d312ec9da33f04"
+    },
+    {
+      "id": "tater_tube_support",
+      "name": "Tater Tube Support",
+      "version": "1.0.0",
+      "min_tater_version": "59",
+      "description": "Use when a Discord user asks how to install, configure, pair, troubleshoot, use, or develop Tater Tube for Raspberry Pi, Tater Tube for Steam or Steam Deck, or Tater Tube Server, including questions that require checking their README files or source code.",
+      "portals": [
+        "discord"
+      ],
+      "notifier": false,
+      "settings_category": "Tater Discord Support",
+      "tags": [
+        "discord",
+        "support",
+        "documentation",
+        "github",
+        "tater-tube",
+        "steam-deck"
+      ],
+      "entry": "verba/tater_tube_support.py",
+      "sha256": "ec0dee27ce17a707b4685cdd323431263c2831d8141a25e5ad20e2e0e18b9fcf"
     },
     {
       "id": "temperature_status",
@@ -1503,6 +1546,28 @@
       "tags": [],
       "entry": "verba/voicepe_remote_timer.py",
       "sha256": "6ce49b85c08108ba6537ee30bdcf8b9392558dfe0dd26210bcfb9951a51cf24d"
+    },
+    {
+      "id": "wake_word_trainer_support",
+      "name": "Wake Word Trainer Support",
+      "version": "1.0.0",
+      "min_tater_version": "59",
+      "description": "Use when a Discord user asks how to choose, install, configure, train with, troubleshoot, or understand code in the Apple Silicon or NVIDIA microWakeWord trainers. Do not use for openWakeWord or NanoWakeWord.",
+      "portals": [
+        "discord"
+      ],
+      "notifier": false,
+      "settings_category": "Tater Discord Support",
+      "tags": [
+        "discord",
+        "support",
+        "documentation",
+        "github",
+        "wake-word",
+        "training"
+      ],
+      "entry": "verba/wake_word_trainer_support.py",
+      "sha256": "fb489692c0e95a7406e3953c2bf4f8f220cdcab2fa9e9478107100925796c12f"
     },
     {
       "id": "weather_forecast",
