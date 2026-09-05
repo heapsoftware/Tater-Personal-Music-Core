@@ -4,6 +4,7 @@ import json
 import sys
 import types
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -57,6 +58,16 @@ class TaterTubeCoreAssistantNameTests(unittest.TestCase):
 
     def test_defaults_to_tater(self):
         self.assertEqual(self.core._assistant_first_name(FakeRedis()), "Tater")
+
+    def test_local_moment_includes_time_day_and_holiday_context(self):
+        moment = self.core._local_moment(
+            datetime(2026, 12, 20, 19, 30, tzinfo=timezone.utc)
+        )
+        self.assertEqual(moment["weekday"], "Sunday")
+        self.assertEqual(moment["time_of_day"], "evening")
+        self.assertEqual(moment["day_kind"], "weekend")
+        self.assertEqual(moment["season"], "winter")
+        self.assertEqual(moment["nearby_occasion"], "winter holiday season")
 
     def test_sends_a_url_encoded_unicode_name_header(self):
         response = types.SimpleNamespace(
@@ -265,6 +276,8 @@ class TaterTubeCoreAssistantNameTests(unittest.TestCase):
         self.assertIn("Super Mario 64", result["boot_summary"])
         self.assertEqual(published_payload["boot_summary"], result["boot_summary"])
         self.assertEqual(len(llm.payloads), 2)
+        self.assertIn("local_moment", llm.payloads[0])
+        self.assertIn("weekday", llm.payloads[0]["local_moment"])
         pick_titles = [row["title"] for row in llm.payloads[0]["recent_server_viewing"]]
         global_titles = [row["title"] for row in llm.payloads[1]["recent_global_activity"]]
         self.assertEqual(pick_titles, ["Server Movie"])

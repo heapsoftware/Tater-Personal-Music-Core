@@ -22,7 +22,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 MIN_TATER_VERSION = "59"
 CORE_DESCRIPTION = (
     "Connect Tater to Tater Tube Server, keep Tater's Picks focused on the server "
@@ -118,7 +118,7 @@ MUSIC_RECOMMENDATIONS_KEY = "music_core_recommendations_v1"
 DEFAULT_PROFILE_ID = "household"
 REQUEST_TIMEOUT_SECONDS = 25
 TTS_MAX_TEXT_CHARS = 800
-GENERATION_SCHEMA_VERSION = 2
+GENERATION_SCHEMA_VERSION = 3
 TATER_PICKS_ACTIVITY_SOURCES = {
     "local",
     "local_media",
@@ -173,6 +173,58 @@ def _as_bool(value: Any, default: bool = False) -> bool:
     if token in {"0", "false", "no", "off", "disabled"}:
         return False
     return bool(default)
+
+
+def _nearby_occasion(current: datetime) -> str:
+    month = current.month
+    day = current.day
+    if (month == 12 and day >= 27) or (month == 1 and day <= 2):
+        return "New Year's"
+    if month == 2 and 10 <= day <= 14:
+        return "Valentine's week"
+    if month == 7 and 1 <= day <= 4:
+        return "Independence Day weekend"
+    if month == 10 and day >= 15:
+        return "Halloween season"
+    if month == 11:
+        first = current.replace(month=11, day=1)
+        thanksgiving_day = 1 + ((3 - first.weekday()) % 7) + 21
+        if thanksgiving_day - 10 <= day <= thanksgiving_day + 3:
+            return "Thanksgiving season"
+    if month == 12 and day <= 26:
+        return "winter holiday season"
+    return ""
+
+
+def _local_moment(now: Optional[datetime] = None) -> Dict[str, Any]:
+    current = now or datetime.now().astimezone()
+    if current.tzinfo is None:
+        current = current.astimezone()
+    hour = current.hour
+    if 5 <= hour < 12:
+        time_of_day = "morning"
+    elif 12 <= hour < 17:
+        time_of_day = "afternoon"
+    elif 17 <= hour < 22:
+        time_of_day = "evening"
+    else:
+        time_of_day = "late night"
+    if current.month in {12, 1, 2}:
+        season = "winter"
+    elif current.month in {3, 4, 5}:
+        season = "spring"
+    elif current.month in {6, 7, 8}:
+        season = "summer"
+    else:
+        season = "fall"
+    return {
+        "local_datetime": current.isoformat(timespec="minutes"),
+        "weekday": current.strftime("%A"),
+        "time_of_day": time_of_day,
+        "day_kind": "weekend" if current.weekday() >= 5 else "weekday",
+        "season": season,
+        "nearby_occasion": _nearby_occasion(current),
+    }
 
 
 def _decode_hash(raw: Any) -> Dict[str, str]:
@@ -847,14 +899,18 @@ def _generate_recommendations_impl(
             "launchable server catalog. Do not use or mention games, PC Link, Music Core, other modules, or "
             "the separate Main Menu Message. Base choices on the viewing context without overstating the "
             "household's preferences, avoid recently completed titles, and keep each reason to one friendly "
-            "sentence. Write summary as a natural two-sentence welcome describing the server picks without "
-            "reading every title. Return JSON only in this exact shape: "
+            "sentence. Let the supplied local moment gently influence the mood: weekday versus weekend, time "
+            "of day, season, or a nearby holiday can matter, but only choose a seasonal title when it actually "
+            "exists in the supplied catalog. Write summary as a polished Tater Link message for a TV home-screen "
+            "hero: one or two short friendly sentences under 38 words, naming at most one exact selected title. "
+            "Do not invent titles or announce that data was analyzed. Return JSON only in this exact shape: "
             '{"summary":"two short spoken sentences","items":'
             '[{"candidate_id":"exact id","reason":"one sentence"}]}. '
             f"Return up to {count} unique items."
         ),
         {
             "profile_id": _profile_id(cfg),
+            "local_moment": _local_moment(),
             "server_viewing_patterns": server_patterns,
             "recent_server_viewing": compact_server_events,
             "server_catalog_candidates": compact_candidates,
@@ -883,7 +939,7 @@ def _generate_recommendations_impl(
     if not selections:
         raise RuntimeError("The recommendation model did not select any valid catalog items.")
 
-    briefing = _text(result.get("summary"))[:500]
+    briefing = _text(result.get("summary"))[:320]
     if not briefing:
         briefing = (
             "I've looked through the Tater Tube Server library and put together a fresh mix. "
