@@ -224,6 +224,10 @@ class TaterTubeCoreAssistantNameTests(unittest.TestCase):
                 if "server_catalog_candidates" in payload:
                     body = {
                         "summary": "I made a fresh server-library mix.",
+                        "picks_briefing": (
+                            "You have been returning to easygoing movies, so I grouped "
+                            "together another relaxed set for your next watch."
+                        ),
                         "items": [
                             {"candidate_id": "movie-1", "reason": "A good next watch."}
                         ],
@@ -275,6 +279,11 @@ class TaterTubeCoreAssistantNameTests(unittest.TestCase):
 
         self.assertIn("Super Mario 64", result["boot_summary"])
         self.assertEqual(published_payload["boot_summary"], result["boot_summary"])
+        self.assertEqual(
+            published_payload["picks_briefing"], result["picks_briefing"]
+        )
+        self.assertIn("easygoing movies", result["picks_briefing"])
+        self.assertNotEqual(result["picks_briefing"], result["summary"])
         self.assertEqual(len(llm.payloads), 2)
         self.assertIn("local_moment", llm.payloads[0])
         self.assertIn("weekday", llm.payloads[0]["local_moment"])
@@ -285,6 +294,42 @@ class TaterTubeCoreAssistantNameTests(unittest.TestCase):
         self.assertIn("Server Movie", global_titles)
         saved_main_menu = json.loads(client.get(self.core.MAIN_MENU_MESSAGE_KEY))
         self.assertEqual(saved_main_menu["suggestion"]["kind"], "play")
+
+    def test_recommendation_generation_requires_a_distinct_picks_briefing(self):
+        client = FakeRedis()
+        client.hset(
+            self.core.SETTINGS_KEY,
+            mapping={"server_url": "http://tube.local", "token": "secret"},
+        )
+        client.set(self.core.CONTEXT_KEY, json.dumps({"events": []}))
+
+        def fake_api(method, path, **_kwargs):
+            if path.startswith("tater/core/candidates"):
+                return {
+                    "candidates": [
+                        {
+                            "id": "movie-1",
+                            "title": "A Movie",
+                            "media_type": "movie",
+                            "source": "local_media",
+                        }
+                    ]
+                }
+            raise AssertionError((method, path))
+
+        model_result = {
+            "summary": "A fresh mix is ready.",
+            "items": [{"candidate_id": "movie-1", "reason": "A good next watch."}],
+        }
+        loop = asyncio.new_event_loop()
+        try:
+            with patch.object(self.core, "_api_request", side_effect=fake_api), patch.object(
+                self.core, "_llm_json", return_value=model_result
+            ):
+                with self.assertRaisesRegex(RuntimeError, "group briefing"):
+                    self.core._generate_recommendations_impl(loop, object(), client)
+        finally:
+            loop.close()
 
     def test_core_ui_has_a_dedicated_main_menu_message_section(self):
         client = FakeRedis(

@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import threading
 import time
 from datetime import datetime
@@ -22,12 +23,12 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "1.4.1"
+__version__ = "1.4.2"
 MIN_TATER_VERSION = "59"
 CORE_DESCRIPTION = (
     "Connect Tater to Tater Tube Server, keep Tater's Picks focused on the server "
-    "catalog, create a separate global Main Menu Message from cross-module activity, "
-    "and voice both with the user's TTS settings."
+    "catalog, explain each pick and the group as a whole, create a separate global "
+    "Main Menu Message from cross-module activity, and voice both with the user's TTS settings."
 )
 TAGS = ["tater-tube", "media", "games", "music", "recommendations", "context", "tts"]
 
@@ -118,7 +119,7 @@ MUSIC_RECOMMENDATIONS_KEY = "music_core_recommendations_v1"
 DEFAULT_PROFILE_ID = "household"
 REQUEST_TIMEOUT_SECONDS = 25
 TTS_MAX_TEXT_CHARS = 800
-GENERATION_SCHEMA_VERSION = 3
+GENERATION_SCHEMA_VERSION = 4
 TATER_PICKS_ACTIVITY_SOURCES = {
     "local",
     "local_media",
@@ -655,28 +656,35 @@ def _compact_activity_events(
         source_counts[source] = source_counts.get(source, 0) + 1
         media_type_counts[media_type] = media_type_counts.get(media_type, 0) + 1
         action_counts[action] = action_counts.get(action, 0) + 1
-        compact.append(
-            {
-                "title": _text(event.get("title")),
-                "series_title": _text(event.get("series_title")),
-                "media_type": media_type,
-                "source": source,
-                "state": _text(event.get("state")),
-                "action": action,
-                "artist": _text(metadata.get("artist")),
-                "album": _text(metadata.get("album")),
-                "system": _text(metadata.get("system_name") or metadata.get("system_id")),
-                "progress": (
-                    round(
-                        100
-                        * _as_float(event.get("position_ms"))
-                        / max(1.0, _as_float(event.get("duration_ms"), 1.0))
-                    )
-                    if _as_float(event.get("duration_ms")) > 0
-                    else None
-                ),
-            }
-        )
+        row = {
+            "title": _text(event.get("title")),
+            "series_title": _text(event.get("series_title")),
+            "media_type": media_type,
+            "source": source,
+            "state": _text(event.get("state")),
+            "action": action,
+            "artist": _text(metadata.get("artist")),
+            "album": _text(metadata.get("album")),
+            "system": _text(metadata.get("system_name") or metadata.get("system_id")),
+            "progress": (
+                round(
+                    100
+                    * _as_float(event.get("position_ms"))
+                    / max(1.0, _as_float(event.get("duration_ms"), 1.0))
+                )
+                if _as_float(event.get("duration_ms")) > 0
+                else None
+            ),
+        }
+        watched_ms = metadata.get("watched_ms")
+        if type(watched_ms) in (int, float) and math.isfinite(watched_ms) and watched_ms >= 0:
+            # Modern players measure played time separately from the timeline.
+            # Older players omit this field; do not infer their watched duration.
+            row["watched_ms"] = int(watched_ms)
+            duration_ms = _as_float(event.get("duration_ms"))
+            if math.isfinite(duration_ms) and duration_ms > 0:
+                row["duration_ms"] = int(duration_ms)
+        compact.append(row)
     return compact, {
         "events_by_source": source_counts,
         "events_by_media_type": media_type_counts,
@@ -899,12 +907,22 @@ def _generate_recommendations_impl(
             "launchable server catalog. Do not use or mention games, PC Link, Music Core, other modules, or "
             "the separate Main Menu Message. Base choices on the viewing context without overstating the "
             "household's preferences, avoid recently completed titles, and keep each reason to one friendly "
-            "sentence. Let the supplied local moment gently influence the mood: weekday versus weekend, time "
+            "sentence. When watched_ms is supplied, it measures actual playback time in that viewing "
+            "session; duration_ms is the full title length and progress is only the timeline position. "
+            "A short watch, a seek near the end, or a late live-channel tune-in does not mean the whole "
+            "title was watched, even if its state is completed. Do not infer watched time when it is absent. "
+            "Let the supplied local moment gently influence the mood: weekday versus weekend, time "
             "of day, season, or a nearby holiday can matter, but only choose a seasonal title when it actually "
             "exists in the supplied catalog. Write summary as a polished Tater Link message for a TV home-screen "
             "hero: one or two short friendly sentences under 38 words, naming at most one exact selected title. "
-            "Do not invent titles or announce that data was analyzed. Return JSON only in this exact shape: "
-            '{"summary":"two short spoken sentences","items":'
+            "Also write picks_briefing as a distinct collection-level explanation to speak when Tater's Picks "
+            "opens. In two or three natural sentences under 75 words, explain why these recommendations work "
+            "together as a group, grounded in meaningful supplied viewing patterns and the local moment when "
+            "relevant. Do not merely announce that picks are ready, list every title, mention tracking or data "
+            "analysis, or add a greeting because the server adds one for speech. Do not invent titles or preferences. "
+            "Return JSON only in this exact shape: "
+            '{"summary":"short TV hero message","picks_briefing":"why this group was selected",'
+            '"items":'
             '[{"candidate_id":"exact id","reason":"one sentence"}]}. '
             f"Return up to {count} unique items."
         ),
@@ -945,6 +963,9 @@ def _generate_recommendations_impl(
             "I've looked through the Tater Tube Server library and put together a fresh mix. "
             "There should be something here for your next watch."
         )
+    picks_briefing = _text(result.get("picks_briefing"))[:650]
+    if not picks_briefing:
+        raise RuntimeError("The recommendation model did not provide a Tater Picks group briefing.")
     main_menu = _generate_main_menu_message(
         loop,
         llm_client,
@@ -962,6 +983,7 @@ def _generate_recommendations_impl(
             "profile_id": _profile_id(cfg),
             "assistant_name": assistant_name,
             "summary": briefing,
+            "picks_briefing": picks_briefing,
             "boot_summary": main_menu_message,
             "expires_in_hours": expires,
             "items": selections,
@@ -973,6 +995,7 @@ def _generate_recommendations_impl(
         "generated_at": now,
         "assistant_name": assistant_name,
         "summary": briefing,
+        "picks_briefing": picks_briefing,
         "boot_summary": main_menu_message,
         "main_menu_message": main_menu,
         "items": selections,
@@ -1042,7 +1065,7 @@ def get_core_system_tasks(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
             {
                 "id": "recommendation_refresh",
                 "label": "Picks & Main Menu Refresh",
-                "description": "Creates server-focused Tater's Picks plus a separate global Main Menu Message.",
+                "description": "Creates server-focused Tater's Picks, their spoken group briefing, and a separate global Main Menu Message.",
                 "interval_seconds": recommendation_interval,
                 "running": _TATER_TUBE_RECOMMEND_LOCK.locked(),
                 "started_at": _TATER_TUBE_RECOMMEND_STARTED_AT,
@@ -1298,7 +1321,8 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
             "group": "overview",
             "title": "Tater's Picks",
             "subtitle": f"{len(picks)} recommendations cached",
-            "detail": _text(recommendations.get("summary")) or "Generate recommendations from recent viewing and the server catalog.",
+            "detail": _text(recommendations.get("picks_briefing"))
+            or "No Tater Picks group briefing has been generated yet.",
             "run_action": "tater_tube_recommend_now",
             "run_label": "Make Fresh Picks",
         },
@@ -1532,7 +1556,7 @@ def handle_htmlui_tab_action(
             "ok": True,
             "message": (
                 f"Published {len(recommendations.get('items') or [])} fresh picks "
-                "and a new Main Menu Message."
+                "with a group briefing and a new Main Menu Message."
             ),
         }
 
