@@ -5,9 +5,12 @@ changes stay diffable, but rebuilt around a provider abstraction:
 
 - ``EmbyMusicProvider`` — a per-configuration Emby server (one server, one music
   view) speaking Emby's REST API directly.
-- ``NetworkShareMusicProvider`` — a locally mounted SMB/NFS share (added in a
-  later phase) served to playback targets through this core's own Range-capable
-  stream server.
+- ``NetworkShareMusicProvider`` — a locally mounted SMB/NFS share: the Tater host
+  (or container, via a bind mount) is expected to mount the share, and this core
+  scans it like a local folder. Tags are read with a stdlib parser (ID3v2,
+  FLAC/Vorbis, MP4, Ogg/Opus, WAV) so no extra image packages are required, and
+  files stream to playback targets through this core's own Range-capable stream
+  server.
 
 Per-person linkage (Emby user or share subfolder per Person) is layered on top
 of the provider abstraction in a later phase using core-owned Redis keys.
@@ -16,6 +19,7 @@ of the provider abstraction in a later phase using core-owned Redis keys.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import importlib.util
@@ -23,9 +27,12 @@ import io
 import json
 import logging
 import math
+import os
 import random
+import re
 import socket
 import struct
+import tempfile
 import threading
 import time
 import uuid
@@ -234,11 +241,42 @@ CONTINUATION_TRIGGER_REMAINING_TRACKS = 2
 CONTINUATION_BATCH_TRACKS = 12
 MAX_CONTINUATION_CANDIDATES = 200
 PROVIDER_LABELS = {"emby": "Emby", "network_share": "Network Share"}
-CATALOG_PROVIDER_IDS = {"emby"}
+CATALOG_PROVIDER_IDS = {"emby", "network_share"}
 EMBY_PAGE_SIZE = 500
 EMBY_ARTWORK_MAX_WIDTH = 1000
 STREAM_DEFAULT_PORT = 8621
 STREAM_CHUNK_SIZE = 128 * 1024
+SHARE_AUDIO_EXTENSIONS = {".mp3", ".flac", ".ogg", ".oga", ".opus", ".m4a", ".mp4", ".wav", ".wma"}
+# Case-insensitive folder-image names, checked in this order.
+SHARE_FOLDER_ARTWORK_NAMES = (
+    "cover.jpg",
+    "folder.jpg",
+    "cover.png",
+    "folder.png",
+    "album.jpg",
+    "album.png",
+    "albumart.jpg",
+    "front.jpg",
+    "front.png",
+)
+# Redis hash mapping artwork id -> {"path": ..., "version": ...} for share files.
+SHARE_ART_INDEX_KEY = "custom_music_core:share:art"
+SHARE_ART_CACHE_DIRNAME = "custom_music_artwork"
+SHARE_MIME_TYPES = {
+    ".mp3": "audio/mpeg",
+    ".flac": "audio/flac",
+    ".ogg": "audio/ogg",
+    ".oga": "audio/ogg",
+    ".opus": "audio/ogg",
+    ".m4a": "audio/mp4",
+    ".mp4": "audio/mp4",
+    ".wav": "audio/wav",
+    ".wma": "audio/x-ms-wma",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+}
 GENERIC_SEARCH_WORDS = {
     "a",
     "an",
@@ -1273,10 +1311,719 @@ class EmbyMusicProvider:
             "libraries": {view_id: view_name},
         }
 
+# --------------------------------------------------------------------------
+# Network Share tag reading (stdlib only — the Tater image has no mutagen).
+# --------------------------------------------------------------------------
+
+_ID3_V22_TEXT_FRAMES = {
+    "TT2": "title",
+    "TP1": "artist",
+    "TAL": "album",
+    "TP2": "album_artist",
+    "TCO": "genre",
+    "TRK": "track",
+    "TPA": "disc",
+    "TYE": "date",
+}
+_ID3_V3_TEXT_FRAMES = {
+    "TIT2": "title",
+    "TPE1": "artist",
+    "TALB": "album",
+    "TPE2": "album_artist",
+    "TCON": "genre",
+    "TRCK": "track",
+    "TPOS": "disc",
+    "TDRC": "date",
+    "TYER": "date",
+    "TDAT": "date",
+}
+
+
+def _share_id3_text(data: bytes) -> str:
+    """Decode one ID3v2 text frame body (first value only)."""
+    if not data:
+        return ""
+    encoding, body = data[0], data[1:]
+    try:
+        if encoding == 1:
+            text = body.decode("utf-16", "replace")
+        elif encoding == 2:
+            text = body.decode("utf-16-be", "replace")
+        elif encoding == 3:
+            text = body.decode("utf-8", "replace").lstrip("﻿")
+        else:
+            text = body.decode("latin-1", "replace")
+    except Exception:
+        return ""
+    return text.split("\x00")[0].strip()
+
+
+def _share_id3_syncsafe(raw: bytes) -> int:
+    return (
+        ((raw[0] & 0x7F) << 21)
+        | ((raw[1] & 0x7F) << 14)
+        | ((raw[2] & 0x7F) << 7)
+        | (raw[3] & 0x7F)
+    )
+
+
+def _share_image_kind(mime: str, data: bytes) -> str:
+    mime = mime.casefold()
+    if "png" in mime or data.startswith(b"\x89PNG"):
+        return "png"
+    return "jpg"
+
+
+def _share_read_id3(path: str) -> Dict[str, Any]:
+    tags: Dict[str, Any] = {}
+    try:
+        with open(path, "rb") as handle:
+            header = handle.read(10)
+            if len(header) < 10 or not header.startswith(b"ID3"):
+                return tags
+            major = header[3]
+            flags = header[5]
+            blob = handle.read(_share_id3_syncsafe(header[6:10]))
+    except OSError:
+        return tags
+    if not blob or major not in (2, 3, 4):
+        return tags
+    if flags & 0x80 and major < 4:  # whole-tag unsynchronisation
+        blob = blob.replace(b"\xff\x00", b"\xff")
+    pos = 0
+    if flags & 0x40 and len(blob) >= 4:  # extended header
+        if major == 4:
+            pos += max(4, _share_id3_syncsafe(blob[0:4]))
+        else:
+            pos += struct.unpack(">I", blob[0:4])[0] + 4
+    id_len = 3 if major == 2 else 4
+    size_len = 3 if major == 2 else 4
+    flags_len = 0 if major == 2 else 2
+    head_len = id_len + size_len + flags_len
+    picture: Dict[str, Any] = {}
+    while pos + head_len <= len(blob):
+        frame_id = blob[pos : pos + id_len].decode("latin-1", "replace")
+        raw_size = blob[pos + id_len : pos + id_len + size_len]
+        frame_flags = blob[pos + id_len + size_len : pos + head_len]
+        if major == 2:
+            size = int.from_bytes(raw_size, "big")
+        elif major == 4:
+            size = _share_id3_syncsafe(raw_size)
+        else:
+            size = struct.unpack(">I", raw_size)[0]
+        pos += head_len
+        if not frame_id.isalnum() or size <= 0 or pos + size > len(blob):
+            break  # padding or corrupt tail
+        data = blob[pos : pos + size]
+        pos += size
+        if major == 4 and len(frame_flags) == 2:
+            if frame_flags[1] & 0x02:  # per-frame unsynchronisation
+                data = data.replace(b"\xff\x00", b"\xff")
+            if frame_flags[1] & 0x01 and len(data) >= 4:  # data length indicator
+                data = data[4:]
+        field = (_ID3_V22_TEXT_FRAMES if major == 2 else _ID3_V3_TEXT_FRAMES).get(frame_id)
+        if field and field != "date":
+            value = _share_id3_text(data)
+            if value and not tags.get(field):
+                tags[field] = value
+        elif field == "date":
+            value = _share_id3_text(data)
+            if value and not tags.get("year"):
+                tags["year"] = value[:4]
+        elif (major == 2 and frame_id == "PIC") or frame_id == "APIC":
+            parsed = _share_id3_apic(data, legacy=major == 2)
+            if parsed and not picture:
+                picture = parsed
+    if picture and not tags.get("picture"):
+        tags["picture"] = picture
+    return tags
+
+
+def _share_id3_apic(data: bytes, *, legacy: bool = False) -> Dict[str, Any]:
+    """Parse one APIC/PIC frame into {"mime", "data"}."""
+    if not data:
+        return {}
+    encoding = data[0]
+    pos = 1
+    if legacy:
+        mime = data[pos : pos + 3].decode("latin-1", "replace").strip().casefold()
+        pos += 3
+    else:
+        end = data.find(b"\x00", pos)
+        if end < 0:
+            return {}
+        mime = data[pos:end].decode("latin-1", "replace").casefold()
+        pos = end + 1
+    pos += 1  # picture type byte
+    # Description terminates with the text encoding's terminator.
+    if encoding in (1, 2):
+        terminator = b"\x00\x00"
+    else:
+        terminator = b"\x00"
+    end = data.find(terminator, pos)
+    if end < 0:
+        return {}
+    pos = end + len(terminator)
+    image = data[pos:]
+    if len(image) < 8:
+        return {}
+    return {"mime": _share_image_kind(mime, image), "data": image}
+
+
+def _share_parse_vorbis_comments(data: bytes) -> Dict[str, List[str]]:
+    pos = 0
+    if len(data) < 8:
+        return {}
+    vendor_len = struct.unpack("<I", data[pos : pos + 4])[0]
+    pos += 4 + vendor_len
+    if pos + 4 > len(data):
+        return {}
+    count = struct.unpack("<I", data[pos : pos + 4])[0]
+    pos += 4
+    comments: Dict[str, List[str]] = {}
+    for _ in range(min(count, 512)):
+        if pos + 4 > len(data):
+            break
+        length = struct.unpack("<I", data[pos : pos + 4])[0]
+        pos += 4
+        raw = data[pos : pos + length]
+        pos += length
+        if b"=" not in raw:
+            continue
+        key, value = raw.split(b"=", 1)
+        name = key.decode("ascii", "replace").strip().upper()
+        text = value.decode("utf-8", "replace").strip()
+        if name and text:
+            comments.setdefault(name, []).append(text)
+    return comments
+
+
+def _share_vorbis_tags(comments: Dict[str, List[str]]) -> Dict[str, Any]:
+    tags: Dict[str, Any] = {}
+    field_map = {
+        "TITLE": "title",
+        "ARTIST": "artist",
+        "ALBUM": "album",
+        "ALBUMARTIST": "album_artist",
+        "ALBUM ARTIST": "album_artist",
+        "GENRE": "genre",
+        "TRACKNUMBER": "track",
+        "DISCNUMBER": "disc",
+    }
+    for key, field in field_map.items():
+        values = [value for value in comments.get(key) or [] if value]
+        if not values:
+            continue
+        value = ", ".join(values) if field in ("artist", "genre") else values[0]
+        if not tags.get(field):
+            tags[field] = value
+    for key in ("DATE", "ORIGINALDATE", "YEAR"):
+        values = comments.get(key) or []
+        if values and not tags.get("year"):
+            tags["year"] = _text(values[0])[:4]
+            break
+    return tags
+
+
+def _share_read_flac(path: str) -> Dict[str, Any]:
+    tags: Dict[str, Any] = {}
+    try:
+        with open(path, "rb") as handle:
+            if handle.read(4) != b"fLaC":
+                return tags
+            while True:
+                head = handle.read(4)
+                if len(head) < 4:
+                    break
+                block_type = head[0] & 0x7F
+                length = int.from_bytes(head[1:4], "big")
+                if block_type not in (0, 4, 6):
+                    handle.seek(length, 1)
+                    if head[0] & 0x80:
+                        break
+                    continue
+                payload = handle.read(length)
+                if block_type == 0 and len(payload) >= 18:  # STREAMINFO
+                    sample_rate = int.from_bytes(payload[10:13], "big") >> 2
+                    total_samples = ((payload[13] & 0x0F) << 32) | int.from_bytes(
+                        payload[14:18], "big"
+                    )
+                    if sample_rate and total_samples:
+                        tags["duration"] = total_samples / sample_rate
+                elif block_type == 4:  # VORBIS_COMMENT
+                    tags.update(_share_vorbis_tags(_share_parse_vorbis_comments(payload)))
+                elif block_type == 6 and len(payload) > 32:  # PICTURE
+                    pos = 4
+                    mime_len = struct.unpack(">I", payload[pos : pos + 4])[0]
+                    pos += 4
+                    mime = payload[pos : pos + mime_len].decode("latin-1", "replace")
+                    pos += mime_len
+                    desc_len = struct.unpack(">I", payload[pos : pos + 4])[0]
+                    pos += 4 + desc_len + 16
+                    data_len = struct.unpack(">I", payload[pos : pos + 4])[0]
+                    pos += 4
+                    image = payload[pos : pos + data_len]
+                    if len(image) > 8 and not tags.get("picture"):
+                        tags["picture"] = {"mime": _share_image_kind(mime, image), "data": image}
+                if head[0] & 0x80:
+                    break
+    except OSError:
+        return {}
+    return tags
+
+
+def _share_ogg_comment_and_rate(handle: Any) -> tuple[Dict[str, List[str]], int, int]:
+    """Read (comments, sample_rate, pre_skip) from an Ogg/Opus stream's head."""
+    comments: Dict[str, List[str]] = {}
+    sample_rate = 0
+    pre_skip = 0
+    packets: List[bytes] = []
+    current = bytearray()
+    while True:
+        page_head = handle.read(27)
+        if len(page_head) < 27 or not page_head.startswith(b"OggS"):
+            break
+        seg_count = page_head[26]
+        seg_table = handle.read(seg_count)
+        if len(seg_table) < seg_count:
+            break
+        payload = handle.read(sum(seg_table))
+        pos = 0
+        for seg in seg_table:
+            current.extend(payload[pos : pos + seg])
+            pos += seg
+            if seg < 255:
+                packets.append(bytes(current))
+                current = bytearray()
+        if len(packets) >= 2:
+            break
+    for packet in packets:
+        if packet.startswith(b"\x01vorbis") and len(packet) >= 16:
+            sample_rate = struct.unpack("<I", packet[12:16])[0]
+        elif packet.startswith(b"OpusHead") and len(packet) >= 16:
+            pre_skip = struct.unpack("<H", packet[10:12])[0]
+            sample_rate = struct.unpack("<I", packet[12:16])[0]
+        elif packet.startswith(b"\x03vorbis"):
+            comments = _share_parse_vorbis_comments(packet[7:])
+        elif packet.startswith(b"OpusTags"):
+            comments = _share_parse_vorbis_comments(packet[8:])
+    return comments, sample_rate, pre_skip
+
+
+def _share_ogg_duration(path: str) -> float:
+    """Last-page granule position, read from the file tail."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as handle:
+            handle.seek(max(0, size - 65536))
+            tail = handle.read()
+    except OSError:
+        return 0.0
+    pos = tail.rfind(b"OggS")
+    if pos < 0 or len(tail) < pos + 14:
+        return 0.0
+    try:
+        granule = struct.unpack("<q", tail[pos + 6 : pos + 14])[0]
+    except struct.error:
+        return 0.0
+    return max(0.0, float(granule))
+
+
+def _share_read_ogg(path: str) -> Dict[str, Any]:
+    tags: Dict[str, Any] = {}
+    is_opus = path.casefold().endswith(".opus")
+    try:
+        with open(path, "rb") as handle:
+            # The page walker validates the OggS magic itself.
+            comments, sample_rate, pre_skip = _share_ogg_comment_and_rate(handle)
+    except OSError:
+        return {}
+    tags.update(_share_vorbis_tags(comments))
+    if is_opus:
+        if sample_rate:
+            # Opus always decodes at 48 kHz; the header rate is the original.
+            duration = (_share_ogg_duration(path) - pre_skip) / 48000.0
+        else:
+            duration = 0.0
+    else:
+        duration = _share_ogg_duration(path) / sample_rate if sample_rate else 0.0
+    if duration > 0:
+        tags["duration"] = duration
+    return tags
+
+
+def _share_read_mp4(path: str) -> Dict[str, Any]:
+    text_fields = {
+        "\xa9nam": "title",
+        "\xa9ART": "artist",
+        "\xa9alb": "album",
+        "aART": "album_artist",
+        "\xa9gen": "genre",
+        "gnre": "genre",
+        "\xa9day": "year",
+    }
+
+    def walk(handle: Any, start: int, end: int, path: List[bytes]) -> Optional[Dict[str, Any]]:
+        """Return {start, end} of the first atom whose container path matches."""
+        pos = start
+        while pos + 8 <= end:
+            handle.seek(pos)
+            header = handle.read(8)
+            if len(header) < 8:
+                return None
+            size = struct.unpack(">I", header[0:4])[0]
+            kind = header[4:8]
+            header_len = 8
+            if size == 1:
+                extended = handle.read(8)
+                if len(extended) < 8:
+                    return None
+                size = struct.unpack(">Q", extended)[0]
+                header_len = 16
+            elif size == 0:
+                size = end - pos
+            if size < header_len or pos + size > end:
+                return None
+            if kind == path[0]:
+                content = pos + header_len
+                if kind == b"meta":
+                    content += 4  # version/flags precede meta's child atoms
+                if len(path) == 1:
+                    return {"start": content, "end": pos + size}
+                return walk(handle, content, pos + size, path[1:])
+            pos += size
+        return None
+
+    def read(handle: Any, start: int, end: int) -> bytes:
+        handle.seek(start)
+        return handle.read(max(0, end - start))
+
+    tags: Dict[str, Any] = {}
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, 2)
+            file_end = handle.tell()
+            mvhd = walk(handle, 0, file_end, [b"moov", b"mvhd"])
+            if mvhd:
+                blob = read(handle, mvhd["start"], mvhd["end"])
+                if len(blob) >= 20 and blob[0] == 0:  # version 0
+                    timescale = struct.unpack(">I", blob[12:16])[0]
+                    duration = struct.unpack(">I", blob[16:20])[0]
+                elif len(blob) >= 28:  # version 1
+                    timescale = struct.unpack(">I", blob[20:24])[0]
+                    duration = struct.unpack(">Q", blob[24:32])[0]
+                else:
+                    timescale = duration = 0
+                if timescale and duration:
+                    tags["duration"] = duration / timescale
+            ilst = walk(handle, 0, file_end, [b"moov", b"udta", b"meta", b"ilst"])
+            if ilst:
+                blob = read(handle, ilst["start"], ilst["end"])
+                pos = 0
+                picture: Dict[str, Any] = {}
+                while pos + 8 <= len(blob):
+                    size = struct.unpack(">I", blob[pos : pos + 4])[0]
+                    key = blob[pos + 4 : pos + 8].decode("latin-1", "replace")
+                    if size < 8 or pos + size > len(blob):
+                        break
+                    item = blob[pos + 8 : pos + size]
+                    pos += size
+                    data_pos = 0
+                    while data_pos + 16 <= len(item):
+                        data_size = struct.unpack(">I", item[data_pos : data_pos + 4])[0]
+                        if item[data_pos + 4 : data_pos + 8] != b"data" or data_size < 16:
+                            break
+                        flags = struct.unpack(">I", item[data_pos + 8 : data_pos + 12])[0] & 0xFFFFFF
+                        payload = item[data_pos + 16 : data_pos + data_size]
+                        data_pos += data_size
+                        field = text_fields.get(key)
+                        if field and flags in (0, 1, 2, 3) and not tags.get(field):
+                            text = payload.decode("utf-8", "replace").strip()
+                            if text:
+                                tags[field] = text[:4] if field == "year" else text
+                        elif key == "trkn" and len(payload) >= 4:
+                            tags["track"] = str(struct.unpack(">H", payload[2:4])[0])
+                        elif key == "disk" and len(payload) >= 4:
+                            tags["disc"] = str(struct.unpack(">H", payload[2:4])[0])
+                        elif key == "covr" and flags in (13, 14) and not picture:
+                            picture = {
+                                "mime": "jpg" if flags == 13 else "png",
+                                "data": payload,
+                            }
+                if picture and not tags.get("picture"):
+                    tags["picture"] = picture
+    except OSError:
+        return {}
+    return tags
+
+
+def _share_read_wav(path: str) -> Dict[str, Any]:
+    try:
+        with open(path, "rb") as handle:
+            riff = handle.read(12)
+            if len(riff) < 12 or riff[0:4] != b"RIFF" or riff[8:12] != b"WAVE":
+                return {}
+            byte_rate = 0
+            data_size = 0
+            while True:
+                head = handle.read(8)
+                if len(head) < 8:
+                    break
+                chunk_id = head[0:4]
+                chunk_size = struct.unpack("<I", head[4:8])[0]
+                if chunk_id == b"fmt " and chunk_size >= 16:
+                    fmt = handle.read(min(chunk_size, 16))
+                    byte_rate = struct.unpack("<I", fmt[8:12])[0]
+                    handle.seek(chunk_size - len(fmt), 1)
+                elif chunk_id == b"data":
+                    data_size = chunk_size
+                    break
+                else:
+                    handle.seek(chunk_size + (chunk_size & 1), 1)
+    except OSError:
+        return {}
+    if byte_rate and data_size:
+        return {"duration": data_size / byte_rate}
+    return {}
+
+
+def _share_tags_from_path(path: str) -> Dict[str, Any]:
+    """Filename fallback: Artist/Album/NN - Title.ext or Artist - Title.ext."""
+    rel = Path(path)
+    stem = rel.stem
+    tags: Dict[str, Any] = {}
+    match = re.match(r"^\s*(\d{1,3})\s*[-.)]\s*(.+)$", stem)
+    if match:
+        tags["track"] = match.group(1)
+        stem = match.group(2)
+    parts = rel.parts
+    if len(parts) >= 3:
+        tags.setdefault("artist", parts[-3])
+        tags.setdefault("album", parts[-2])
+    elif len(parts) == 2:
+        tags.setdefault("album", parts[-2])
+    if " - " in stem and not tags.get("artist"):
+        artist, _, title = stem.partition(" - ")
+        tags["artist"] = artist.strip()
+        stem = title
+    tags.setdefault("title", stem.strip() or rel.name)
+    return tags
+
+
+def _share_read_tags(path: str) -> Dict[str, Any]:
+    suffix = Path(path).suffix.casefold()
+    if suffix == ".mp3":
+        tags = _share_read_id3(path)
+    elif suffix == ".flac":
+        tags = _share_read_flac(path)
+    elif suffix in (".ogg", ".oga", ".opus"):
+        tags = _share_read_ogg(path)
+    elif suffix in (".m4a", ".mp4"):
+        tags = _share_read_mp4(path)
+    elif suffix == ".wav":
+        tags = _share_read_wav(path)
+    else:
+        tags = {}
+    if "picture" in tags and not isinstance(tags.get("picture"), dict):
+        tags["picture"] = {}
+    fallback = _share_tags_from_path(path)
+    for key, value in fallback.items():
+        if not tags.get(key):
+            tags[key] = value
+    if not tags.get("album_artist") and tags.get("artist"):
+        tags["album_artist"] = tags["artist"]
+    return tags
+
+
+def _share_art_cache_dir() -> str:
+    return os.path.join(tempfile.gettempdir(), SHARE_ART_CACHE_DIRNAME)
+
+
+def _share_track_id(rel_path: str) -> str:
+    return "track:" + hashlib.sha256(rel_path.encode("utf-8")).hexdigest()[:24]
+
+
+def _share_stream_id(rel_path: str) -> str:
+    """URL-safe, path-free id for one share file (token-gated at the proxy)."""
+    return base64.urlsafe_b64encode(rel_path.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _share_relpath_from_id(stream_id: str) -> Optional[str]:
+    padding = "=" * (-len(stream_id) % 4)
+    try:
+        return base64.urlsafe_b64decode(stream_id + padding).decode("utf-8")
+    except Exception:
+        return None
+
+
+def _share_contained_path(root: str, rel_path: str) -> Optional[str]:
+    """Resolve one share-relative path, refusing anything that escapes the root."""
+    if not rel_path or rel_path.startswith("/") or ".." in Path(rel_path).parts:
+        return None
+    resolved = os.path.realpath(os.path.join(root, rel_path))
+    root = os.path.realpath(root)
+    if resolved != root and not resolved.startswith(root + os.sep):
+        return None
+    return resolved
+
+
+def _share_store_art(
+    art_index: Dict[str, Dict[str, Any]],
+    source_path: str,
+    version: str,
+    image: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Register one artwork source; embedded images are extracted to a cache file."""
+    art_id = hashlib.sha1(source_path.encode("utf-8")).hexdigest()[:20]
+    if image and isinstance(image.get("data"), bytes) and image["data"]:
+        cache_path = os.path.join(
+            _share_art_cache_dir(), f"{art_id}.{_text(image.get('mime')) or 'jpg'}"
+        )
+        if not os.path.isfile(cache_path):
+            try:
+                os.makedirs(_share_art_cache_dir(), exist_ok=True)
+                with open(cache_path, "wb") as handle:
+                    handle.write(image["data"])
+            except OSError:
+                return ""
+        art_index[art_id] = {"path": cache_path, "version": version}
+    elif os.path.isfile(source_path):
+        art_index[art_id] = {"path": source_path, "version": version}
+    else:
+        return ""
+    return art_id
+
+
+@dataclass
+class NetworkShareMusicProvider:
+    """A mounted SMB/CIFS or NFS share treated as a local music folder.
+
+    The Tater host (or container, via a compose bind mount) owns the mount; this
+    provider never mounts anything itself. Files stream through the core's own
+    Range-capable stream server so share paths and credentials never reach
+    playback targets.
+    """
+
+    root_path: str
+    provider_id: str = "network_share"
+
+    @classmethod
+    def from_settings(cls, cfg: Dict[str, str]) -> "NetworkShareMusicProvider":
+        return cls(root_path=_text(cfg.get("share_root_path")))
+
+    @property
+    def connected(self) -> bool:
+        root = _text(self.root_path)
+        if not root:
+            return False
+        try:
+            return os.path.isdir(root) and os.access(root, os.R_OK)
+        except OSError:
+            return False
+
+    def stream_url(self, track: Dict[str, Any], *, audio_sync: bool = False) -> str:
+        del audio_sync  # No stdlib transcode path; satellites handle the container.
+        stream_id = _text(track.get("provider_track_id")) or _share_stream_id(
+            _text(track.get("path"))
+        )
+        if not stream_id:
+            return _text(track.get("stream_url"))
+        return _stream_proxy_url("share", stream_id)
+
+    def artwork_url(self, track: Dict[str, Any]) -> str:
+        art_id = _text(track.get("artwork_item_id"))
+        if not art_id or art_id == _text(track.get("id")):
+            return ""
+        return _stream_proxy_url("share_art", art_id)
+
+    def catalog(self) -> Dict[str, Any]:
+        root = _text(self.root_path)
+        if not self.connected:
+            raise ValueError(
+                "Mount the network share on the Tater host and set its folder path before syncing."
+            )
+        catalog_id = "share:" + hashlib.sha1(root.encode("utf-8")).hexdigest()[:16]
+        tracks: List[Dict[str, Any]] = []
+        art_index: Dict[str, Dict[str, Any]] = {}
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(name for name in dirnames if not name.startswith("."))
+            album_art: Optional[Dict[str, Any]] = None
+            folder_art_id = ""
+            for name in sorted(filenames):
+                if name.casefold() in SHARE_FOLDER_ARTWORK_NAMES:
+                    source = os.path.join(dirpath, name)
+                    folder_art_id = _share_store_art(
+                        art_index, source, str(int(os.path.getmtime(source)))
+                    )
+                    break
+            for name in sorted(filenames):
+                if Path(name).suffix.casefold() not in SHARE_AUDIO_EXTENSIONS:
+                    continue
+                if len(tracks) >= MAX_CATALOG_TRACKS:
+                    break
+                full_path = os.path.join(dirpath, name)
+                rel_path = os.path.relpath(full_path, root)
+                try:
+                    stat = os.stat(full_path)
+                    tags = _share_read_tags(full_path)
+                except OSError:
+                    continue
+                artwork: Dict[str, Any] = {}
+                embedded = tags.pop("picture", None)
+                version = str(int(stat.st_mtime))
+                if folder_art_id:
+                    artwork = {"id": folder_art_id, "version": version}
+                elif isinstance(embedded, dict) and embedded.get("data"):
+                    art_id = _share_store_art(
+                        art_index, full_path, version, image=embedded
+                    )
+                    if art_id:
+                        artwork = {"id": art_id, "version": version}
+                genres = _genres(tags.get("genre"))
+                tracks.append(
+                    {
+                        "id": _share_track_id(rel_path),
+                        "provider_track_id": _share_stream_id(rel_path),
+                        "title": _text(tags.get("title")) or Path(name).stem,
+                        "artist": _text(tags.get("artist")),
+                        "album_artist": _text(tags.get("album_artist")),
+                        "album": _text(tags.get("album")),
+                        "genres": genres,
+                        "genre": ", ".join(genres),
+                        "year": _text(tags.get("year"))[:4],
+                        "track_number": _as_int(tags.get("track"), 0, 0, 10000),
+                        "disc_number": _as_int(tags.get("disc"), 0, 0, 1000),
+                        "duration_seconds": max(
+                            0.0, _as_float(tags.get("duration"))
+                        ),
+                        "path": rel_path,
+                        "container": Path(name).suffix.lstrip(".").lower(),
+                        "size_bytes": stat.st_size,
+                        "modified_unix": int(stat.st_mtime),
+                        "artwork_item_id": artwork.get("id", ""),
+                        "artwork_version": artwork.get("version", ""),
+                        "provider": self.provider_id,
+                    }
+                )
+            if len(tracks) >= MAX_CATALOG_TRACKS:
+                break
+        store = globals().get("redis_client")
+        if store is not None:
+            _save_json(store, SHARE_ART_INDEX_KEY, art_index)
+        return {
+            "catalog_id": catalog_id,
+            "tracks": tracks,
+            "total": len(tracks),
+            "libraries": {catalog_id: "Network Share"},
+        }
+
+
 def _provider(client: Any = None, provider_id: Any = "") -> Any:
     selected = _provider_id(provider_id)
     if selected == "emby":
         return EmbyMusicProvider.from_settings(_settings(client))
+    if selected == "network_share":
+        return NetworkShareMusicProvider.from_settings(_settings(client))
     raise ValueError(
         f"{PROVIDER_LABELS.get(selected, selected)} support is not enabled in this build."
     )
@@ -5933,14 +6680,31 @@ def _provider_connection_detail(
     cfg: Dict[str, Any],
     provider_id: str,
 ) -> str:
-    del provider_id
+    if _provider_id(provider_id) == "network_share":
+        return _text(cfg.get("share_root_path")) or (
+            "Mount the SMB/NFS share on the Tater host, then point this core at the mounted folder."
+        )
     return _text(
         cfg.get("emby_server_url") or cfg.get("server_url")
     ) or "Point this core at your Emby server to begin."
 
 
 def _provider_fields(cfg: Dict[str, Any], provider_id: str) -> List[Dict[str, Any]]:
-    del provider_id
+    if _provider_id(provider_id) == "network_share":
+        return [
+            {
+                "key": "share_root_path",
+                "label": "Mounted Share Folder",
+                "type": "text",
+                "required": True,
+                "value": _text(cfg.get("share_root_path")),
+                "placeholder": "/mnt/music",
+                "description": (
+                    "Folder path of the SMB/CIFS or NFS share as mounted on the Tater host "
+                    "(for Docker, add the share as a bind-mount volume and use its container path)."
+                ),
+            },
+        ]
     auth_mode = _text(cfg.get("emby_auth_mode")).casefold() or "user_token"
     return [
         {
@@ -6009,55 +6773,62 @@ def _provider_cards(
     catalog: Dict[str, Any],
     active_provider: str,
 ) -> List[Dict[str, Any]]:
-    del active_provider
-    provider_id = "emby"
-    label = PROVIDER_LABELS[provider_id]
-    connected = _paired(cfg)
-    actions: List[Dict[str, Any]] = [
-        {
-            "action": "music_provider_connect",
-            "label": "Connect / Test",
-            "working_text": f"Connecting to {label}...",
-            "success_text": f"{label} connected.",
-        }
-    ]
-    if connected:
-        actions.extend(
-            [
-                {
-                    "action": "music_provider_activate",
-                    "label": "Rescan Library",
-                    "working_text": f"Loading the {label} library...",
-                    "success_text": f"{label} library loaded.",
-                },
-                {
-                    "action": "music_provider_disconnect",
-                    "label": "Disconnect",
-                    "tone": "danger",
-                    "confirm": f"Disconnect Custom Music Core from {label}?",
-                },
-            ]
+    catalog_provider = _provider_id(catalog.get("provider"))
+    cards: List[Dict[str, Any]] = []
+    for provider_id in ("emby", "network_share"):
+        label = PROVIDER_LABELS[provider_id]
+        connected = _paired(cfg, provider_id)
+        actions: List[Dict[str, Any]] = [
+            {
+                "action": "music_provider_connect",
+                "label": "Connect / Test",
+                "working_text": f"Connecting to {label}...",
+                "success_text": f"{label} connected.",
+            }
+        ]
+        if connected:
+            actions.extend(
+                [
+                    {
+                        "action": "music_provider_activate",
+                        "label": "Rescan Library",
+                        "working_text": f"Loading the {label} library...",
+                        "success_text": f"{label} library loaded.",
+                    },
+                    {
+                        "action": "music_provider_disconnect",
+                        "label": "Disconnect",
+                        "tone": "danger",
+                        "confirm": f"Disconnect Custom Music Core from {label}?",
+                    },
+                ]
+            )
+        cards.append(
+            {
+                "id": f"provider:{provider_id}",
+                "group": "providers",
+                "title": label,
+                "subtitle": "Connected music source" if connected else "Not connected",
+                "detail": _provider_connection_detail(cfg, provider_id),
+                "hero_badges": [
+                    {
+                        "label": "CONNECTED" if connected else "SETUP NEEDED",
+                        "tone": "good" if connected else "warn",
+                    },
+                    {
+                        "label": f"{len(catalog.get('tracks') or [])} TRACKS",
+                        "tone": "muted",
+                    }
+                    if catalog_provider == provider_id
+                    else {"label": "NOT LOADED", "tone": "muted"},
+                ],
+                "fields": _provider_fields(cfg, provider_id),
+                "fields_popup": False,
+                "fields_dropdown": True,
+                "actions": actions,
+            }
         )
-    return [
-        {
-            "id": "provider:emby",
-            "group": "providers",
-            "title": label,
-            "subtitle": "Connected music source" if connected else "Not connected",
-            "detail": _provider_connection_detail(cfg, provider_id),
-            "hero_badges": [
-                {
-                    "label": "CONNECTED" if connected else "SETUP NEEDED",
-                    "tone": "good" if connected else "warn",
-                },
-                {"label": f"{len(catalog.get('tracks') or [])} TRACKS", "tone": "muted"},
-            ],
-            "fields": _provider_fields(cfg, provider_id),
-            "fields_popup": False,
-            "fields_dropdown": True,
-            "actions": actions,
-        }
-    ]
+    return cards
 
 
 def _recommendation_ui_items(
@@ -6556,7 +7327,7 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
             },
         ],
         "items": [],
-        "empty_message": "Connect your Emby server to load your music library.",
+        "empty_message": "Connect a music source (Emby or a mounted network share) to load your library.",
         "ui": {
             "kind": "settings_manager",
             "title": "Custom Music Core",
@@ -6641,12 +7412,13 @@ def _payload_values(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _provider_from_card(payload: Dict[str, Any], fallback: Any = "") -> str:
     item_id = _text(payload.get("id"))
-    if item_id and item_id != "provider:emby":
+    candidate = _provider_id(
+        _text(payload.get("provider") or fallback) or item_id.replace("provider:", ""),
+        "",
+    )
+    if candidate not in PROVIDER_LABELS:
         raise ValueError("Unknown music source.")
-    candidate = _provider_id(_text(payload.get("provider") or fallback))
-    if candidate != "emby":
-        raise ValueError("Only the Emby source can be connected in this build.")
-    return "emby"
+    return candidate
 
 
 def _connect_provider(
@@ -6654,9 +7426,28 @@ def _connect_provider(
     values: Dict[str, Any],
     client: Any,
 ) -> Dict[str, Any]:
-    if provider_id != "emby":
-        raise ValueError("Only the Emby source can be connected in this build.")
     cfg = _settings(client)
+    if provider_id == "network_share":
+        root_path = _text(values.get("share_root_path")) or _text(cfg.get("share_root_path"))
+        provider = NetworkShareMusicProvider(root_path=root_path)
+        if not root_path:
+            raise ValueError("Enter the mounted network-share folder path first.")
+        if not provider.connected:
+            raise ValueError(
+                "That folder path is not readable from Tater. Mount the SMB/NFS share on the host "
+                "(or bind-mount it into the container) and try again."
+            )
+        _save_hash(client, SETTINGS_KEY, {"share_root_path": root_path, "provider": provider_id})
+        catalog = _sync_catalog(client, provider_id)
+        return {
+            "ok": True,
+            "message": (
+                f"{PROVIDER_LABELS[provider_id]} connected and loaded "
+                f"{len(catalog.get('tracks') or [])} tracks."
+            ),
+        }
+    if provider_id != "emby":
+        raise ValueError(f"{PROVIDER_LABELS.get(provider_id, provider_id)} support is not enabled in this build.")
     auth_mode = (
         "api_key"
         if _text(values.get("emby_auth_mode")).casefold() == "api_key"
@@ -6706,6 +7497,7 @@ def _connect_provider(
             "emby_user_id": resolved_user_id,
             "emby_library_name": library_name,
             "server_url": server_url,
+            "provider": provider_id,
         },
     )
     catalog = _sync_catalog(client, provider_id)
@@ -6719,25 +7511,35 @@ def _connect_provider(
 
 
 def _disconnect_provider(provider_id: str, client: Any) -> Dict[str, Any]:
-    if provider_id != "emby":
-        raise ValueError("Only the Emby source can be disconnected in this build.")
-    fields = (
-        "emby_server_url",
-        "emby_auth_mode",
-        "emby_username",
-        "emby_password",
-        "emby_api_key",
-        "emby_user_id",
-        "emby_library_name",
-        "server_url",
-    )
+    if provider_id == "network_share":
+        fields = ("share_root_path",)
+    elif provider_id == "emby":
+        fields = (
+            "emby_server_url",
+            "emby_auth_mode",
+            "emby_username",
+            "emby_password",
+            "emby_api_key",
+            "emby_user_id",
+            "emby_library_name",
+            "server_url",
+        )
+    else:
+        raise ValueError(f"{PROVIDER_LABELS.get(provider_id, provider_id)} support is not enabled in this build.")
     player = _player(client)
     if _provider_id(player.get("provider")) == provider_id:
         _stop_player(client=client)
     if client is not None:
-        client.hdel(SETTINGS_KEY, *fields)
+        client.hdel(SETTINGS_KEY, *fields, "provider")
         try:
-            client.delete(EMBY_AUTH_CACHE_KEY)
+            if provider_id == "emby":
+                client.delete(EMBY_AUTH_CACHE_KEY)
+            else:
+                client.delete(SHARE_ART_INDEX_KEY)
+                try:
+                    os.rmdir(_share_art_cache_dir())
+                except OSError:
+                    pass
         except Exception:
             pass
         cached = _load_json(client, CATALOG_KEY, {})
@@ -7051,7 +7853,7 @@ def handle_htmlui_tab_action(
     if action_name == "music_ui_save_player":
         player = _player(store)
         current_settings = _settings(store)
-        selected_provider = "emby"
+        selected_provider = _provider_id(current_settings.get("provider"))
         old_targets = _list(player.get("targets") or player.get("target"))
         old_player_settings = _selected_player_settings(
             old_targets,
@@ -7696,8 +8498,81 @@ def _emby_upstream_request(
     return f"{provider.server_url}/{path}?{urlencode(params)}", headers
 
 
+def _share_parse_range(value: str, size: int) -> Optional[tuple[int, int]]:
+    """Parse a Range header into an inclusive (start, end) byte pair."""
+    if not value or size <= 0:
+        return None
+    match = re.match(r"^bytes=(\d*)-(\d*)$", value.strip(), re.IGNORECASE)
+    if not match:
+        return None
+    start_raw, end_raw = match.group(1), match.group(2)
+    if not start_raw and not end_raw:
+        return None
+    if not start_raw:  # suffix range: last N bytes
+        suffix = int(end_raw)
+        if suffix <= 0:
+            return None
+        start = max(0, size - suffix)
+    else:
+        start = int(start_raw)
+    end = size - 1 if not end_raw else min(int(end_raw), size - 1)
+    if start >= size or start > end:
+        return None
+    return start, end
+
+
+def _share_send_file(
+    handler: "_MusicStreamHandler",
+    file_path: str,
+    *,
+    download_name: str = "",
+) -> None:
+    """Serve one local file with Range support (the Emby proxy path serves 206s too)."""
+    size = os.path.getsize(file_path)
+    if size <= 0:
+        handler._send_error(404, "File is empty.")
+        return
+    content_type = SHARE_MIME_TYPES.get(Path(file_path).suffix.casefold(), "application/octet-stream")
+    span = _share_parse_range(handler.headers.get("Range") or "", size)
+    if handler.headers.get("Range") and span is None:
+        handler.send_response(416)
+        handler.send_header("Content-Range", f"bytes */{size}")
+        handler.send_header("Content-Length", "0")
+        handler.end_headers()
+        return
+    status = 206 if span else 200
+    start, end = span if span else (0, size - 1)
+    try:
+        stat = os.stat(file_path)
+        handler.send_response(status)
+        handler.send_header("Content-Type", content_type)
+        handler.send_header("Content-Length", str(end - start + 1))
+        handler.send_header("Accept-Ranges", "bytes")
+        handler.send_header("Last-Modified", time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime(stat.st_mtime)))
+        handler.send_header("ETag", f'"share-{int(stat.st_mtime)}-{size}"')
+        if span:
+            handler.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        if download_name:
+            handler.send_header("Content-Disposition", f'attachment; filename="{download_name}"')
+        handler.end_headers()
+        if handler.command == "HEAD":
+            return
+        with open(file_path, "rb") as handle:
+            handle.seek(start)
+            remaining = end - start + 1
+            while remaining > 0:
+                chunk = handle.read(min(STREAM_CHUNK_SIZE, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                handler.wfile.write(chunk)
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+
+
 class _MusicStreamHandler(BaseHTTPRequestHandler):
-    """Range-capable proxy that keeps Emby per-user tokens out of stream URLs."""
+    """Range-capable local server that keeps Emby tokens out of stream URLs and
+    serves mounted-share files straight from disk."""
 
     server_version = "TaterCustomMusic/1.0"
     protocol_version = "HTTP/1.1"
@@ -7721,6 +8596,9 @@ class _MusicStreamHandler(BaseHTTPRequestHandler):
             token, kind, item_id = parts[1], parts[2], parts[3]
             if not hmac.compare_digest(token, _stream_token()):
                 self._send_error(403, "Invalid stream token.")
+                return
+            if kind in ("share", "share_art"):
+                self._serve_share(kind, item_id)
                 return
             sync = any(
                 key.casefold() == "sync" and _text(value) not in {"0", "false", "no"}
@@ -7793,6 +8671,32 @@ class _MusicStreamHandler(BaseHTTPRequestHandler):
             logger.warning("[Music] stream server request failed: %s", exc)
             try:
                 self._send_error(502, _text(exc) or "Stream request failed.")
+            except Exception:
+                pass
+
+    def _serve_share(self, kind: str, item_id: str) -> None:
+        """Serve a mounted-share file or cached artwork directly from disk."""
+        try:
+            root = _text(_settings().get("share_root_path"))
+            if kind == "share_art":
+                # Index entries are paths this core wrote itself, never client input.
+                entry = _load_json(globals().get("redis_client"), SHARE_ART_INDEX_KEY, {}).get(item_id)
+                art_path = _text(entry.get("path")) if isinstance(entry, dict) else ""
+                if not art_path or not os.path.isfile(art_path):
+                    self._send_error(404, "Artwork is not available.")
+                    return
+                _share_send_file(self, art_path)
+                return
+            rel_path = _share_relpath_from_id(item_id)
+            file_path = _share_contained_path(root, rel_path or "") if rel_path else None
+            if not file_path or not os.path.isfile(file_path):
+                self._send_error(404, "Share file is not available.")
+                return
+            _share_send_file(self, file_path, download_name=Path(file_path).name)
+        except Exception as exc:
+            logger.warning("[Music] share stream request failed: %s", exc)
+            try:
+                self._send_error(500, "Share stream request failed.")
             except Exception:
                 pass
 
