@@ -402,6 +402,7 @@ class CustomMusicCoreTests(unittest.TestCase):
                 "recommendation_refresh",
                 "music_profile_refresh",
                 "continuous_radio_refill",
+                "follow_me",
             ],
         )
 
@@ -1336,6 +1337,682 @@ class MultiQueueTests(unittest.TestCase):
         self.seed_playing_queue("person_c", ["voice_core:native:den"])
         core._release_targets_to(self.redis, ["voice_core:native:den"], except_queue_id="person_a")
         self.assertEqual(core._player(self.redis, "person_c")["status"], "stopped")
+
+
+class FollowMeTests(unittest.TestCase):
+    """Follow-Me presence: HA person tracking that moves music room to room."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.core = load_custom_music_core()
+
+    def setUp(self):
+        self.redis = FakeRedis()
+        self.core.redis_client = self.redis
+        self.core._shutdown_stream_server()
+        self.played = []
+        self.stopped = []
+        self.spoken = []
+        self.ha_states = {}
+        self.room_targets = {}
+        self._originals = {}
+
+    def tearDown(self):
+        for name, value in self._originals.items():
+            setattr(self.core, name, value)
+        self.core._shutdown_stream_server()
+
+    def stub_playback(self):
+        self._originals["_play_track"] = self.core._play_track
+
+        def fake_play_track(track, targets, *, volume_percent, start_position_seconds=0.0, **_kwargs):
+            self.played.append(
+                {
+                    "track_id": track.get("id"),
+                    "targets": list(targets),
+                    "start_position": float(start_position_seconds or 0.0),
+                    "volume": volume_percent,
+                }
+            )
+            return {"ok": True, "sent_count": len(targets), "voice_core_sessions": []}
+
+        self.core._play_track = fake_play_track
+        self._originals["_stop_target"] = self.core._stop_target
+
+        def fake_stop_target(targets, *, expected_voice_core_sessions=None):
+            self.stopped.append(list(targets))
+            return []
+
+        self.core._stop_target = fake_stop_target
+
+    def seed_playing_queue(self, person_id, targets, *, position=30.0, elapsed=10.0, duration=180.0):
+        player = {
+            "status": "playing",
+            "provider": "emby",
+            "queue": [_track_row(1, "Jamming", duration), _track_row(2, "Exodus", duration)],
+            "queue_original": [_track_row(1, "Jamming", duration), _track_row(2, "Exodus", duration)],
+            "index": 0,
+            "current": _track_row(1, "Jamming", duration),
+            "targets": targets,
+            "person_id": person_id,
+            "shuffle": False,
+            "repeat": "off",
+            "volume_percent": 60,
+            "mixed_sync_adjustment_ms": 0,
+            "created_at": time.time(),
+            "queue_session_id": f"session-{person_id or 'shared'}",
+            "continuous_radio": True,
+            "continuation_pending": False,
+            "radio_name": "Tater Continuous Radio",
+            "started_at": time.time() - elapsed if position else 0.0,
+            "position_offset_seconds": position,
+            "duration_seconds": duration,
+            "last_error": "",
+        }
+        self.core._save_player(player, self.redis, person_id)
+        return player
+
+    def stub_ha(self):
+        """Point HA polling, room resolution, and TTS prompts at fakes."""
+        core = self.core
+        self._originals["_ha_person_location"] = core._ha_person_location
+        core._ha_person_location = lambda client, entity: dict(
+            self.ha_states.get(entity, {"state": "not_home"})
+        )
+        self._originals["_room_name_to_targets"] = core._room_name_to_targets
+        core._room_name_to_targets = lambda name, client=None: self.room_targets.get(
+            str(name), ""
+        )
+        self._originals["_speak_follow_me_prompt"] = core._speak_follow_me_prompt
+
+        def fake_speak(targets, text):
+            self.spoken.append({"targets": list(targets), "text": text})
+            return True
+
+        core._speak_follow_me_prompt = fake_speak
+        # Tater's built-in HA integration settings (reused, never rewritten).
+        self.redis.hset(
+            core.HA_SETTINGS_KEY,
+            mapping={"HA_BASE_URL": "http://ha.local:8123", "HA_TOKEN": "secret"},
+        )
+
+    def enable_follow_me(self, delay="0"):
+        self.redis.hset(
+            self.core.SETTINGS_KEY,
+            mapping={"follow_me_enabled": "1", "follow_me_move_delay_seconds": delay},
+        )
+
+    def link_person(self, person_id, entity="person.john", **extra):
+        link = {"music_source": ""}
+        if entity:
+            link["follow_me_person_entity"] = entity
+        link.update(extra)
+        self.redis.hset(self.core.PERSON_LINKS_KEY, mapping={person_id: json.dumps(link)})
+
+    # ---- HA settings + REST polling ----
+
+    def test_ha_config_reuses_tater_settings(self):
+        core = self.core
+        self.redis.hset(
+            core.HA_SETTINGS_KEY,
+            mapping={"HA_BASE_URL": "http://ha.local:8123/", "HA_TOKEN": "secret"},
+        )
+        self.assertEqual(
+            core._ha_config(self.redis),
+            {"base": "http://ha.local:8123", "token": "secret"},
+        )
+        # Without Tater's HA integration configured: default base, no token.
+        self.assertEqual(
+            core._ha_config(FakeRedis()),
+            {"base": core.HA_DEFAULT_BASE_URL, "token": ""},
+        )
+
+    def test_ha_person_location_polls_and_maps_errors(self):
+        core = self.core
+        self.redis.hset(
+            core.HA_SETTINGS_KEY,
+            mapping={"HA_BASE_URL": "http://ha.local:8123", "HA_TOKEN": "secret"},
+        )
+
+        class Resp:
+            def __init__(self, status, payload):
+                self.status_code = status
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        seen = {}
+        self._originals["_ha_http_get"] = core._ha_http_get
+
+        def fake_get(url, headers, timeout):
+            seen["url"] = url
+            seen["headers"] = headers
+            seen["timeout"] = timeout
+            return Resp(200, {"state": "Office", "last_changed": 123.0})
+
+        core._ha_http_get = fake_get
+        try:
+            self.assertEqual(
+                core._ha_person_location(self.redis, "person.john"),
+                {"state": "Office", "last_changed": 123.0},
+            )
+            self.assertEqual(seen["url"], "http://ha.local:8123/api/states/person.john")
+            self.assertEqual(seen["headers"], {"Authorization": "Bearer secret"})
+            self.assertEqual(seen["timeout"], core.HA_STATE_TIMEOUT_SECONDS)
+            for status, code in (
+                (404, "entity_not_found"),
+                (401, "ha_unauthorized"),
+                (403, "ha_unauthorized"),
+                (500, "ha_http_500"),
+            ):
+                core._ha_http_get = lambda *a, **k: Resp(status, {})
+                self.assertEqual(core._ha_person_location(self.redis, "person.john"), {"error": code})
+
+            def boom(*_args, **_kwargs):
+                raise RuntimeError("connection refused")
+
+            core._ha_http_get = boom
+            self.assertEqual(
+                core._ha_person_location(self.redis, "person.john"),
+                {"error": "connection refused"},
+            )
+        finally:
+            core._ha_http_get = self._originals["_ha_http_get"]
+        # No HA token in Tater settings -> not configured, no request at all.
+        self.assertEqual(
+            core._ha_person_location(FakeRedis(), "person.john"),
+            {"error": "ha_not_configured"},
+        )
+
+    # ---- mode + zone resolution ----
+
+    def test_room_overrides_and_zone_resolution(self):
+        core = self.core
+        self.assertEqual(
+            core._parse_room_overrides("The Kitchen=Kitchen, Guest Room=Beds"),
+            {"thekitchen": "Kitchen", "guestroom": "Beds"},
+        )
+        self.assertEqual(core._parse_room_overrides("no-equals-pair"), {})
+        self.assertEqual(core._resolve_follow_me_zone("not_home", {}, self.redis), ("", ""))
+        self.assertEqual(core._resolve_follow_me_zone("Home", {}, self.redis), ("", ""))
+        self.assertEqual(core._resolve_follow_me_zone("", {"follow_me_room_overrides": "A=B"}, self.redis), ("", ""))
+        self._originals["_room_name_to_targets"] = core._room_name_to_targets
+        core._room_name_to_targets = lambda name, client=None: {
+            "Kitchen": "voice_core:native:kitchen",
+            "Beds": "voice_core:native:beds",
+        }.get(str(name), "")
+        try:
+            self.assertEqual(
+                core._resolve_follow_me_zone(
+                    "The Kitchen",
+                    {"follow_me_room_overrides": "The Kitchen=Kitchen"},
+                    self.redis,
+                ),
+                ("Kitchen", "voice_core:native:kitchen"),
+            )
+            # No override: the zone name itself is used as the Tater room name.
+            self.assertEqual(core._resolve_follow_me_zone("Kitchen", {}, self.redis), ("Kitchen", "voice_core:native:kitchen"))
+            # A zone with no matching Tater room resolves to nothing.
+            self.assertEqual(core._resolve_follow_me_zone("Patio", {}, self.redis), ("Patio", ""))
+        finally:
+            core._room_name_to_targets = self._originals["_room_name_to_targets"]
+
+    def test_takeover_and_away_mode_resolution(self):
+        core = self.core
+        self.assertEqual(core._follow_me_takeover_mode("person_a", self.redis), "auto")
+        self.assertEqual(core._follow_me_away_action("person_a", self.redis), "keep_pause")
+        self.redis.hset(
+            core.SETTINGS_KEY,
+            mapping={"follow_me_takeover_mode": "ask", "follow_me_away_action": "pause"},
+        )
+        self.assertEqual(core._follow_me_takeover_mode("person_a", self.redis), "ask")
+        self.assertEqual(core._follow_me_away_action("person_a", self.redis), "pause")
+        # Per-Person link overrides win over the global setting.
+        self.redis.hset(
+            core.PERSON_LINKS_KEY,
+            mapping={
+                "person_a": json.dumps(
+                    {
+                        "music_source": "",
+                        "follow_me_takeover_mode": "auto",
+                        "follow_me_away_action": "keep",
+                    }
+                )
+            },
+        )
+        self.assertEqual(core._follow_me_takeover_mode("person_a", self.redis), "auto")
+        self.assertEqual(core._follow_me_away_action("person_a", self.redis), "keep")
+        # An invalid value falls through to the default.
+        self.redis.hset(core.SETTINGS_KEY, mapping={"follow_me_takeover_mode": "yolo"})
+        self.assertEqual(core._follow_me_takeover_mode("person_b", self.redis), "auto")
+
+    # ---- the handoff primitive ----
+
+    def test_follow_me_move_hands_off_at_the_same_position(self):
+        core = self.core
+        self.stub_playback()
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"], position=30.0, elapsed=10.0)
+        result = core._follow_me_move("person_a", "Office", ["voice_core:native:office"], self.redis)
+        self.assertTrue(result["moved"], result)
+        self.assertEqual(result["targets"], ["voice_core:native:office"])
+        self.assertEqual(self.played[-1]["targets"], ["voice_core:native:office"])
+        self.assertAlmostEqual(self.played[-1]["start_position"], 40.0, delta=1.0)
+        self.assertEqual(core._player(self.redis, "person_a")["status"], "playing")
+        # Nobody playing -> no move; no resolvable targets -> no move.
+        self.assertEqual(
+            core._follow_me_move("person_b", "Office", ["voice_core:native:office"], self.redis),
+            {"moved": False, "reason": "no_playback"},
+        )
+        self.assertEqual(
+            core._follow_me_move("person_a", "Office", [], self.redis),
+            {"moved": False, "reason": "no_targets"},
+        )
+
+    # ---- tick: follow between rooms ----
+
+    def test_follow_me_tick_moves_music_to_the_new_room(self):
+        core = self.core
+        self.stub_playback()
+        self.stub_ha()
+        self.enable_follow_me(delay="0")
+        self.link_person("person_a", "person.john")
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"], position=30.0, elapsed=10.0)
+        self.ha_states["person.john"] = {"state": "Office"}
+        self.room_targets["Office"] = "voice_core:native:office"
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["checked"], 1)
+        self.assertEqual(summary["moved"], 1)
+        self.assertEqual(core._player(self.redis, "person_a")["targets"], ["voice_core:native:office"])
+        self.assertAlmostEqual(self.played[-1]["start_position"], 40.0, delta=1.0)
+        state = core._follow_me_state("person_a", self.redis)
+        self.assertEqual(state["status"], "following")
+        self.assertEqual(state["zone"], "Office")
+        self.assertEqual(state["resolved_room"], "Office")
+        runtime = core._runtime(self.redis)
+        self.assertGreater(float(runtime.get("last_follow_me_at") or 0), 0)
+        self.assertEqual(int(runtime.get("follow_me_run_count") or 0), 1)
+        self.assertEqual(runtime.get("follow_me_last_error"), "")
+
+    def test_follow_me_tick_waits_for_the_move_delay(self):
+        core = self.core
+        self.stub_playback()
+        self.stub_ha()
+        self.enable_follow_me(delay="30")
+        self.link_person("person_a", "person.john")
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"])
+        self.ha_states["person.john"] = {"state": "Office"}
+        self.room_targets["Office"] = "voice_core:native:office"
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["moved"], 0)
+        self.assertEqual(core._follow_me_state("person_a", self.redis)["status"], "tracking")
+        self.assertEqual(self.played, [])
+        # The zone holds past the delay: the next pass moves.
+        state = core._follow_me_state("person_a", self.redis)
+        state["zone_since"] = time.time() - 31
+        core._save_follow_me_state("person_a", state, self.redis)
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["moved"], 1)
+        self.assertEqual(core._player(self.redis, "person_a")["targets"], ["voice_core:native:office"])
+
+    # ---- tick: away + dead zones ----
+
+    def test_follow_me_tick_pauses_away_and_resumes_on_return(self):
+        core = self.core
+        self.stub_playback()
+        self.stub_ha()
+        self.enable_follow_me(delay="0")
+        self.link_person("person_a", "person.john")
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"], position=30.0, elapsed=10.0)
+        # Default keep_pause action: leaving the home pauses, position kept.
+        self.ha_states["person.john"] = {"state": "not_home"}
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["paused"], 1)
+        self.assertEqual(core._player(self.redis, "person_a")["status"], "paused")
+        state = core._follow_me_state("person_a", self.redis)
+        self.assertTrue(state.get("paused_by_follow_me"))
+        self.assertEqual(state["status"], "paused_away")
+        # A second away pass does not re-pause.
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["paused"], 0)
+        self.assertEqual(core._follow_me_state("person_a", self.redis)["status"], "away_idle")
+        # Walked back into a speaker room: hand off and resume in place.
+        self.ha_states["person.john"] = {"state": "Office"}
+        self.room_targets["Office"] = "voice_core:native:office"
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["moved"], 1)
+        player = core._player(self.redis, "person_a")
+        self.assertEqual(player["status"], "playing")
+        self.assertEqual(player["targets"], ["voice_core:native:office"])
+        self.assertAlmostEqual(self.played[-1]["start_position"], 40.0, delta=1.0)
+        state = core._follow_me_state("person_a", self.redis)
+        self.assertNotIn("paused_by_follow_me", state)
+        self.assertEqual(state["status"], "following")
+
+    def test_follow_me_tick_away_keep_action_never_pauses(self):
+        core = self.core
+        self.stub_playback()
+        self.stub_ha()
+        self.enable_follow_me(delay="0")
+        self.redis.hset(core.SETTINGS_KEY, mapping={"follow_me_away_action": "keep"})
+        self.link_person("person_a", "person.john")
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"])
+        self.ha_states["person.john"] = {"state": "not_home"}
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["paused"], 0)
+        self.assertEqual(core._player(self.redis, "person_a")["status"], "playing")
+        self.assertEqual(core._follow_me_state("person_a", self.redis)["status"], "away_kept")
+
+    def test_follow_me_tick_dead_zone(self):
+        core = self.core
+        self.stub_playback()
+        self.stub_ha()
+        self.enable_follow_me(delay="0")
+        self.link_person("person_a", "person.john")
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"])
+        # Patio exists in HA but maps to no Tater room.
+        self.ha_states["person.john"] = {"state": "Patio"}
+        # keep_pause (default): stays playing, just noted as a dead zone.
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["paused"], 0)
+        self.assertEqual(core._player(self.redis, "person_a")["status"], "playing")
+        self.assertEqual(core._follow_me_state("person_a", self.redis)["status"], "dead_zone")
+        # The pause action stops the music in dead zones.
+        self.redis.hset(core.SETTINGS_KEY, mapping={"follow_me_away_action": "pause"})
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["paused"], 1)
+        self.assertEqual(core._player(self.redis, "person_a")["status"], "paused")
+        self.assertEqual(core._follow_me_state("person_a", self.redis)["status"], "paused_dead_zone")
+
+    # ---- tick: taking over occupied rooms ----
+
+    def test_follow_me_tick_asks_before_taking_over(self):
+        core = self.core
+        self.stub_playback()
+        self.stub_ha()
+        self.enable_follow_me(delay="0")
+        self.redis.hset(core.SETTINGS_KEY, mapping={"follow_me_takeover_mode": "ask"})
+        self.link_person("person_a", "person.john")
+        self.link_person("person_b", entity="")  # linked, but no tracker
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"], position=30.0, elapsed=10.0)
+        self.seed_playing_queue("person_b", ["voice_core:native:office"])
+        self.ha_states["person.john"] = {"state": "Office"}
+        self.room_targets["Office"] = "voice_core:native:office"
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["awaiting"], 1)
+        self.assertEqual(summary["moved"], 0)
+        pending = core._load_pending_confirmation(self.redis, "person_a")
+        self.assertEqual(pending["type"], "follow_takeover")
+        self.assertEqual(pending["targets"], ["voice_core:native:office"])
+        self.assertEqual(core._follow_me_state("person_a", self.redis)["status"], "awaiting_confirmation")
+        # Bob's stream is untouched; the question was voiced in the room.
+        self.assertEqual(core._player(self.redis, "person_b")["status"], "playing")
+        self.assertEqual(len(self.spoken), 1)
+        self.assertEqual(self.spoken[0]["targets"], ["voice_core:native:office"])
+        self.assertIn("yes", self.spoken[0]["text"])
+        # A repeated pass does not re-ask the same question.
+        core._follow_me_tick(self.redis)
+        self.assertEqual(len(self.spoken), 1)
+        # The Person's yes takes the room over and stops the other queue.
+        confirmed = asyncio.run(
+            core.run_hydra_kernel_tool(
+                tool_id="custom_music_confirm",
+                args={"choice": "yes"},
+                origin={"people_resolution": {"master_user_id": "person_a"}},
+                redis_client=self.redis,
+            )
+        )
+        self.assertTrue(confirmed.get("ok"), confirmed)
+        alice = core._player(self.redis, "person_a")
+        self.assertEqual(alice["targets"], ["voice_core:native:office"])
+        self.assertEqual(alice["status"], "playing")
+        self.assertEqual(core._player(self.redis, "person_b")["status"], "stopped")
+        self.assertEqual(core._load_pending_confirmation(self.redis, "person_a"), {})
+        # A declining yes/no clears the question without moving anything.
+        self.seed_playing_queue("person_b", ["voice_core:native:office"])
+        core._follow_me_tick(self.redis)
+        declined = asyncio.run(
+            core.run_hydra_kernel_tool(
+                tool_id="custom_music_confirm",
+                args={"choice": "no"},
+                origin={"people_resolution": {"master_user_id": "person_a"}},
+                redis_client=self.redis,
+            )
+        )
+        self.assertTrue(declined.get("ok"), declined)
+        self.assertEqual(core._player(self.redis, "person_a")["targets"], ["voice_core:native:office"])
+        self.assertEqual(core._player(self.redis, "person_b")["status"], "playing")
+
+    def test_follow_me_tick_auto_takes_over(self):
+        core = self.core
+        self.stub_playback()
+        self.stub_ha()
+        self.enable_follow_me(delay="0")  # default takeover mode is auto
+        self.link_person("person_a", "person.john")
+        self.link_person("person_b", entity="")
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"], position=30.0, elapsed=10.0)
+        self.seed_playing_queue("person_b", ["voice_core:native:office", "voice_core:native:den"], position=30.0)
+        self.ha_states["person.john"] = {"state": "Office"}
+        self.room_targets["Office"] = "voice_core:native:office"
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["moved"], 1)
+        self.assertEqual(core._player(self.redis, "person_a")["targets"], ["voice_core:native:office"])
+        # Bob lost the office but keeps the den, paused in place.
+        bob = core._player(self.redis, "person_b")
+        self.assertEqual(bob["status"], "paused")
+        self.assertEqual(bob["targets"], ["voice_core:native:den"])
+
+    # ---- tick: errors + skips ----
+
+    def test_follow_me_tick_records_errors_without_moving(self):
+        core = self.core
+        self.stub_playback()
+        self.stub_ha()
+        self.enable_follow_me(delay="0")
+        self.link_person("person_a", "person.john")
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"])
+        self.ha_states["person.john"] = {"error": "entity_not_found"}
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["checked"], 1)
+        self.assertEqual(summary["moved"], 0)
+        self.assertEqual(len(summary["errors"]), 1)
+        self.assertIn("entity_not_found", summary["errors"][0])
+        state = core._follow_me_state("person_a", self.redis)
+        self.assertEqual(state["status"], "error")
+        self.assertEqual(state["last_error"], "entity_not_found")
+        # Nothing moved; the last error is surfaced to the system-task UI.
+        self.assertEqual(self.played, [])
+        self.assertEqual(core._player(self.redis, "person_a")["targets"], ["voice_core:native:kitchen"])
+        self.assertEqual(core._runtime(self.redis).get("follow_me_last_error"), "")
+
+    def test_follow_me_tick_skips_when_disabled_or_unconfigured(self):
+        core = self.core
+        # Off by default.
+        self.assertEqual(core._follow_me_tick(self.redis).get("skipped"), "disabled")
+        # On, but Tater has no Home Assistant integration configured.
+        self.redis.hset(core.SETTINGS_KEY, mapping={"follow_me_enabled": "1"})
+        self.assertEqual(core._follow_me_tick(self.redis).get("skipped"), "ha_not_configured")
+        # Skipped passes never record a run.
+        self.assertIsNone(core._runtime(self.redis).get("last_follow_me_at"))
+
+    # ---- system task + manual run ----
+
+    def test_follow_me_system_task(self):
+        core = self.core
+        tasks = core.get_core_system_tasks(redis_client=self.redis)
+        self.assertEqual(
+            [task["id"] for task in tasks["tasks"]],
+            [
+                "catalog_sync",
+                "recommendation_refresh",
+                "music_profile_refresh",
+                "continuous_radio_refill",
+                "follow_me",
+            ],
+        )
+        follow_me_task = tasks["tasks"][-1]
+        # No HA token yet: unavailable and waiting.
+        self.assertFalse(follow_me_task["available"])
+        self.assertEqual(follow_me_task["status"], "waiting")
+        self.assertIn("Home Assistant", follow_me_task["unavailable_reason"])
+        # With Tater's HA integration configured and the feature enabled, the
+        # task is available and a manual run performs one presence pass.
+        self.redis.hset(
+            core.HA_SETTINGS_KEY,
+            mapping={"HA_BASE_URL": "http://ha.local:8123", "HA_TOKEN": "secret"},
+        )
+        self.redis.hset(core.SETTINGS_KEY, mapping={"follow_me_enabled": "1"})
+        follow_me_task = core.get_core_system_tasks(redis_client=self.redis)["tasks"][-1]
+        self.assertTrue(follow_me_task["available"])
+        self.assertEqual(follow_me_task["status"], "idle")
+        self.assertEqual(
+            core.run_core_system_task(task_id="follow_me", redis_client=self.redis),
+            {"ok": True, "checked": 0, "moved": 0, "paused": 0, "awaiting": 0, "errors": []},
+        )
+
+    # ---- hydra prompt note ----
+
+    def test_follow_me_pending_note_and_prompt_fragment(self):
+        core = self.core
+        origin = {"people_resolution": {"master_user_id": "person_a"}}
+        self.assertEqual(core._follow_me_pending_note("person_a", self.redis), "")
+        core._save_pending_confirmation(
+            self.redis,
+            "person_a",
+            {
+                "type": "follow_takeover",
+                "targets": ["voice_core:native:office"],
+                "queue_id": "person_a",
+                "zone": "Office",
+            },
+        )
+        note = core._follow_me_pending_note("person_a", self.redis)
+        self.assertIn("custom_music_confirm", note)
+        self.assertIn("'yes'", note)
+        fragments = core.get_hydra_system_prompt_fragments(
+            role="chat", redis_client=self.redis, origin=origin
+        )
+        self.assertTrue(any("custom_music_confirm" in m for m in fragments["chat"]))
+        # No pending question -> no note (and no fragment without a profile).
+        core._clear_pending_confirmation(self.redis, "person_a")
+        self.assertEqual(core._follow_me_pending_note("person_a", self.redis), "")
+        self.assertEqual(
+            core.get_hydra_system_prompt_fragments(role="chat", redis_client=self.redis, origin=origin),
+            {},
+        )
+
+    # ---- person card + link save ----
+
+    def test_person_card_shows_follow_me_fields_and_status(self):
+        core = self.core
+        people = types.SimpleNamespace(
+            load_store=lambda _client=None: {
+                "people": [
+                    {"id": "person_zoe", "display_name": "Zoe"},
+                    {"id": "person_ama", "display_name": "Ama"},
+                ]
+            }
+        )
+        original_people = core._PEOPLE_API_MODULE
+        core._PEOPLE_API_MODULE = people
+        try:
+            self.redis.hset(core.SETTINGS_KEY, mapping={"follow_me_enabled": "1"})
+            self.redis.hset(
+                core.PERSON_LINKS_KEY,
+                mapping={
+                    "person_zoe": json.dumps(
+                        {
+                            "music_source": "",
+                            "follow_me_person_entity": "person.zoe",
+                            "follow_me_room_overrides": "The Kitchen=Kitchen",
+                            "follow_me_takeover_mode": "ask",
+                            "follow_me_away_action": "pause",
+                        }
+                    )
+                },
+            )
+            core._save_follow_me_state(
+                "person_zoe",
+                {
+                    "status": "following",
+                    "zone": "Kitchen",
+                    "resolved_room": "Kitchen",
+                    "resolved_targets": ["voice_core:native:kitchen"],
+                },
+                self.redis,
+            )
+            cards = {item["id"]: item for item in core._person_link_items(core._settings(self.redis), self.redis)}
+            self.assertIn("person:person_zoe", cards)
+            self.assertIn("person:new", cards)
+            fields = {field["key"]: field for field in cards["person:person_zoe"]["fields"]}
+            self.assertEqual(fields["person_link_follow_me_entity"]["value"], "person.zoe")
+            self.assertEqual(fields["person_link_follow_me_room_overrides"]["value"], "The Kitchen=Kitchen")
+            self.assertEqual(fields["person_link_follow_me_takeover_mode"]["value"], "ask")
+            self.assertEqual(fields["person_link_follow_me_away_action"]["value"], "pause")
+            self.assertIn("Follow-me: in Kitchen → Kitchen", cards["person:person_zoe"]["subtitle"])
+            # The new-link card carries the same fields, defaulted from settings.
+            new_fields = {field["key"]: field for field in cards["person:new"]["fields"]}
+            self.assertEqual(new_fields["person_link_follow_me_takeover_mode"]["value"], "auto")
+            self.assertEqual(new_fields["person_link_follow_me_away_action"]["value"], "keep_pause")
+            # Error states are surfaced with a friendly label.
+            core._save_follow_me_state(
+                "person_zoe",
+                {"status": "error", "last_error": "entity_not_found"},
+                self.redis,
+            )
+            cards = {item["id"]: item for item in core._person_link_items(core._settings(self.redis), self.redis)}
+            self.assertIn(
+                "Follow-me: person entity not found in Home Assistant",
+                cards["person:person_zoe"]["subtitle"],
+            )
+        finally:
+            core._PEOPLE_API_MODULE = original_people
+
+    def test_link_save_persists_follow_me_fields(self):
+        core = self.core
+        people = types.SimpleNamespace(
+            load_store=lambda _client=None: {
+                "people": [{"id": "person_zoe", "display_name": "Zoe"}]
+            }
+        )
+        original_people = core._PEOPLE_API_MODULE
+        core._PEOPLE_API_MODULE = people
+        try:
+            result = core._save_person_link_action(
+                {
+                    "person_link_person_id": "person_zoe",
+                    "person_link_source": "",
+                    "person_link_follow_me_entity": " person.zoe ",
+                    "person_link_follow_me_room_overrides": " The Kitchen=Kitchen ",
+                    "person_link_follow_me_takeover_mode": "ASK",
+                    "person_link_follow_me_away_action": "pause",
+                },
+                self.redis,
+            )
+            self.assertTrue(result["ok"], result)
+            link = core._person_link("person_zoe", self.redis)
+            self.assertEqual(link["follow_me_person_entity"], "person.zoe")
+            self.assertEqual(link["follow_me_room_overrides"], "The Kitchen=Kitchen")
+            self.assertEqual(link["follow_me_takeover_mode"], "ask")
+            self.assertEqual(link["follow_me_away_action"], "pause")
+            # Blank entity clears tracking; invalid select values are dropped.
+            result = core._save_person_link_action(
+                {
+                    "person_link_person_id": "person_zoe",
+                    "person_link_source": "",
+                    "person_link_follow_me_entity": "",
+                    "person_link_follow_me_takeover_mode": "yolo",
+                    "person_link_follow_me_away_action": "teleport",
+                },
+                self.redis,
+            )
+            self.assertTrue(result["ok"], result)
+            link = core._person_link("person_zoe", self.redis)
+            self.assertEqual(link.get("follow_me_person_entity"), "")
+            self.assertEqual(link.get("follow_me_takeover_mode"), "ask")
+            self.assertEqual(link.get("follow_me_away_action"), "pause")
+        finally:
+            core._PEOPLE_API_MODULE = original_people
 
 
 class UpstreamCoexistenceTests(unittest.TestCase):

@@ -90,6 +90,44 @@ and the stock-like global path):
     the other queue keeps playing, paused at its position, on any rooms it has
     left.
 
+### Follow-Me presence (v1.2)
+
+Optionally, a linked Person's music can **follow them room to room**. Enable
+**Follow-Me Presence** in the core settings, then give the Person a
+**Home Assistant Person** entity in their People card (e.g. `person.john`) —
+any presence stack works, including BLE trackers that compute the closest node
+and update the person entity (Bermuda, ESPHome, phone GPS, …). The core
+reuses Tater's built-in Home Assistant integration for the base URL and token
+(no separate credentials) and polls HA's REST API for the entity's state,
+which is the friendly name of the zone the Person is in.
+
+- **Follows zones, resolves Tater rooms.** When the zone changes and holds for
+  the move delay (default 20 s), the Person's queue hands off to that room at
+  the same spot in the track — using Tater's room model (which Sat/player is
+  in which room). Zone names that differ from Tater room names can be mapped
+  per Person with **Zone to Room Overrides** (`The Kitchen=Kitchen, …`).
+- **Room takeover is user-selectable.** When the room they walk into is already
+  playing someone else's music: **Auto take over** (default) frees the room
+  immediately, or **Ask before taking over** asks over TTS in that room and
+  waits for the Person's yes/no (expires after 10 minutes, like other
+  conflicts). Settable globally in the core settings and per Person on their
+  card.
+- **Away behavior is user-selectable (3 options).** In a zone with no
+  speakers, or when the person is `not_home`:
+  - **Keep in dead rooms, pause when away** (default)
+  - **Pause whenever they leave a speaker room**
+  - **Never pause; only move into rooms**
+  A follow-me pause resumes automatically when they reappear in a room with
+  speakers, at the same spot in the track.
+- **Visibility.** The **Follow-Me Presence** system task shows the last check
+  and errors; each Person card shows their current state (e.g. "Follow-me: in
+  Kitchen → Kitchen", "paused (away from home)", "person entity not found in
+  Home Assistant").
+
+Follow-Me is off by default and requires Tater's Home Assistant integration to
+be configured (base URL + token); without it the system task explains what to
+enable.
+
 ## Settings worth knowing
 
 | Setting | Default | Notes |
@@ -97,8 +135,11 @@ and the stock-like global path):
 | Stream Server Port | `8621` | Local HTTP port the core serves token-authenticated Emby streams and share files from. Must be reachable from your playback targets on the LAN. |
 | Stream Host | auto | Override only if the auto-detected LAN address is wrong (e.g. multiple NICs). |
 | Catalog Sync Interval | `900` s | Also drives per-person catalog refreshes. |
+| Follow-Me Presence | off | Master switch for following linked People's Home Assistant person entities (see [Follow-Me presence](#follow-me-presence-v12)). |
+| Follow-Me Poll Interval | `15` s | How often HA is polled for each tracked Person (5–3600 s). |
+| Follow-Me Move Delay | `20` s | How long a new zone must hold before the music moves (prevents hallway flicker). |
 
-## Limitations (v1.1)
+## Limitations (v1.2)
 
 - Little Spud client music is not switched over — the Tater host currently links
   client music to the stock `music_core` only, and this core's client music
@@ -111,6 +152,11 @@ and the stock-like global path):
   calibration is shared.
 - The dashboard player bar still shows the shared household queue; per-Person
   queue state is visible on each Person's card in the People section.
+- Follow-Me tracks one zone per Person (their Home Assistant person entity's
+  state) and moves the whole queue to the single room that zone resolves to.
+  Zones with no matching Tater room are dead zones (handled by the selected
+  away action), and Follow-Me reuses Tater's Home Assistant credentials — it
+  cannot track a second Home Assistant instance.
 
 ## Development
 

@@ -53,12 +53,13 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby user or network-share folder, browse and play "
     "their library with voice control, and build AI-named recommendations from each Person's listening history "
-    "across clock-synchronized satellites, native Sonos groups, stereo pairs, and media players."
+    "across clock-synchronized satellites, native Sonos groups, stereo pairs, and media players — with optional "
+    "Follow-Me presence that moves a Person's music to the room their Home Assistant person entity reports."
 )
 TAGS = [
     "music",
@@ -72,6 +73,7 @@ TAGS = [
     "queue",
     "recommendations",
     "album-art",
+    "follow-me",
 ]
 
 logger = logging.getLogger("custom_music_core")
@@ -212,6 +214,67 @@ CORE_SETTINGS = {
                 "override this on their link card in the People section."
             ),
         },
+        "follow_me_enabled": {
+            "label": "Follow-Me (Home Assistant Presence)",
+            "type": "checkbox",
+            "default": False,
+            "description": (
+                "Track each Person's Home Assistant person entity (for example one your BLE "
+                "trackers update as they move between rooms) and automatically move their music "
+                "to the room they're in. Requires the Home Assistant integration configured in "
+                "Tater (base URL and token); set each Person's entity on their card in the "
+                "People section."
+            ),
+        },
+        "follow_me_poll_interval_seconds": {
+            "label": "Follow-Me Check Interval (sec)",
+            "type": "number",
+            "default": 15,
+            "description": (
+                "How often Custom Music Core checks the linked People's Home Assistant person "
+                "entities for a new room."
+            ),
+        },
+        "follow_me_move_delay_seconds": {
+            "label": "Follow-Me Move Delay (sec)",
+            "type": "number",
+            "default": 20,
+            "description": (
+                "A new room must remain the Person's detected location for this long before "
+                "their music moves, so brief BLE flaps between rooms don't bounce the music."
+            ),
+        },
+        "follow_me_takeover_mode": {
+            "label": "Follow-Me Room Takeover",
+            "type": "select",
+            "default": "auto",
+            "options": [
+                {"value": "auto", "label": "Auto take over"},
+                {"value": "ask", "label": "Ask before taking over"},
+            ],
+            "description": (
+                "Default for what Follow-Me does when the room a Person walks into is already "
+                "playing someone else's music: take it over automatically (the other queue is "
+                "paused in place), or ask over TTS first. Each Person can override this on "
+                "their link card."
+            ),
+        },
+        "follow_me_away_action": {
+            "label": "Follow-Me Away Behavior",
+            "type": "select",
+            "default": "keep_pause",
+            "options": [
+                {"value": "keep_pause", "label": "Keep in dead rooms, pause when away"},
+                {"value": "pause", "label": "Pause whenever they leave a speaker room"},
+                {"value": "keep", "label": "Never pause; only move into rooms"},
+            ],
+            "description": (
+                "Default for what happens to a Person's music when they're in a zone with no "
+                "speakers (a dead room) or outside the home. Music paused by Follow-Me resumes "
+                "automatically when they reappear in a room with speakers. Each Person can "
+                "override this on their link card."
+            ),
+        },
     },
     "tags": TAGS,
 }
@@ -240,6 +303,24 @@ PENDING_CONFIRM_KEY_PREFIX = "custom_music_core:pending:"
 PENDING_CONFIRM_TTL_SECONDS = 600.0
 QUEUE_CONFLICT_MODES = ("ask", "auto_move")
 DEFAULT_QUEUE_CONFLICT_MODE = "ask"
+# Follow-Me presence: each linked Person can carry a Home Assistant person
+# entity (e.g. one a BLE tracker updates as they move between rooms). When the
+# entity reports a new room, that Person's queue hands off to it. Per-Person
+# tracking state lives at "custom_music_core:follow_me:<person_id>"; the HA
+# base URL and token are reused from Tater's built-in Home Assistant
+# integration (host-owned key "homeassistant_settings" — read only).
+FOLLOW_ME_KEY = "custom_music_core:follow_me"
+HA_SETTINGS_KEY = "homeassistant_settings"
+HA_DEFAULT_BASE_URL = "http://homeassistant.local:8123"
+FOLLOW_ME_TAKEOVER_MODES = ("auto", "ask")
+DEFAULT_FOLLOW_ME_TAKEOVER_MODE = "auto"
+FOLLOW_ME_AWAY_ACTIONS = ("keep_pause", "pause", "keep")
+DEFAULT_FOLLOW_ME_AWAY_ACTION = "keep_pause"
+FOLLOW_ME_DEFAULT_POLL_SECONDS = 15
+FOLLOW_ME_DEFAULT_MOVE_DELAY_SECONDS = 20.0
+# (connect, read) timeout for one HA REST poll; keeps a dead HA from stalling
+# the background loop.
+HA_STATE_TIMEOUT_SECONDS = (3.0, 8.0)
 HISTORY_KEY = "custom_music_core:history:v1"
 RECOMMENDATIONS_KEY = "custom_music_core:recommendations:v1"
 PROMPT_PROFILE_KEY = "custom_music_core:profile:v1"
@@ -394,6 +475,9 @@ GENRE_CANONICAL_NAMES = {
 }
 
 _state_lock = threading.RLock()
+# Serializes follow-me presence passes (background loop + manual task runs)
+# so two ticks can't double-move or double-speak for the same Person.
+_follow_me_lock = threading.Lock()
 _artwork_cache_lock = threading.RLock()
 _artwork_cache: Dict[str, Dict[str, Any]] = {}
 _artwork_inflight: Dict[str, threading.Event] = {}
@@ -2982,6 +3066,440 @@ def _clear_pending_confirmation(store: Any, person_id: Any) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# Follow-Me presence (Home Assistant person tracking).
+#
+# Each linked Person can carry a Home Assistant person entity ("person.john").
+# The entity's state is the friendly name of the zone the Person is in (or
+# "not_home"), updated by whatever presence stack the user runs — BLE trackers
+# computing the closest node, phone GPS, and so on. When the zone changes and
+# holds for the move delay, the Person's queue hands off to that room at the
+# same spot in the track, using the same room resolution as the voice
+# "move my music" path (room store preferred player, then target label match).
+# The HA base URL and token are reused from Tater's built-in Home Assistant
+# integration; the core polls HA's REST API directly because the host's
+# WebSocket state mirror can filter person entities out depending on its
+# entity-scope setting.
+# ---------------------------------------------------------------------------
+
+
+def _follow_me_follow_enabled(cfg: Dict[str, Any]) -> bool:
+    return _as_bool(cfg.get("follow_me_enabled"), False)
+
+
+def _follow_me_poll_interval(cfg: Dict[str, Any]) -> int:
+    return _as_int(
+        cfg.get("follow_me_poll_interval_seconds"),
+        FOLLOW_ME_DEFAULT_POLL_SECONDS,
+        5,
+        3600,
+    )
+
+
+def _follow_me_move_delay(cfg: Dict[str, Any]) -> float:
+    raw = cfg.get("follow_me_move_delay_seconds")
+    if _text(raw) == "":
+        return FOLLOW_ME_DEFAULT_MOVE_DELAY_SECONDS
+    return max(0.0, _as_float(raw, FOLLOW_ME_DEFAULT_MOVE_DELAY_SECONDS))
+
+
+def _follow_me_takeover_mode(person_id: Any, client: Any = None) -> str:
+    """Per-Person override, else the global setting, else auto take over."""
+    store = client or globals().get("redis_client")
+    link = _person_link(person_id, store)
+    value = _text(link.get("follow_me_takeover_mode")).casefold()
+    if value in FOLLOW_ME_TAKEOVER_MODES:
+        return value
+    value = _text(_settings(store).get("follow_me_takeover_mode")).casefold()
+    if value in FOLLOW_ME_TAKEOVER_MODES:
+        return value
+    return DEFAULT_FOLLOW_ME_TAKEOVER_MODE
+
+
+def _follow_me_away_action(person_id: Any, client: Any = None) -> str:
+    """Per-Person override, else the global setting, else keep/pause."""
+    store = client or globals().get("redis_client")
+    link = _person_link(person_id, store)
+    value = _text(link.get("follow_me_away_action")).casefold()
+    if value in FOLLOW_ME_AWAY_ACTIONS:
+        return value
+    value = _text(_settings(store).get("follow_me_away_action")).casefold()
+    if value in FOLLOW_ME_AWAY_ACTIONS:
+        return value
+    return DEFAULT_FOLLOW_ME_AWAY_ACTION
+
+
+def _ha_config(client: Any = None) -> Dict[str, str]:
+    """Base URL and token of Tater's built-in Home Assistant integration."""
+    store = client or globals().get("redis_client")
+    try:
+        from tater_voice.reply_playback import load_homeassistant_config
+
+        conf = load_homeassistant_config(required=False, client=store)
+        if isinstance(conf, dict):
+            return {
+                "base": _text(conf.get("base")).rstrip("/"),
+                "token": _text(conf.get("token")),
+            }
+    except Exception:
+        pass
+    raw = store.hgetall(HA_SETTINGS_KEY) or {}
+    base = _text(raw.get("HA_BASE_URL") or HA_DEFAULT_BASE_URL)
+    return {"base": base.rstrip("/"), "token": _text(raw.get("HA_TOKEN"))}
+
+
+def _ha_http_get(url: str, headers: Dict[str, str], timeout: Any):
+    """One HA REST request; indirection so tests can stub the network."""
+    return requests.get(url, headers=headers, timeout=timeout)
+
+
+def _ha_person_location(client: Any, entity: str) -> Dict[str, Any]:
+    """Current HA state of a person entity: {"state": ...} or {"error": ...}."""
+    conf = _ha_config(client)
+    if not _text(conf.get("token")):
+        return {"error": "ha_not_configured"}
+    url = f"{conf.get('base')}/api/states/{quote(_text(entity), safe='')}"
+    try:
+        response = _ha_http_get(
+            url,
+            {"Authorization": f"Bearer {conf.get('token')}"},
+            HA_STATE_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        return {"error": _text(exc)[:300] or "ha_unreachable"}
+    status = int(getattr(response, "status_code", 0) or 0)
+    if status == 404:
+        return {"error": "entity_not_found"}
+    if status in {401, 403}:
+        return {"error": "ha_unauthorized"}
+    if status <= 0 or status >= 400:
+        return {"error": f"ha_http_{status or 'error'}"}
+    try:
+        data = response.json()
+    except Exception:
+        return {"error": "ha_bad_response"}
+    if not isinstance(data, dict):
+        return {"error": "ha_bad_response"}
+    return {"state": _text(data.get("state")), "last_changed": _as_float(data.get("last_changed"))}
+
+
+def _follow_me_state_key(person_id: Any) -> str:
+    return f"{FOLLOW_ME_KEY}:{_text(person_id) or 'shared'}"
+
+
+def _follow_me_state(person_id: Any, client: Any = None) -> Dict[str, Any]:
+    payload = _load_json(
+        client or globals().get("redis_client"),
+        _follow_me_state_key(person_id),
+        {},
+    )
+    return payload if isinstance(payload, dict) else {}
+
+
+def _save_follow_me_state(
+    person_id: Any,
+    state: Dict[str, Any],
+    client: Any = None,
+) -> None:
+    _save_json(
+        client or globals().get("redis_client"),
+        _follow_me_state_key(person_id),
+        state,
+    )
+
+
+def _normalize_room_token(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", _text(value).casefold())
+
+
+def _parse_room_overrides(raw: Any) -> Dict[str, str]:
+    """Map normalized HA zone names to Tater room names ("The Kitchen=Kitchen")."""
+    out: Dict[str, str] = {}
+    for chunk in _list(raw):
+        zone, _, room = chunk.partition("=")
+        key = _normalize_room_token(zone)
+        room_name = _text(room).strip()
+        if key and room_name:
+            out[key] = room_name
+    return out
+
+
+def _room_name_to_targets(room_name: Any, client: Any = None) -> str:
+    """One target for a Tater room name: room-store preference, else label match."""
+    store = client or globals().get("redis_client")
+    name = _text(room_name)
+    if not name:
+        return ""
+    preferred = _preferred_room_target([name], store)
+    if preferred:
+        return preferred
+    return _room_target_from_query(name, _target_options())
+
+
+def _resolve_follow_me_zone(
+    zone: Any,
+    link: Dict[str, Any],
+    client: Any = None,
+) -> tuple[str, str]:
+    """(room_name, target) for an HA zone; ("", "") when the zone has no room."""
+    zone_name = _text(zone)
+    if not zone_name or zone_name.casefold() in {"not_home", "home"}:
+        return "", ""
+    overrides = _parse_room_overrides((link or {}).get("follow_me_room_overrides"))
+    room_name = overrides.get(_normalize_room_token(zone_name), zone_name)
+    return room_name, _room_name_to_targets(room_name, client)
+
+
+def _speak_follow_me_prompt(targets: List[str], text: str) -> bool:
+    """Best-effort TTS of the follow-me question on the destination room."""
+    if not text:
+        return False
+    try:
+        from speech_settings import get_speech_settings
+        from speech_tts import speak_announcement_targets
+
+        try:
+            from tater_voice.runtime import run_async_blocking
+        except Exception:
+            run_async_blocking = None
+        speech_settings = get_speech_settings() or {}
+        ha_config = _ha_config()
+        backend = (
+            _text(speech_settings.get("announcement_tts_backend"))
+            or _text(speech_settings.get("tts_backend"))
+            or "wyoming"
+        )
+        result = speak_announcement_targets(
+            text=text,
+            backend=backend,
+            ha_base=_text(ha_config.get("base")),
+            token=_text(ha_config.get("token")),
+            targets=list(targets),
+            public_base_url="",
+            default_backend=backend,
+            tts_kind="follow_me",
+        )
+        if run_async_blocking is not None:
+            result = run_async_blocking(result, timeout=120.0)
+        else:
+            result = asyncio.run(result)
+        return bool(
+            isinstance(result, dict)
+            and (result.get("ok") or int(result.get("sent_count") or 0) > 0)
+        )
+    except Exception as exc:
+        logger.debug("[Music] follow-me prompt playback skipped: %s", exc)
+        return False
+
+
+def _follow_me_move(
+    person_id: Any,
+    zone: Any,
+    targets: List[str],
+    client: Any = None,
+) -> Dict[str, Any]:
+    """Hand the Person's queue off to the room they walked into (same spot).
+
+    Callers must hold _follow_me_lock. Returns one of:
+      {"moved": True, "targets": [...]}
+      {"moved": False, "reason": "no_playback" | "no_targets"
+                                 | "awaiting_confirmation"}
+    """
+    store = client or globals().get("redis_client")
+    queue_id = _queue_id_for_person(person_id)
+    player = _player(store, queue_id)
+    status = _text(player.get("status")).lower()
+    if status not in {"playing", "paused"} or not (player.get("queue") or []):
+        return {"moved": False, "reason": "no_playback"}
+    wanted = _normalize_stereo_targets(targets)
+    if not wanted:
+        return {"moved": False, "reason": "no_targets"}
+    paused_by_follow_me = bool(_follow_me_state(person_id, store).get("paused_by_follow_me"))
+
+    conflicts = _queue_conflicts(store, queue_id, wanted)
+    if conflicts["foreign_targets"]:
+        if _follow_me_takeover_mode(person_id, store) == "ask":
+            pending = _load_pending_confirmation(store, person_id)
+            if (
+                _text(pending.get("type")) != "follow_takeover"
+                or sorted(_list(pending.get("targets"))) != sorted(wanted)
+            ):
+                owners = sorted(
+                    {_queue_owner_label(qid, store) for qid in conflicts["foreign_queues"]}
+                )
+                question = (
+                    f"{' and '.join(owners)} still playing on {_target_summary(wanted)}. "
+                    f"Say yes to move your music here."
+                )
+                _save_pending_confirmation(
+                    store,
+                    person_id,
+                    {
+                        "type": "follow_takeover",
+                        "args": {},
+                        "origin": {},
+                        "targets": list(wanted),
+                        "queue_id": queue_id,
+                        "zone": _text(zone),
+                    },
+                )
+                _speak_follow_me_prompt(wanted, question)
+            state = _follow_me_state(person_id, store)
+            state["status"] = "awaiting_confirmation"
+            _save_follow_me_state(person_id, state, store)
+            return {"moved": False, "reason": "awaiting_confirmation"}
+        # auto: free the destination from other queues without asking; a queue
+        # that keeps at least one room stays paused at its position.
+        _release_targets_to(store, wanted, except_queue_id=queue_id)
+    _route_player_targets(wanted, person_id=queue_id, client=store)
+    if paused_by_follow_me and _text(
+        _player(store, queue_id).get("status")
+    ).lower() == "paused":
+        # Walked back into a speaker room after Follow-Me paused them: resume.
+        _resume_player(person_id=queue_id, client=store)
+        state = _follow_me_state(person_id, store)
+        state.pop("paused_by_follow_me", None)
+        _save_follow_me_state(person_id, state, store)
+    return {"moved": True, "targets": _list(_player(store, queue_id).get("targets"))}
+
+
+def _follow_me_apply_away_action(
+    person_id: Any,
+    *,
+    client: Any = None,
+) -> bool:
+    """Pause the Person's queue (position kept) if it is currently playing.
+
+    Callers set the paused_by_follow_me flag on their own tracking state and
+    persist it, so a single owner writes the state.
+    """
+    store = client or globals().get("redis_client")
+    queue_id = _queue_id_for_person(person_id)
+    if _text(_player(store, queue_id).get("status")).lower() != "playing":
+        return False
+    _pause_player(person_id=queue_id, client=store)
+    return True
+
+
+def _follow_me_tick(client: Any = None) -> Dict[str, Any]:
+    """One pass: check every linked Person's HA entity and follow the movers."""
+    store = client or globals().get("redis_client")
+    with _follow_me_lock:
+        cfg = _settings(store)
+        if not _follow_me_follow_enabled(cfg):
+            return {"ok": True, "skipped": "disabled"}
+        if not _text(_ha_config(store).get("token")):
+            return {"ok": True, "skipped": "ha_not_configured"}
+        delay = _follow_me_move_delay(cfg)
+        now = time.time()
+        summary: Dict[str, Any] = {
+            "ok": True,
+            "checked": 0,
+            "moved": 0,
+            "paused": 0,
+            "awaiting": 0,
+            "errors": [],
+        }
+        for person_id, link in _person_links(store).items():
+            entity = _text(link.get("follow_me_person_entity"))
+            if not entity:
+                continue
+            summary["checked"] += 1
+            state = _follow_me_state(person_id, store)
+            player = _player(store, _queue_id_for_person(person_id))
+            # The flag only means "Follow-Me paused this"; any playback since
+            # then (manual resume, new request, track advance) supersedes it.
+            if bool(state.get("paused_by_follow_me")) and _text(
+                player.get("status")
+            ).lower() == "playing":
+                state.pop("paused_by_follow_me", None)
+            location = _ha_person_location(store, entity)
+            if "error" in location:
+                state.update(
+                    {
+                        "last_error": _text(location.get("error")),
+                        "last_error_at": now,
+                        "last_check_at": now,
+                        "status": "error",
+                    }
+                )
+                _save_follow_me_state(person_id, state, store)
+                summary["errors"].append(f"{person_id}: {location.get('error')}")
+                continue
+            zone = _text(location.get("state"))
+            if zone != _text(state.get("zone")):
+                # A new room supersedes any pending takeover question.
+                _clear_pending_confirmation(store, person_id)
+                state.update(
+                    {
+                        "zone": zone,
+                        "zone_since": now,
+                        "last_error": "",
+                        "status": "tracking",
+                    }
+                )
+            state["last_check_at"] = now
+            _save_follow_me_state(person_id, state, store)
+            if now - _as_float(state.get("zone_since")) < delay:
+                continue
+            if zone.casefold() in {"not_home", ""}:
+                if _follow_me_away_action(person_id, store) in {"keep_pause", "pause"}:
+                    if _follow_me_apply_away_action(person_id, client=store):
+                        summary["paused"] += 1
+                        state["paused_by_follow_me"] = True
+                        state["status"] = "paused_away"
+                    else:
+                        state["status"] = "away_idle"
+                else:
+                    state["status"] = "away_kept"
+                _save_follow_me_state(person_id, state, store)
+                continue
+            room_name, target = _resolve_follow_me_zone(zone, link, store)
+            if not target:
+                state["resolved_room"] = ""
+                state["resolved_targets"] = []
+                if _follow_me_away_action(person_id, store) == "pause":
+                    if _follow_me_apply_away_action(person_id, client=store):
+                        summary["paused"] += 1
+                        state["paused_by_follow_me"] = True
+                        state["status"] = "paused_dead_zone"
+                    else:
+                        state["status"] = "dead_zone_idle"
+                else:
+                    state["status"] = "dead_zone"
+                _save_follow_me_state(person_id, state, store)
+                continue
+            result = _follow_me_move(person_id, zone, [target], store)
+            # _follow_me_move persists its own state changes (awaiting_confirmation,
+            # cleared paused_by_follow_me); build on that copy, not the stale one.
+            state = _follow_me_state(person_id, store)
+            state.update({"resolved_room": room_name, "resolved_targets": [target]})
+            if result.get("moved"):
+                summary["moved"] += 1
+                state["last_move_at"] = time.time()
+                state["status"] = "following"
+            elif result.get("reason") == "awaiting_confirmation":
+                summary["awaiting"] += 1
+                # Status was already set by _follow_me_move.
+            else:
+                state["status"] = "following"
+            _save_follow_me_state(person_id, state, store)
+        runtime = _runtime(store)
+        _save_hash(
+            store,
+            RUNTIME_KEY,
+            {
+                "last_follow_me_at": time.time(),
+                "follow_me_last_error": "",
+                "follow_me_run_count": _as_int(
+                    runtime.get("follow_me_run_count"), 0, 0, 1_000_000_000
+                )
+                + 1,
+            },
+        )
+        return summary
+
+
 def _player(client: Any = None, person_id: Any = "") -> Dict[str, Any]:
     store = client or globals().get("redis_client")
     queue_id = _queue_id_for_person(person_id)
@@ -3611,22 +4129,35 @@ def _music_prompt_message(profile: Dict[str, Any]) -> str:
     return "\n".join(lines)[:MAX_PROMPT_CONTEXT_CHARS]
 
 
-def get_hydra_system_prompt_fragments(
-    *,
-    role: str,
-    redis_client: Any = None,
-    origin: Optional[Dict[str, Any]] = None,
-    memory_context: Optional[Dict[str, Any]] = None,
-    personal_context: Optional[Dict[str, Any]] = None,
-    **_kwargs,
-) -> Dict[str, List[str]]:
-    normalized_role = _text(role).lower()
-    if normalized_role not in {"", "chat", "hermes", "memory_context", "music_context"}:
-        return {}
-    store = redis_client or globals().get("redis_client")
+def _follow_me_pending_note(person_id: Any, client: Any = None) -> str:
+    """Hydra hint when the speaking Person has a pending follow-me takeover."""
+    store = client or globals().get("redis_client")
+    if not person_id:
+        return ""
+    pending = _load_pending_confirmation(store, person_id)
+    if _text(pending.get("type")) != "follow_takeover":
+        return ""
+    targets = _list(pending.get("targets"))
+    if not targets:
+        return ""
+    name = _people_person_name(person_id, store) or "this Person"
+    return (
+        f"Follow-me is waiting for {name}'s answer: their music can move to "
+        f"{_target_summary(targets)} (the room they walked into, currently playing "
+        f"someone else's music). If they confirm, call custom_music_confirm with "
+        f"choice 'yes'; if they decline, call it with choice 'no'."
+    )
+
+
+def _music_prompt_fragment_message(
+    store: Any,
+    origin: Optional[Dict[str, Any]],
+    memory_context: Optional[Dict[str, Any]],
+    personal_context: Optional[Dict[str, Any]],
+) -> str:
     cfg = _settings(store)
     if not _as_bool(cfg.get("prompt_context_enabled"), True):
-        return {}
+        return ""
     configured_person_id = _text(cfg.get("prompt_person_id"))
     active_person_id = _context_person_id(origin, memory_context, personal_context)
     if active_person_id and _music_prompt_profile(store, active_person_id):
@@ -3635,15 +4166,15 @@ def get_hydra_system_prompt_fragments(
         configured_person_id = active_person_id
     else:
         if not configured_person_id or active_person_id != configured_person_id:
-            return {}
+            return ""
         profile = _music_prompt_profile(store)
     if not profile:
-        return {}
+        return ""
     if (
         _text(profile.get("person_id")) != configured_person_id
         or _provider_id(profile.get("provider")) != _person_source_id(configured_person_id, store)
     ):
-        return {}
+        return ""
     live_recent_tracks = []
     seen_tracks = set()
     for event in reversed(
@@ -3664,9 +4195,33 @@ def get_hydra_system_prompt_fragments(
             break
     if live_recent_tracks:
         profile = {**profile, "recent_tracks": live_recent_tracks}
-    message = _music_prompt_message(profile)
-    if not message:
+    return _music_prompt_message(profile)
+
+
+def get_hydra_system_prompt_fragments(
+    *,
+    role: str,
+    redis_client: Any = None,
+    origin: Optional[Dict[str, Any]] = None,
+    memory_context: Optional[Dict[str, Any]] = None,
+    personal_context: Optional[Dict[str, Any]] = None,
+    **_kwargs,
+) -> Dict[str, List[str]]:
+    normalized_role = _text(role).lower()
+    if normalized_role not in {"", "chat", "hermes", "memory_context", "music_context"}:
         return {}
+    store = redis_client or globals().get("redis_client")
+    message = _music_prompt_fragment_message(store, origin, memory_context, personal_context)
+    # A pending follow-me takeover must survive even when no music profile is
+    # configured, so the Person's yes/no reaches the confirm tool.
+    follow_me_note = _follow_me_pending_note(
+        _context_person_id(origin, memory_context, personal_context),
+        store,
+    )
+    if not message and not follow_me_note:
+        return {}
+    if follow_me_note:
+        message = f"{message} {follow_me_note}".strip()
     return {
         "chat": [message],
         "hermes": [message],
@@ -6289,6 +6844,27 @@ async def run_hydra_kernel_tool(
                         "at the same spot in the track."
                     ),
                 }
+            if pending_type == "follow_takeover":
+                targets = _list(pending.get("targets"))
+                queue_id = _text(pending.get("queue_id")) or active_person_id
+                # The Person confirmed; take the room over regardless of mode.
+                _release_targets_to(store, targets, except_queue_id=queue_id)
+                player = await asyncio.to_thread(
+                    _route_player_targets,
+                    targets,
+                    person_id=queue_id,
+                    client=store,
+                )
+                return {
+                    "ok": True,
+                    "targets": _list(player.get("targets")),
+                    "status": _text(player.get("status")),
+                    "now_playing": _public_track(player.get("current") or {}),
+                    "summary_for_user": (
+                        f"Moved the music to {_target_summary(targets)} "
+                        "at the same spot in the track."
+                    ),
+                }
             return await asyncio.to_thread(
                 _play_request,
                 pending.get("args") or {},
@@ -7814,6 +8390,115 @@ def _recommendation_ui_items(
     return items
 
 
+def _follow_me_link_fields(
+    cfg: Dict[str, Any],
+    link: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Follow-Me presence fields shared by the People section cards."""
+    return [
+        {
+            "key": "person_link_follow_me_entity",
+            "label": "Home Assistant Person",
+            "type": "text",
+            "value": _text(link.get("follow_me_person_entity")),
+            "placeholder": "person.john",
+            "description": (
+                "The Home Assistant person entity for this Person (updated as they move, for "
+                "example by your BLE trackers). With Follow-Me enabled, their music follows "
+                "them to the room this entity reports."
+            ),
+        },
+        {
+            "key": "person_link_follow_me_room_overrides",
+            "label": "Zone to Room Overrides (optional)",
+            "type": "text",
+            "value": _text(link.get("follow_me_room_overrides")),
+            "placeholder": "The Kitchen=Kitchen, Guest Room=Beds",
+            "description": (
+                "Map Home Assistant zone names to Tater room names when they differ, so the "
+                "right room is used automatically. Comma-separated Zone=Room pairs."
+            ),
+        },
+        {
+            "key": "person_link_follow_me_takeover_mode",
+            "label": "Follow-Me Room Takeover",
+            "type": "select",
+            "value": _text(link.get("follow_me_takeover_mode"))
+            or _text(cfg.get("follow_me_takeover_mode") or DEFAULT_FOLLOW_ME_TAKEOVER_MODE),
+            "options": [
+                {"value": "auto", "label": "Auto take over"},
+                {"value": "ask", "label": "Ask before taking over"},
+            ],
+            "description": (
+                "When the room they walk into is already playing someone else's music: take it "
+                "over automatically (the other queue pauses in place), or ask first."
+            ),
+        },
+        {
+            "key": "person_link_follow_me_away_action",
+            "label": "Follow-Me Away Behavior",
+            "type": "select",
+            "value": _text(link.get("follow_me_away_action"))
+            or _text(cfg.get("follow_me_away_action") or DEFAULT_FOLLOW_ME_AWAY_ACTION),
+            "options": [
+                {"value": "keep_pause", "label": "Keep in dead rooms, pause when away"},
+                {"value": "pause", "label": "Pause whenever they leave a speaker room"},
+                {"value": "keep", "label": "Never pause; only move into rooms"},
+            ],
+            "description": (
+                "What happens to their music in a zone with no speakers, or when they're "
+                "outside the home. Follow-Me pausing resumes automatically when they reappear "
+                "in a room with speakers."
+            ),
+        },
+    ]
+
+
+def _follow_me_card_status(
+    person_id: Any,
+    link: Dict[str, Any],
+    cfg: Dict[str, Any],
+    store: Any,
+) -> str:
+    """Short follow-me status for a Person card subtitle ("" when not shown)."""
+    if not _follow_me_follow_enabled(cfg):
+        return ""
+    if not _text(link.get("follow_me_person_entity")):
+        return ""
+    state = _follow_me_state(person_id, store)
+    status = _text(state.get("status"))
+    zone = _text(state.get("zone"))
+    room = _text(state.get("resolved_room"))
+    if status == "error":
+        error = _text(state.get("last_error"))
+        labels = {
+            "ha_not_configured": "Home Assistant not configured in Tater",
+            "entity_not_found": "person entity not found in Home Assistant",
+            "ha_unauthorized": "Home Assistant token was rejected",
+        }
+        return f"Follow-me: {labels.get(error, error) or 'unreachable'}"
+    if status == "awaiting_confirmation":
+        return (
+            "Follow-me: asking before taking over "
+            f"{_target_summary(_list(state.get('resolved_targets')))}"
+        )
+    if status == "following" and room:
+        return f"Follow-me: in {zone} → {room}"
+    if status == "tracking":
+        return f"Follow-me: spotted in {zone}, holding…"
+    if status == "paused_away":
+        return "Follow-me: paused (away from home)"
+    if status == "paused_dead_zone":
+        return f"Follow-me: paused (in {zone}, no speakers)"
+    if status == "away_kept":
+        return "Follow-me: away, music kept playing"
+    if status in {"dead_zone", "dead_zone_idle", "away_idle"}:
+        return f"Follow-me: in {zone}, no move needed"
+    if not status:
+        return "Follow-me: waiting for first check"
+    return f"Follow-me: {status}"
+
+
 def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
     """Per-Person source links shown in the core tab's People section."""
     items: List[Dict[str, Any]] = []
@@ -7834,6 +8519,7 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                 f" · Now {person_queue_status}: {_track_label(person_queue.get('current') or {})} "
                 f"on {_target_summary(person_queue_targets)}"
             )
+        follow_me_status = _follow_me_card_status(person_id, link, cfg, store)
         items.append(
             {
                 "id": f"person:{person_id}",
@@ -7842,7 +8528,8 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                 "subtitle": (
                     f"Plays from {PROVIDER_LABELS[source]}" if source else "Uses the global music source"
                 )
-                + queue_state,
+                + queue_state
+                + (f" · {follow_me_status}" if follow_me_status else ""),
                 "detail": _text(values.get("server_url")) or _text(values.get("root_path")),
                 "hero_badges": [
                     {
@@ -7883,6 +8570,7 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                             "the rooms they ask for: ask first, or move/take over automatically."
                         ),
                     },
+                    *_follow_me_link_fields(cfg, link),
                     {
                         "key": "person_link_emby_server_url",
                         "label": "Emby Server URL",
@@ -7990,6 +8678,7 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                             "the rooms they ask for: ask first, or move/take over automatically."
                         ),
                     },
+                    *_follow_me_link_fields(cfg, {}),
                     {
                         "key": "person_link_emby_server_url",
                         "label": "Emby Server URL",
@@ -8540,6 +9229,24 @@ def _save_person_link_action(values: Dict[str, Any], store: Any) -> Dict[str, An
     conflict_mode = _text(values.get("person_link_queue_conflict_mode")).casefold()
     if conflict_mode in QUEUE_CONFLICT_MODES:
         link["queue_conflict_mode"] = conflict_mode
+    if "person_link_follow_me_entity" in values:
+        link["follow_me_person_entity"] = _text(values.get("person_link_follow_me_entity")).strip()
+    if "person_link_follow_me_room_overrides" in values:
+        link["follow_me_room_overrides"] = _text(
+            values.get("person_link_follow_me_room_overrides")
+        ).strip()
+    # Selects inherit the stored value when the payload carries an invalid one,
+    # so a stale form can never wipe a saved mode.
+    follow_takeover = _text(values.get("person_link_follow_me_takeover_mode")).casefold()
+    if follow_takeover not in FOLLOW_ME_TAKEOVER_MODES:
+        follow_takeover = _text(existing.get("follow_me_takeover_mode")).casefold()
+    if follow_takeover in FOLLOW_ME_TAKEOVER_MODES:
+        link["follow_me_takeover_mode"] = follow_takeover
+    follow_away = _text(values.get("person_link_follow_me_away_action")).casefold()
+    if follow_away not in FOLLOW_ME_AWAY_ACTIONS:
+        follow_away = _text(existing.get("follow_me_away_action")).casefold()
+    if follow_away in FOLLOW_ME_AWAY_ACTIONS:
+        link["follow_me_away_action"] = follow_away
     if source:
         if source == "emby":
             password = _text(values.get("person_link_emby_password")) or _text(
@@ -9508,6 +10215,10 @@ def get_core_system_tasks(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
         and prompt_person_name
         and has_profile_history
     )
+    follow_me_enabled = _as_bool(cfg.get("follow_me_enabled"), False)
+    follow_me_interval = _follow_me_poll_interval(cfg)
+    last_follow_me = _as_float(runtime.get("last_follow_me_at"))
+    follow_me_ha_ready = bool(_text(_ha_config(store).get("token")))
     return {
         "label": "Custom Music Core",
         "order": 36,
@@ -9624,6 +10335,39 @@ def get_core_system_tasks(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
                 "requires_running": True,
                 "order": 40,
             },
+            {
+                "id": "follow_me",
+                "label": "Follow-Me Presence",
+                "description": "Checks linked People's Home Assistant person entities and moves their music to the room they're in.",
+                "interval_seconds": follow_me_interval,
+                "enabled": follow_me_enabled,
+                "running": bool(_follow_me_lock.locked()),
+                "started_at": 0.0,
+                "finished_at": last_follow_me,
+                "duration_ms": 0.0,
+                "next_run_at": (
+                    last_follow_me + follow_me_interval
+                    if last_follow_me and follow_me_enabled
+                    else 0.0
+                ),
+                "last_error": _text(runtime.get("follow_me_last_error")),
+                "run_count": _as_int(
+                    runtime.get("follow_me_run_count"),
+                    0,
+                    0,
+                    1_000_000_000,
+                ),
+                "available": follow_me_ha_ready,
+                "unavailable_reason": (
+                    "Enable the Home Assistant integration in Tater (base URL and token) before "
+                    "Follow-Me can track People."
+                    if not follow_me_ha_ready
+                    else ""
+                ),
+                "status": "idle" if follow_me_enabled and follow_me_ha_ready else "waiting",
+                "requires_running": True,
+                "order": 50,
+            },
         ],
     }
 
@@ -9648,6 +10392,8 @@ def run_core_system_task(*, task_id: str, redis_client=None, **_kwargs) -> Dict[
             "person_id": _text(profile.get("person_id")),
             "history_event_count": _as_int(profile.get("history_event_count"), 0, 0, 1_000_000_000),
         }
+    if task == "follow_me":
+        return _follow_me_tick(store)
     raise KeyError(f"Unknown Custom Music Core task: {task_id}")
 
 
@@ -10054,6 +10800,23 @@ def run(stop_event: Optional[object] = None) -> None:
                             "[Music] queue %s maintenance failed: %s",
                             queue_id or "shared",
                             exc,
+                        )
+                # Follow-Me presence: check linked People's Home Assistant
+                # person entities and hand their queues off to new rooms.
+                if _as_bool(cfg.get("follow_me_enabled"), False) and now - _as_float(
+                    runtime.get("last_follow_me_at")
+                ) >= _follow_me_poll_interval(cfg):
+                    try:
+                        _follow_me_tick()
+                    except Exception as exc:
+                        logger.warning("[Music] follow-me presence check failed: %s", exc)
+                        _save_hash(
+                            redis_client,
+                            RUNTIME_KEY,
+                            {
+                                "last_follow_me_at": time.time(),
+                                "follow_me_last_error": _text(exc)[:300],
+                            },
                         )
                 recommendation_interval = (
                     _as_int(cfg.get("recommendation_interval_hours"), 12, 1, 168) * 3600

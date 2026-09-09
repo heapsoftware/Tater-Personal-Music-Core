@@ -5,11 +5,11 @@
       "id": "custom_music",
       "name": "Custom Music Core",
       "module_key": "custom_music_core",
-      "version": "1.1.0",
+      "version": "1.2.0",
       "min_tater_version": "99.5",
-      "description": "Per-person music for Tater: link each Person to their own Emby user or network-share folder, browse and play their library with voice control, and build AI-named recommendations from each Person's listening history across clock-synchronized satellites, native Sonos groups, stereo pairs, and media players.",
+      "description": "Per-person music for Tater: link each Person to their own Emby user or network-share folder, browse and play their library with voice control, and build AI-named recommendations from each Person's listening history across clock-synchronized satellites, native Sonos groups, stereo pairs, and media players — with optional Follow-Me presence that moves a Person's music to the room their Home Assistant person entity reports.",
       "settings_category": "Custom Music Core Settings",
-      "required_settings_count": 19,
+      "required_settings_count": 24,
       "autostart_key": "custom_music_core_running",
       "tags": [
         "music",
@@ -22,10 +22,11 @@
         "multi-room",
         "queue",
         "recommendations",
-        "album-art"
+        "album-art",
+        "follow-me"
       ],
       "entry": "cores/custom_music_core.py",
-      "sha256": "d2d3c62e96817e51a5a4c3907356959ad41ea74ccbc5818420d19fe69d91a59c"
+      "sha256": "17e0eea739ea47ee7b137ee7e8eaef4bb17c819fea05925ddd9f6dbef1b3a23b"
     }
   ]
 }
