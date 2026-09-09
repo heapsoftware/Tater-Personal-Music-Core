@@ -3,12 +3,8 @@ name: Build manifests
 on:
   push:
     paths:
-      - "verba/**/*.py"
       - "cores/**/*.py"
-      - "portals/**/*.py"
-      - "tools/generate_manifest.py"
       - "tools/generate_core_manifest.py"
-      - "tools/generate_portal_manifest.py"
       - ".github/workflows/build-manifest.yml"
   workflow_dispatch:
 
@@ -27,23 +23,17 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Generate verba manifest
-        run: python tools/generate_manifest.py
-
       - name: Generate core manifest
         run: python tools/generate_core_manifest.py
 
-      - name: Generate portal manifest
-        run: python tools/generate_portal_manifest.py
-
-      - name: Commit manifests if changed
+      - name: Commit manifest if changed
         run: |
-          if git diff --quiet manifest.json core_manifest.json portal_manifest.json; then
+          if git diff --quiet core_manifest.json; then
             echo "No changes."
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add manifest.json core_manifest.json portal_manifest.json
+          git add core_manifest.json
           git commit -m "chore: update manifests"
           git push
