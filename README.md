@@ -18,7 +18,7 @@ away from the original (verified by tests).
    every core change).
 2. In Tater's **Core Shop**, add this repo's raw manifest URL as an additional
    shop repo (Core Shop → repos / `POST /api/shop/cores/repos`), e.g.
-   `https://raw.githubusercontent.com/heapsoftware/Tater_Custom_Music_Core/main/core_manifest.json`.
+   `https://raw.githubusercontent.com/heapsoftware/Tater-Custom-Music-Core/main/core_manifest.json`.
 3. Install **Custom Music Core** from the shop and enable it.
 
 Alternatively, copy `cores/custom_music_core.py` into your Tater `cores/` directory
