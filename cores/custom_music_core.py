@@ -557,13 +557,127 @@ def _context_person_id(*sources: Any) -> str:
     return ""
 
 
+# --------------------------------------------------------------------------
+# Per-person linkage. people.py exposes fixed person fields only (unknown
+# fields are stripped on save), so each Person's music setup lives in this
+# core-owned hash: person_id -> {"music_source": ..., "emby": {...}, ...}.
+# --------------------------------------------------------------------------
+
+def _person_links(client: Any = None) -> Dict[str, Dict[str, Any]]:
+    store = client or globals().get("redis_client")
+    if store is None:
+        return {}
+    links: Dict[str, Dict[str, Any]] = {}
+    try:
+        raw = store.hgetall(PERSON_LINKS_KEY) or {}
+    except Exception:
+        return {}
+    for person_id, value in raw.items():
+        try:
+            parsed = value if isinstance(value, dict) else json.loads(_text(value))
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict) and _text(person_id):
+            links[_text(person_id)] = parsed
+    return links
+
+
+def _person_link(person_id: Any, client: Any = None) -> Dict[str, Any]:
+    wanted = _text(person_id)
+    if not wanted:
+        return {}
+    return _person_links(client).get(wanted) or {}
+
+
+def _save_person_link(person_id: Any, link: Dict[str, Any], client: Any = None) -> None:
+    store = client or globals().get("redis_client")
+    wanted = _text(person_id)
+    if store is None or not wanted:
+        return
+    _save_hash(store, PERSON_LINKS_KEY, {wanted: json.dumps(link, sort_keys=True)})
+
+
+def _delete_person_link(person_id: Any, client: Any = None) -> None:
+    store = client or globals().get("redis_client")
+    wanted = _text(person_id)
+    if store is None or not wanted:
+        return
+    try:
+        store.hdel(PERSON_LINKS_KEY, wanted)
+    except Exception:
+        pass
+
+
+def _linked_person_ids(client: Any = None) -> List[str]:
+    return sorted(
+        person_id
+        for person_id, link in _person_links(client).items()
+        if _provider_id(link.get("music_source"), "") in CATALOG_PROVIDER_IDS
+    )
+
+
+def _person_link_source(link: Dict[str, Any]) -> str:
+    """Effective provider id for one person's link ("" = follow the global source)."""
+    return _provider_id(link.get("music_source"), "")
+
+
+def _scoped_key(base: str, person_id: Any) -> str:
+    """Per-person data keys; "" keeps the shared global key."""
+    wanted = _text(person_id)
+    return f"{base}:{wanted}" if wanted else base
+
+
+def _catalog_key(person_id: Any = "") -> str:
+    return _scoped_key(CATALOG_KEY, person_id)
+
+
+def _history_key(person_id: Any = "") -> str:
+    return _scoped_key(HISTORY_KEY, person_id)
+
+
+def _recommendations_key(person_id: Any = "") -> str:
+    return _scoped_key(RECOMMENDATIONS_KEY, person_id)
+
+
+def _profile_key(person_id: Any = "") -> str:
+    return _scoped_key(PROMPT_PROFILE_KEY, person_id)
+
+
+def _person_link_provider(
+    person_id: Any,
+    provider_id: Any,
+    client: Any = None,
+) -> Optional[Any]:
+    """Build a provider from one Person's link settings, if they override the source."""
+    link = _person_link(person_id, client)
+    source = _person_link_source(link)
+    if not source:
+        return None
+    if provider_id and _provider_id(provider_id) != source:
+        return None
+    values = link.get(source) if isinstance(link.get(source), dict) else {}
+    if source == "emby":
+        return EmbyMusicProvider(
+            server_url=_normalize_server_url(values.get("server_url")),
+            auth_mode="api_key" if _text(values.get("auth_mode")).casefold() == "api_key" else "user_token",
+            username=_text(values.get("username")),
+            password=_text(values.get("password")),
+            api_key=_text(values.get("api_key")),
+            user_id=_text(values.get("user_id")),
+            library_name=_text(values.get("library_name")),
+            stream_scope=_text(person_id),
+        )
+    return NetworkShareMusicProvider(root_path=_text(values.get("root_path")))
+
+
 def _provider_id(value: Any, default: str = "emby") -> str:
     token = _text(value).lower().replace("-", "_").replace(" ", "_")
     if token in {"emby"}:
         return "emby"
     if token in {"network_share", "share", "network", "smb", "nfs"}:
         return "network_share"
-    return _text(default) if _text(default) in {"emby", "network_share"} else "emby"
+    # An explicit empty default means "no fallback" for person-scoped lookups.
+    return _text(default) if _text(default) in {"", "emby", "network_share"} else "emby"
 
 
 def _decode_hash(raw: Any) -> Dict[str, str]:
@@ -1034,6 +1148,10 @@ class EmbyMusicProvider:
     api_key: str = ""
     user_id: str = ""
     library_name: str = ""
+    # Person id when this provider instance serves a linked Person's own Emby
+    # account; proxied stream routes carry the scope so the proxy attaches the
+    # right person's credentials server-side.
+    stream_scope: str = ""
     provider_id = "emby"
 
     @classmethod
@@ -1252,7 +1370,8 @@ class EmbyMusicProvider:
                 values["Static"] = "true"
             query = urlencode(values)
             return f"{self.server_url}/Audio/{quote(str(item_id), safe='')}/stream?{query}"
-        return _stream_proxy_url("emby", item_id)
+        kind = f"emby:{self.stream_scope}" if self.stream_scope else "emby"
+        return _stream_proxy_url(kind, item_id)
 
     def artwork_url(self, track: Dict[str, Any]) -> str:
         item_id = _text(track.get("artwork_item_id")) or _text(track.get("provider_track_id")) or _text(track.get("id"))
@@ -1269,7 +1388,8 @@ class EmbyMusicProvider:
                 values["tag"] = tag
             query = urlencode(values)
             return f"{self.server_url}/Items/{quote(str(item_id), safe='')}/Images/Primary?{query}"
-        return _stream_proxy_url("emby_art", item_id)
+        kind = f"emby_art:{self.stream_scope}" if self.stream_scope else "emby_art"
+        return _stream_proxy_url(kind, item_id)
 
     def catalog(self) -> Dict[str, Any]:
         view = self.music_view()
@@ -2018,7 +2138,11 @@ class NetworkShareMusicProvider:
         }
 
 
-def _provider(client: Any = None, provider_id: Any = "") -> Any:
+def _provider(client: Any = None, provider_id: Any = "", person_id: Any = "") -> Any:
+    # A linked Person plays from their own source configuration, when set.
+    linked = _person_link_provider(person_id, provider_id, client) if _text(person_id) else None
+    if linked is not None:
+        return linked
     selected = _provider_id(provider_id)
     if selected == "emby":
         return EmbyMusicProvider.from_settings(_settings(client))
@@ -2027,6 +2151,14 @@ def _provider(client: Any = None, provider_id: Any = "") -> Any:
     raise ValueError(
         f"{PROVIDER_LABELS.get(selected, selected)} support is not enabled in this build."
     )
+
+
+def _person_source_id(person_id: Any, client: Any = None) -> str:
+    """Provider id one Person resolves to (link override, else the global source)."""
+    linked = _person_link_provider(person_id, "", client) if _text(person_id) else None
+    if linked is not None:
+        return linked.provider_id
+    return _provider_id(_settings(client).get("provider"))
 
 
 def _paired(
@@ -2239,25 +2371,32 @@ def _facet_values(tracks: Iterable[Dict[str, Any]], key: str) -> List[str]:
     return sorted(values.values(), key=str.casefold)
 
 
-def _catalog(client: Any = None, provider_id: Any = "") -> Dict[str, Any]:
+def _catalog(client: Any = None, provider_id: Any = "", person_id: Any = "") -> Dict[str, Any]:
     store = client or globals().get("redis_client")
     now = time.monotonic()
+    wanted_provider = _provider_id(provider_id, "")
+    wanted_person = _text(person_id)
+    if not wanted_provider:
+        wanted_provider = (
+            _person_source_id(wanted_person, store) if wanted_person else "emby"
+        )
     with _catalog_memory_cache_lock:
         cached = _catalog_memory_cache.get("payload")
-        if (
+        cached_fresh = (
             _catalog_memory_cache.get("store") is store
             and isinstance(cached, dict)
             and now - float(_catalog_memory_cache.get("loaded_at") or 0.0)
             < CATALOG_MEMORY_CACHE_TTL_SECONDS
-        ):
-            if _provider_id(cached.get("provider")) != _provider_id(provider_id):
-                return {}
-            return cached
+        )
+        if cached_fresh and _text(_catalog_memory_cache.get("person")) == wanted_person:
+            if cached and _provider_id(cached.get("provider")) == wanted_provider:
+                return cached
+            # Mismatched or empty cached payload: fall through and reload.
 
-        payload = _load_json(store, CATALOG_KEY, {})
+        payload = _load_json(store, _catalog_key(wanted_person), {})
         if not isinstance(payload, dict):
             payload = {}
-        if _provider_id(payload.get("provider")) != _provider_id(provider_id):
+        if _provider_id(payload.get("provider")) != wanted_provider:
             payload = {}
         for track in payload.get("tracks") or []:
             if isinstance(track, dict):
@@ -2268,16 +2407,20 @@ def _catalog(client: Any = None, provider_id: Any = "") -> Dict[str, Any]:
         if isinstance(payload.get("tracks"), list):
             payload["genres"] = _facet_values(payload["tracks"], "genres")
         _catalog_memory_cache.update(
-            {"store": store, "loaded_at": now, "payload": payload}
+            {"store": store, "loaded_at": now, "payload": payload, "person": wanted_person}
         )
         return payload
 
 
-def _catalog_needs_artwork_refresh(client: Any = None, provider_id: Any = "") -> bool:
+def _catalog_needs_artwork_refresh(
+    client: Any = None,
+    provider_id: Any = "",
+    person_id: Any = "",
+) -> bool:
     store = client or globals().get("redis_client")
     # The core loop checks this every second. Reuse the in-process catalog so a
     # multi-megabyte library is not decoded from Redis on every heartbeat.
-    payload = _catalog(store, provider_id)
+    payload = _catalog(store, provider_id, person_id)
     if not isinstance(payload, dict) or not payload:
         return True
     return (
@@ -2286,10 +2429,14 @@ def _catalog_needs_artwork_refresh(client: Any = None, provider_id: Any = "") ->
     )
 
 
-def _sync_catalog_impl(client: Any = None, provider_id: Any = "") -> Dict[str, Any]:
+def _sync_catalog_impl(
+    client: Any = None,
+    provider_id: Any = "",
+    person_id: Any = "",
+) -> Dict[str, Any]:
     store = client or globals().get("redis_client")
-    selected = _provider_id(provider_id)
-    provider = _provider(store, selected)
+    selected = _provider_id(provider_id, "") or _person_source_id(person_id, store)
+    provider = _provider(store, selected, person_id)
     if not provider.connected:
         raise ValueError(
             f"Connect {PROVIDER_LABELS.get(selected, selected)} before syncing its music library."
@@ -2323,40 +2470,46 @@ def _sync_catalog_impl(client: Any = None, provider_id: Any = "") -> Dict[str, A
         "libraries": raw.get("libraries") if isinstance(raw, dict) and isinstance(raw.get("libraries"), dict) else {},
         "synced_at": time.time(),
     }
-    _save_json(store, CATALOG_KEY, payload)
+    _save_json(store, _catalog_key(person_id), payload)
     with _catalog_memory_cache_lock:
         _catalog_memory_cache.update(
             {
                 "store": store,
                 "loaded_at": time.monotonic(),
                 "payload": payload,
+                "person": _text(person_id),
             }
         )
-    _save_hash(
-        store,
-        RUNTIME_KEY,
-        {
-            "status": "connected",
-            "provider": selected,
-            "last_sync_at": payload["synced_at"],
-            "last_error": "",
-            "track_count": len(tracks),
-            "artist_count": len(artists),
-            "album_count": len(albums),
-            "genre_count": len(genres),
-        },
-    )
+    if not _text(person_id):
+        _save_hash(
+            store,
+            RUNTIME_KEY,
+            {
+                "status": "connected",
+                "provider": selected,
+                "last_sync_at": payload["synced_at"],
+                "last_error": "",
+                "track_count": len(tracks),
+                "artist_count": len(artists),
+                "album_count": len(albums),
+                "genre_count": len(genres),
+            },
+        )
     return payload
 
 
-def _sync_catalog(client: Any = None, provider_id: Any = "") -> Dict[str, Any]:
+def _sync_catalog(
+    client: Any = None,
+    provider_id: Any = "",
+    person_id: Any = "",
+) -> Dict[str, Any]:
     global _catalog_sync_started_at
     if not _catalog_sync_lock.acquire(blocking=False):
         raise RuntimeError("Music library sync is already running.")
     store = client or globals().get("redis_client")
     _catalog_sync_started_at = time.time()
     try:
-        payload = _sync_catalog_impl(store, provider_id)
+        payload = _sync_catalog_impl(store, provider_id, person_id)
         finished_at = time.time()
         runtime = _runtime(store)
         _save_hash(
@@ -2462,8 +2615,9 @@ def _search_tracks(
     limit: int = MAX_SEARCH_RESULTS,
     client: Any = None,
     provider_id: Any = "",
+    person_id: Any = "",
 ) -> List[Dict[str, Any]]:
-    payload = _catalog(client, provider_id)
+    payload = _catalog(client, provider_id, person_id)
     tracks = payload.get("tracks") if isinstance(payload.get("tracks"), list) else []
     filters = {
         "query": _text(query),
@@ -2612,9 +2766,9 @@ def _persist_shared_player_volume(
     return volume
 
 
-def _listening_history(client: Any = None) -> List[Dict[str, Any]]:
+def _listening_history(client: Any = None, person_id: Any = "") -> List[Dict[str, Any]]:
     store = client or globals().get("redis_client")
-    payload = _load_json(store, HISTORY_KEY, [])
+    payload = _load_json(store, _history_key(person_id), [])
     if not isinstance(payload, list):
         return []
     return [dict(row) for row in payload if isinstance(row, dict)]
@@ -2682,7 +2836,7 @@ def _record_listening_history(
         return
     selected_person_id = _text(person_id) or _text(_settings(store).get("prompt_person_id"))
     now = time.time()
-    history = _listening_history(store)
+    history = _listening_history(store, selected_person_id)
     if history:
         latest = history[-1]
         if (
@@ -2706,19 +2860,19 @@ def _record_listening_history(
             "played_at": now,
         }
     )
-    _save_json(store, HISTORY_KEY, history[-MAX_HISTORY_EVENTS:])
+    _save_json(store, _history_key(selected_person_id), history[-MAX_HISTORY_EVENTS:])
     _publish_music_activity(track, client=store)
 
 
-def _recommendations(client: Any = None) -> Dict[str, Any]:
+def _recommendations(client: Any = None, person_id: Any = "") -> Dict[str, Any]:
     store = client or globals().get("redis_client")
-    payload = _load_json(store, RECOMMENDATIONS_KEY, {})
+    payload = _load_json(store, _recommendations_key(person_id), {})
     return payload if isinstance(payload, dict) else {}
 
 
-def _music_prompt_profile(client: Any = None) -> Dict[str, Any]:
+def _music_prompt_profile(client: Any = None, person_id: Any = "") -> Dict[str, Any]:
     store = client or globals().get("redis_client")
-    payload = _load_json(store, PROMPT_PROFILE_KEY, {})
+    payload = _load_json(store, _profile_key(person_id), {})
     return payload if isinstance(payload, dict) else {}
 
 
@@ -2732,7 +2886,7 @@ def _profile_history(
     selected_provider = _provider_id(provider_id)
     return [
         row
-        for row in _listening_history(client)
+        for row in _listening_history(client, selected_person)
         if _provider_id(row.get("provider")) == selected_provider
         and (not _text(row.get("person_id")) or _text(row.get("person_id")) == selected_person)
     ]
@@ -2930,16 +3084,17 @@ def _generate_music_prompt_profile_impl(
     loop: asyncio.AbstractEventLoop,
     llm_client: Any,
     client: Any = None,
+    person_id: Any = "",
 ) -> Dict[str, Any]:
     store = client or globals().get("redis_client")
     cfg = _settings(store)
-    person_id = _text(cfg.get("prompt_person_id"))
+    person_id = _text(person_id) or _text(cfg.get("prompt_person_id"))
     if not person_id:
         raise ValueError("Choose a Person in Custom Music Core Settings before building music prompt context.")
     person_name = _people_person_name(person_id, store)
     if not person_name:
         raise ValueError("The selected Custom Music Core Person no longer exists.")
-    provider_id = _provider_id(cfg.get("provider"))
+    provider_id = _person_source_id(person_id, store)
     history = _profile_history(store, person_id=person_id, provider_id=provider_id)
     if not history:
         raise ValueError(f"Play some music for {person_name} before building a music profile.")
@@ -3013,7 +3168,7 @@ def _generate_music_prompt_profile_impl(
         "favorite_genres": favorite_genres,
         "recent_tracks": recent_tracks,
     }
-    _save_json(store, PROMPT_PROFILE_KEY, profile)
+    _save_json(store, _profile_key(person_id), profile)
     return profile
 
 
@@ -3022,6 +3177,7 @@ def _generate_music_prompt_profile(
     *,
     loop: Optional[asyncio.AbstractEventLoop] = None,
     llm_client: Any = None,
+    person_id: Any = "",
 ) -> Dict[str, Any]:
     global _profile_started_at
     if not _profile_lock.acquire(blocking=False):
@@ -3034,7 +3190,20 @@ def _generate_music_prompt_profile(
         asyncio.set_event_loop(active_loop)
     try:
         model = llm_client if llm_client is not None else _get_primary_llm_client_from_env()
-        profile = _generate_music_prompt_profile_impl(active_loop, model, store)
+        profile = _generate_music_prompt_profile_impl(active_loop, model, store, person_id)
+        # Linked People get their own prompt-ready profile from their own
+        # history; one Person's failure never blocks the others.
+        for linked_id in _linked_person_ids(store):
+            if _text(person_id) and linked_id != _text(person_id):
+                continue
+            try:
+                _generate_music_prompt_profile_impl(active_loop, model, store, linked_id)
+            except Exception as exc:
+                logger.warning(
+                    "[Music] prompt profile for %s failed: %s",
+                    _people_person_name(linked_id, store) or linked_id,
+                    exc,
+                )
         finished_at = time.time()
         runtime = _runtime(store)
         _save_hash(
@@ -3139,12 +3308,19 @@ def get_hydra_system_prompt_fragments(
         return {}
     configured_person_id = _text(cfg.get("prompt_person_id"))
     active_person_id = _context_person_id(origin, memory_context, personal_context)
-    if not configured_person_id or active_person_id != configured_person_id:
+    if active_person_id and _music_prompt_profile(store, active_person_id):
+        # Linked People read their own scoped profile, whoever is configured.
+        profile = _music_prompt_profile(store, active_person_id)
+        configured_person_id = active_person_id
+    else:
+        if not configured_person_id or active_person_id != configured_person_id:
+            return {}
+        profile = _music_prompt_profile(store)
+    if not profile:
         return {}
-    profile = _music_prompt_profile(store)
     if (
         _text(profile.get("person_id")) != configured_person_id
-        or _provider_id(profile.get("provider")) != _provider_id(cfg.get("provider"))
+        or _provider_id(profile.get("provider")) != _person_source_id(configured_person_id, store)
     ):
         return {}
     live_recent_tracks = []
@@ -3153,7 +3329,7 @@ def get_hydra_system_prompt_fragments(
         _profile_history(
             store,
             person_id=configured_person_id,
-            provider_id=cfg.get("provider"),
+            provider_id=_person_source_id(configured_person_id, store),
         )
     ):
         title = _text(event.get("title"))
@@ -3182,26 +3358,29 @@ def _generate_recommendations_impl(
     loop: asyncio.AbstractEventLoop,
     llm_client: Any,
     client: Any = None,
+    person_id: Any = "",
 ) -> Dict[str, Any]:
     store = client or globals().get("redis_client")
     assistant_name = _assistant_first_name(store)
     recommendations_label = _recommendations_label(store)
     cfg = _settings(store)
-    provider_id = _provider_id(cfg.get("provider"))
+    person_id = _text(person_id) or _text(cfg.get("prompt_person_id"))
+    provider_id = _person_source_id(person_id, store)
     if provider_id not in CATALOG_PROVIDER_IDS:
         raise ValueError(f"{recommendations_label} require a catalog-based music provider.")
-    if not _paired(cfg, provider_id):
+    provider = _provider(store, provider_id, person_id)
+    if not provider.connected:
         raise ValueError(f"Connect {PROVIDER_LABELS[provider_id]} before making recommendations.")
     history = [
         row
-        for row in _listening_history(store)
+        for row in _listening_history(store, person_id)
         if _provider_id(row.get("provider")) == provider_id
     ]
     if not history:
         raise ValueError(f"Play at least one song before asking {assistant_name} for recommendations.")
-    catalog = _catalog(store, provider_id)
+    catalog = _catalog(store, provider_id, person_id)
     if not (catalog.get("tracks") or []):
-        catalog = _sync_catalog(store, provider_id)
+        catalog = _sync_catalog(store, provider_id, person_id)
     candidates, candidate_map = _recommendation_candidates(catalog, history)
     if not candidates:
         raise ValueError("The active music library has no recommendation candidates.")
@@ -3310,13 +3489,14 @@ def _generate_recommendations_impl(
     now = time.time()
     published = {
         "provider": provider_id,
+        "person_id": person_id,
         "generated_at": now,
         "summary": _text(result.get("summary"))[:500]
         or f"{assistant_name} made a few fresh mixes from what has been playing lately.",
         "history_event_count": len(history),
         "playlists": playlists,
     }
-    _save_json(store, RECOMMENDATIONS_KEY, published)
+    _save_json(store, _recommendations_key(person_id), published)
     _save_hash(
         store,
         RUNTIME_KEY,
@@ -3335,6 +3515,7 @@ def _generate_recommendations(
     *,
     loop: Optional[asyncio.AbstractEventLoop] = None,
     llm_client: Any = None,
+    person_id: Any = "",
 ) -> Dict[str, Any]:
     global _recommendation_started_at
     if not _recommendation_lock.acquire(blocking=False):
@@ -3347,7 +3528,21 @@ def _generate_recommendations(
         asyncio.set_event_loop(active_loop)
     try:
         model = llm_client if llm_client is not None else _get_primary_llm_client_from_env()
-        result = _generate_recommendations_impl(active_loop, model, store)
+        result = _generate_recommendations_impl(active_loop, model, store, person_id)
+        # Every Person with a linked music source gets their own mixes from
+        # their own listening history. Failures for one Person never block the
+        # rest; the primary result above is still reported.
+        for linked_id in _linked_person_ids(store):
+            if _text(person_id) and linked_id != _text(person_id):
+                continue
+            try:
+                _generate_recommendations_impl(active_loop, model, store, linked_id)
+            except Exception as exc:
+                logger.warning(
+                    "[Music] recommendations for %s failed: %s",
+                    _people_person_name(linked_id, store) or linked_id,
+                    exc,
+                )
         finished_at = time.time()
         runtime = _runtime(store)
         _save_hash(
@@ -5294,10 +5489,11 @@ def _validate_catalog_provider_targets(targets: Any) -> None:
 
 def _play_request(args: Dict[str, Any], origin: Optional[Dict[str, Any]], client: Any) -> Dict[str, Any]:
     cfg = _settings(client)
-    selected_provider = _provider_id(args.get("provider"), _provider_id(cfg.get("provider")))
-    catalog = _catalog(client, selected_provider)
+    person_id = _context_person_id(origin) or _text(cfg.get("prompt_person_id"))
+    selected_provider = _person_source_id(person_id, client)
+    catalog = _catalog(client, selected_provider, person_id)
     if not isinstance(catalog.get("tracks"), list) or not catalog.get("tracks"):
-        catalog = _sync_catalog(client, selected_provider)
+        catalog = _sync_catalog(client, selected_provider, person_id)
     query = _text(args.get("query") or args.get("music"))
     title = _text(args.get("title") or args.get("track") or args.get("song"))
     artist = _text(args.get("artist"))
@@ -5312,6 +5508,7 @@ def _play_request(args: Dict[str, Any], origin: Optional[Dict[str, Any]], client
         limit=_as_int(cfg.get("maximum_queue_tracks"), 200, 1, 1000),
         client=client,
         provider_id=selected_provider,
+        person_id=person_id,
     )
     requested_targets = (
         args.get("targets")
@@ -5433,6 +5630,9 @@ async def run_hydra_kernel_tool(
 ) -> Optional[Dict[str, Any]]:
     store = redis_client or globals().get("redis_client")
     values = args if isinstance(args, dict) else {}
+    # Catalog/history/recommendation scope follows the speaking Person so a
+    # linked Person browses and plays their own source by default.
+    active_person_id = _context_person_id(origin)
     if tool_id == "custom_music_play":
         try:
             return await asyncio.to_thread(_play_request, values, origin, store)
@@ -5444,13 +5644,9 @@ async def run_hydra_kernel_tool(
             }
     if tool_id == "custom_music_search":
         try:
-            cfg = _settings(store)
-            selected_provider = _provider_id(
-                values.get("provider"),
-                _provider_id(cfg.get("provider")),
-            )
-            if not (_catalog(store, selected_provider).get("tracks") or []):
-                await asyncio.to_thread(_sync_catalog, store, selected_provider)
+            selected_provider = _person_source_id(active_person_id, store)
+            if not (_catalog(store, selected_provider, active_person_id).get("tracks") or []):
+                await asyncio.to_thread(_sync_catalog, store, selected_provider, active_person_id)
             matches = _search_tracks(
                 query=values.get("query"),
                 title=values.get("title") or values.get("track") or values.get("song"),
@@ -5460,6 +5656,7 @@ async def run_hydra_kernel_tool(
                 limit=_as_int(values.get("limit"), 10, 1, 50),
                 client=store,
                 provider_id=selected_provider,
+                person_id=active_person_id,
             )
             public = [_public_track(track) for track in matches]
             return {
@@ -5572,13 +5769,12 @@ async def run_hydra_kernel_tool(
             ),
         }
     if tool_id == "custom_music_browse":
-        selected_provider = _provider_id(
-            values.get("provider"),
-            _provider_id(_settings(store).get("provider")),
-        )
-        catalog = _catalog(store, selected_provider)
+        selected_provider = _person_source_id(active_person_id, store)
+        catalog = _catalog(store, selected_provider, active_person_id)
         if not (catalog.get("tracks") or []):
-            catalog = await asyncio.to_thread(_sync_catalog, store, selected_provider)
+            catalog = await asyncio.to_thread(
+                _sync_catalog, store, selected_provider, active_person_id
+            )
         category = _text(values.get("category") or "genres").lower()
         limit = _as_int(values.get("limit"), 50, 1, 200)
         if category == "tracks":
@@ -6947,6 +7143,195 @@ def _recommendation_ui_items(
     return items
 
 
+def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
+    """Per-Person source links shown in the core tab's People section."""
+    items: List[Dict[str, Any]] = []
+    person_options = _people_person_options(store)
+    if len(person_options) <= 1:
+        return items
+    linked_ids = set(_person_links(store))
+    for person_id, link in sorted(_person_links(store).items()):
+        name = _people_person_name(person_id, store) or person_id
+        source = _person_link_source(link)
+        values = link.get(source) if isinstance(link.get(source), dict) else {}
+        items.append(
+            {
+                "id": f"person:{person_id}",
+                "group": "people",
+                "title": name,
+                "subtitle": (
+                    f"Plays from {PROVIDER_LABELS[source]}" if source else "Uses the global music source"
+                ),
+                "detail": _text(values.get("server_url")) or _text(values.get("root_path")),
+                "hero_badges": [
+                    {
+                        "label": PROVIDER_LABELS.get(source, "GLOBAL").upper(),
+                        "tone": "good" if source else "muted",
+                    }
+                ],
+                "fields": [
+                    {
+                        "key": "person_link_person_id",
+                        "type": "text",
+                        "value": person_id,
+                        "hidden": True,
+                    },
+                    {
+                        "key": "person_link_source",
+                        "label": "Music Source",
+                        "type": "select",
+                        "value": source,
+                        "options": [
+                            {"value": "", "label": "Use the global music source"},
+                            {"value": "emby", "label": "Emby (own user/library)"},
+                            {"value": "network_share", "label": "Network share (own folder)"},
+                        ],
+                    },
+                    {
+                        "key": "person_link_emby_server_url",
+                        "label": "Emby Server URL",
+                        "type": "text",
+                        "value": _text(values.get("server_url")),
+                        "placeholder": "http://emby.local:8096",
+                    },
+                    {
+                        "key": "person_link_emby_username",
+                        "label": "Emby Username",
+                        "type": "text",
+                        "value": _text(values.get("username")),
+                    },
+                    {
+                        "key": "person_link_emby_password",
+                        "label": "Emby Password",
+                        "type": "password",
+                        "value": "",
+                        "description": "Leave blank to keep the saved password.",
+                    },
+                    {
+                        "key": "person_link_emby_api_key",
+                        "label": "Emby API Key",
+                        "type": "password",
+                        "value": _text(values.get("api_key")),
+                    },
+                    {
+                        "key": "person_link_emby_user_id",
+                        "label": "Emby User ID (optional)",
+                        "type": "text",
+                        "value": _text(values.get("user_id")),
+                    },
+                    {
+                        "key": "person_link_emby_library_name",
+                        "label": "Emby Library Name (optional)",
+                        "type": "text",
+                        "value": _text(values.get("library_name")),
+                    },
+                    {
+                        "key": "person_link_share_root_path",
+                        "label": "Mounted Share Folder",
+                        "type": "text",
+                        "value": _text(values.get("root_path")),
+                        "placeholder": "/mnt/music/<person>",
+                        "description": (
+                            "Folder path of this Person's own share subfolder as mounted on the Tater host."
+                        ),
+                    },
+                ],
+                "save_action": "music_person_link_save",
+                "save_label": "Save Person Link",
+                "actions": [
+                    {
+                        "action": "music_person_link_remove",
+                        "label": "Remove Link",
+                        "tone": "danger",
+                        "confirm": f"Remove {name}'s personal music link? Their library and history stay until removed.",
+                    }
+                ],
+            }
+        )
+    unlinked = [
+        option
+        for option in person_options
+        if option.get("value") and option["value"] not in linked_ids
+    ]
+    if unlinked:
+        items.append(
+            {
+                "id": "person:new",
+                "group": "people",
+                "title": "Link a Person",
+                "subtitle": "Give one Person their own music source, library, and listening history.",
+                "detail": "Choose a Person, pick a source, and fill in that source's details.",
+                "hero_badges": [{"label": "NEW LINK", "tone": "muted"}],
+                "fields": [
+                    {
+                        "key": "person_link_person_id",
+                        "label": "Person",
+                        "type": "select",
+                        "value": "",
+                        "options": unlinked,
+                    },
+                    {
+                        "key": "person_link_source",
+                        "label": "Music Source",
+                        "type": "select",
+                        "value": "emby",
+                        "options": [
+                            {"value": "emby", "label": "Emby (own user/library)"},
+                            {"value": "network_share", "label": "Network share (own folder)"},
+                        ],
+                    },
+                    {
+                        "key": "person_link_emby_server_url",
+                        "label": "Emby Server URL",
+                        "type": "text",
+                        "value": _text(cfg.get("emby_server_url") or cfg.get("server_url")),
+                        "placeholder": "http://emby.local:8096",
+                    },
+                    {
+                        "key": "person_link_emby_username",
+                        "label": "Emby Username",
+                        "type": "text",
+                        "value": "",
+                    },
+                    {
+                        "key": "person_link_emby_password",
+                        "label": "Emby Password",
+                        "type": "password",
+                        "value": "",
+                    },
+                    {
+                        "key": "person_link_emby_api_key",
+                        "label": "Emby API Key",
+                        "type": "password",
+                        "value": "",
+                    },
+                    {
+                        "key": "person_link_emby_user_id",
+                        "label": "Emby User ID (optional)",
+                        "type": "text",
+                        "value": "",
+                    },
+                    {
+                        "key": "person_link_emby_library_name",
+                        "label": "Emby Library Name (optional)",
+                        "type": "text",
+                        "value": "",
+                    },
+                    {
+                        "key": "person_link_share_root_path",
+                        "label": "Mounted Share Folder",
+                        "type": "text",
+                        "value": "",
+                        "placeholder": "/mnt/music/<person>",
+                    },
+                ],
+                "save_action": "music_person_link_save",
+                "save_label": "Link Person",
+            }
+        )
+    return items
+
+
 def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
     store = redis_client or globals().get("redis_client")
     assistant_name = _assistant_first_name(store)
@@ -7047,6 +7432,7 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
     item_forms.extend(_facet_items(catalog, "artists", "Artist"))
     item_forms.extend(_facet_items(catalog, "albums", "Album"))
     item_forms.extend(_provider_cards(cfg, catalog, active_provider))
+    item_forms.extend(_person_link_items(cfg, store))
     item_forms.extend(
         [
             {
@@ -7390,6 +7776,13 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
                 },
                 {"key": "providers", "label": "Sources", "source": "items", "item_group": "providers"},
                 {
+                    "key": "people",
+                    "label": "People",
+                    "source": "items",
+                    "item_group": "people",
+                    "empty_message": "Link a Person to give them their own music source and history.",
+                },
+                {
                     "key": "airplay",
                     "label": "AirPlay",
                     "source": "items",
@@ -7419,6 +7812,51 @@ def _provider_from_card(payload: Dict[str, Any], fallback: Any = "") -> str:
     if candidate not in PROVIDER_LABELS:
         raise ValueError("Unknown music source.")
     return candidate
+
+
+def _save_person_link_action(values: Dict[str, Any], store: Any) -> Dict[str, Any]:
+    person_id = _text(values.get("person_link_person_id"))
+    if not person_id:
+        raise ValueError("Choose which Person this music source belongs to.")
+    name = _people_person_name(person_id, store)
+    if not name:
+        raise ValueError("That Person no longer exists. Re-check Tater's People settings.")
+    source = _person_link_source({"music_source": values.get("person_link_source")})
+    existing = _person_link(person_id, store)
+    existing_values = (
+        existing.get(source) if isinstance(existing.get(source), dict) else {}
+    ) if source else {}
+    link: Dict[str, Any] = {"music_source": source}
+    if source:
+        if source == "emby":
+            password = _text(values.get("person_link_emby_password")) or _text(
+                existing_values.get("password")
+            )
+            link["emby"] = {
+                "server_url": _normalize_server_url(values.get("person_link_emby_server_url")),
+                "auth_mode": "api_key"
+                if _text(values.get("person_link_emby_api_key"))
+                and not _text(values.get("person_link_emby_username"))
+                else "user_token",
+                "username": _text(values.get("person_link_emby_username")),
+                "password": password,
+                "api_key": _text(values.get("person_link_emby_api_key")),
+                "user_id": _text(values.get("person_link_emby_user_id")),
+                "library_name": _text(values.get("person_link_emby_library_name")),
+            }
+        else:
+            link["network_share"] = {
+                "root_path": _text(values.get("person_link_share_root_path")),
+            }
+    _save_person_link(person_id, link, store)
+    sync_note = ""
+    if source:
+        try:
+            catalog = _sync_catalog(store, source, person_id)
+            sync_note = f" Loaded {len(catalog.get('tracks') or [])} of {name}'s tracks."
+        except Exception as exc:
+            sync_note = f" Their library did not load yet: {_text(exc)}"
+    return {"ok": True, "message": f"Saved {name}'s music link.{sync_note}"}
 
 
 def _connect_provider(
@@ -7653,6 +8091,27 @@ def handle_htmlui_tab_action(
 
     if action_name in {"music_disconnect", "music_provider_disconnect"}:
         return _disconnect_provider(_provider_from_card(body), store)
+
+    if action_name == "music_person_link_save":
+        return _save_person_link_action(values, store)
+
+    if action_name == "music_person_link_remove":
+        person_id = _text(values.get("person_link_person_id"))
+        if not person_id:
+            person_id = _text(body.get("id")).replace("person:", "")
+        name = _people_person_name(person_id, store) or person_id
+        _delete_person_link(person_id, store)
+        for clear_key in (
+            _catalog_key(person_id),
+            _history_key(person_id),
+            _recommendations_key(person_id),
+            _profile_key(person_id),
+        ):
+            try:
+                store.delete(clear_key)
+            except Exception:
+                pass
+        return {"ok": True, "message": f"Removed {name}'s personal music link."}
 
     if action_name == "music_sync_now":
         selected_provider = _provider_id(_settings(store).get("provider"))
@@ -8471,16 +8930,25 @@ def _emby_upstream_request(
     item_id: str,
     *,
     sync: bool = False,
+    person_id: Any = "",
 ) -> tuple[str, Dict[str, str]]:
     """Build (url, headers) for proxying one Emby stream or artwork request."""
-    if kind not in ("emby", "emby_art"):
+    base_kind, _, scope = kind.partition(":")
+    if base_kind not in ("emby", "emby_art"):
         raise LookupError("Unknown stream request.")
-    provider = EmbyMusicProvider.from_settings(_settings())
+    if not scope:
+        scope = _text(person_id)
+    if scope:
+        provider = _person_link_provider(scope, "emby")
+        if provider is None:
+            provider = EmbyMusicProvider.from_settings(_settings())
+    else:
+        provider = EmbyMusicProvider.from_settings(_settings())
     if not provider.connected:
         raise RuntimeError("Emby is not connected.")
     params: Dict[str, Any] = {}
     headers = {"Accept": "*/*"}
-    if kind == "emby":
+    if base_kind == "emby":
         if sync:
             # Mixed Tater satellite + Sonos/AirPlay groups share one normalized
             # PCM source so every target can stay clock-aligned.
@@ -8604,7 +9072,12 @@ class _MusicStreamHandler(BaseHTTPRequestHandler):
                 key.casefold() == "sync" and _text(value) not in {"0", "false", "no"}
                 for key, value in parse_qsl(parsed.query)
             )
-            upstream_url, headers = _emby_upstream_request(kind, item_id, sync=sync)
+            upstream_url, headers = _emby_upstream_request(
+                kind,
+                item_id,
+                sync=sync,
+                person_id=kind.partition(":")[2],
+            )
             forward_headers = {
                 key.title(): value
                 for key, value in (
@@ -8776,7 +9249,20 @@ def run(stop_event: Optional[object] = None) -> None:
             cfg = _settings()
             _configure_external_audio(cfg, _player())
             active_provider = _provider_id(cfg.get("provider"))
-            if not _paired(cfg, active_provider):
+            linked_person_ids = _linked_person_ids()
+
+            def _any_source_connected() -> bool:
+                if _paired(cfg, active_provider):
+                    return True
+                for pid in linked_person_ids:
+                    try:
+                        if _provider(None, "", pid).connected:
+                            return True
+                    except Exception:
+                        continue
+                return False
+
+            if not _any_source_connected():
                 _save_hash(redis_client, RUNTIME_KEY, {"status": "waiting_for_pairing"})
                 time.sleep(1.0)
                 continue
@@ -8809,6 +9295,24 @@ def run(stop_event: Optional[object] = None) -> None:
                 ):
                     _sync_catalog(provider_id=active_provider)
                     runtime = _runtime()
+                # Linked People refresh their own catalogs on the same cadence.
+                for pid in linked_person_ids:
+                    try:
+                        person_payload = _catalog(person_id=pid)
+                        person_provider = _person_source_id(pid)
+                        person_synced = _as_float(person_payload.get("synced_at"))
+                        if (
+                            _provider_id(person_payload.get("provider"), "") != person_provider
+                            or not person_synced
+                            or now - person_synced >= interval
+                        ):
+                            _sync_catalog(provider_id=person_provider, person_id=pid)
+                    except Exception as exc:
+                        logger.warning(
+                            "[Music] library sync for %s failed: %s",
+                            _people_person_name(pid) or pid,
+                            exc,
+                        )
                 _advance_finished_player()
                 _schedule_continuation_refresh()
                 recommendation_interval = (

@@ -6,6 +6,7 @@ running Tater.
 """
 
 import importlib.util
+import json
 import os
 import struct
 import sys
@@ -249,7 +250,7 @@ class CustomMusicCoreTests(unittest.TestCase):
                 }
 
         original_provider = self.core._provider
-        self.core._provider = lambda client=None, provider_id="": FakeEmbyProvider()
+        self.core._provider = lambda client=None, provider_id="", person_id="": FakeEmbyProvider()
         try:
             payload = self.core._sync_catalog()
             self.assertEqual(payload["provider"], "emby")
@@ -274,7 +275,9 @@ class CustomMusicCoreTests(unittest.TestCase):
             self.core._record_listening_history(
                 track, ["voice_core:native:kitchen"], person_id="person_abc"
             )
-            history = self.core._listening_history()
+            # History is stored per person under a scoped key.
+            history = self.core._listening_history(person_id="person_abc")
+            self.assertEqual(self.core._listening_history(), [])
             self.assertEqual(len(history), 1)
             self.assertEqual(history[0]["person_id"], "person_abc")
             self.assertEqual(history[0]["provider"], "emby")
@@ -285,7 +288,7 @@ class CustomMusicCoreTests(unittest.TestCase):
             self.core._record_listening_history(
                 track, ["voice_core:native:kitchen"], person_id="person_abc"
             )
-            self.assertEqual(len(self.core._listening_history()), 1)
+            self.assertEqual(len(self.core._listening_history(person_id="person_abc")), 1)
         finally:
             self.core._provider = original_provider
 
@@ -742,6 +745,190 @@ class NetworkShareProviderTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertNotIn("share_root_path", self.redis.hgetall(self.core.SETTINGS_KEY))
         self.assertEqual(self.core._catalog(provider_id="network_share"), {})
+
+
+class PerPersonLinkageTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.core = load_custom_music_core()
+
+    def setUp(self):
+        self.redis = FakeRedis()
+        self.core.redis_client = self.redis
+        self.core._shutdown_stream_server()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.share_root = os.path.join(self._tmp.name, "music")
+        os.makedirs(self.share_root, exist_ok=True)
+        ShareFixture(self.share_root).write_library()
+
+    def tearDown(self):
+        self.core._shutdown_stream_server()
+        self._tmp.cleanup()
+
+    def link_person(self, person_id="person_zoe", root=None):
+        self.redis.hset(
+            self.core.PERSON_LINKS_KEY,
+            mapping={
+                person_id: json.dumps(
+                    {
+                        "music_source": "network_share",
+                        "network_share": {"root_path": root or self.share_root},
+                    }
+                )
+            },
+        )
+
+    def test_person_link_storage_round_trip(self):
+        self.link_person()
+        link = self.core._person_link("person_zoe", self.redis)
+        self.assertEqual(self.core._person_link_source(link), "network_share")
+        self.assertEqual(self.core._linked_person_ids(self.redis), ["person_zoe"])
+        self.assertEqual(self.core._linked_person_ids(self.redis), ["person_zoe"])
+        self.core._delete_person_link("person_zoe", self.redis)
+        self.assertEqual(self.core._linked_person_ids(self.redis), [])
+
+    def test_person_link_overrides_provider_and_catalog_key(self):
+        self.link_person()
+        provider = self.core._provider(self.redis, "network_share", "person_zoe")
+        self.assertIsInstance(provider, self.core.NetworkShareMusicProvider)
+        self.assertEqual(provider.root_path, self.share_root)
+        # A different provider request for that person does not get the link.
+        self.assertEqual(self.core._provider(self.redis, "emby", "person_zoe").provider_id, "emby")
+        # Without a link the global settings decide.
+        self.assertEqual(self.core._person_source_id("", self.redis), "emby")
+        self.assertEqual(self.core._person_source_id("person_zoe", self.redis), "network_share")
+
+    def test_person_scoped_catalog_and_history(self):
+        self.link_person()
+        payload = self.core._sync_catalog(provider_id="network_share", person_id="person_zoe")
+        self.assertEqual(payload["provider"], "network_share")
+        self.assertEqual(len(payload["tracks"]), 6)
+        # Global catalog stays empty; both live under distinct scoped keys.
+        self.assertEqual(self.core._catalog(), {})
+        self.assertEqual(len(self.core._catalog(person_id="person_zoe")["tracks"]), 6)
+        self.assertEqual(
+            self.core._catalog_key("person_zoe"),
+            "custom_music_core:catalog:v1:person_zoe",
+        )
+        track = dict(payload["tracks"][0])
+        self.core._record_listening_history(
+            track, ["voice_core:native:kitchen"], person_id="person_zoe", client=self.redis
+        )
+        self.assertEqual(len(self.core._listening_history(self.redis, "person_zoe")), 1)
+        self.assertEqual(self.core._listening_history(self.redis), [])
+
+    def test_link_save_and_remove_actions(self):
+        people = types.SimpleNamespace(
+            load_store=lambda _client=None: {
+                "people": [{"id": "person_zoe", "display_name": "Zoe"}]
+            }
+        )
+        original_people = self.core._PEOPLE_API_MODULE
+        self.core._PEOPLE_API_MODULE = people
+        try:
+            result = self.core._save_person_link_action(
+                {
+                    "person_link_person_id": "person_zoe",
+                    "person_link_source": "network_share",
+                    "person_link_share_root_path": self.share_root,
+                },
+                self.redis,
+            )
+            self.assertTrue(result["ok"])
+            self.assertIn("6", result["message"])  # track count from the sync
+            link = self.core._person_link("person_zoe", self.redis)
+            self.assertEqual(link["network_share"]["root_path"], self.share_root)
+
+            # Blank password keeps the saved one; emby link shape is right.
+            self.core._save_person_link_action(
+                {
+                    "person_link_person_id": "person_zoe",
+                    "person_link_source": "emby",
+                    "person_link_emby_server_url": "http://emby.local:8096",
+                    "person_link_emby_username": "zoe",
+                    "person_link_emby_password": "pw",
+                },
+                self.redis,
+            )
+            link = self.core._person_link("person_zoe", self.redis)
+            self.assertEqual(link["music_source"], "emby")
+            self.assertEqual(link["emby"]["password"], "pw")
+            self.core._save_person_link_action(
+                {
+                    "person_link_person_id": "person_zoe",
+                    "person_link_source": "emby",
+                    "person_link_emby_server_url": "http://emby.local:8096",
+                    "person_link_emby_username": "zoe",
+                },
+                self.redis,
+            )
+            link = self.core._person_link("person_zoe", self.redis)
+            self.assertEqual(link["emby"]["password"], "pw")
+
+            # Remove clears the link and every scoped data key.
+            self.redis.set(self.core._catalog_key("person_zoe"), "{}")
+            self.redis.set(self.core._history_key("person_zoe"), "[]")
+            result = self.core.handle_htmlui_tab_action(
+                action="music_person_link_remove",
+                payload={"values": {"person_link_person_id": "person_zoe"}},
+                redis_client=self.redis,
+            )
+            self.assertTrue(result["ok"])
+            self.assertEqual(self.core._linked_person_ids(self.redis), [])
+            self.assertIsNone(self.redis.get(self.core._catalog_key("person_zoe")))
+            self.assertIsNone(self.redis.get(self.core._history_key("person_zoe")))
+        finally:
+            self.core._PEOPLE_API_MODULE = original_people
+
+    def test_people_section_appears_in_tab_data(self):
+        people = types.SimpleNamespace(
+            load_store=lambda _client=None: {
+                "people": [
+                    {"id": "person_zoe", "display_name": "Zoe"},
+                    {"id": "person_ama", "display_name": "Ama"},
+                ]
+            }
+        )
+        original_people = self.core._PEOPLE_API_MODULE
+        self.core._PEOPLE_API_MODULE = people
+        try:
+            self.link_person()
+            data = self.core.get_htmlui_tab_data(redis_client=self.redis)
+            tab_keys = [tab["key"] for tab in data["ui"]["manager_tabs"]]
+            self.assertIn("people", tab_keys)
+            item_ids = [item.get("id") for item in data["ui"]["item_forms"]]
+            self.assertIn("person:person_zoe", item_ids)
+            self.assertIn("person:new", item_ids)  # Ama is still unlinked
+        finally:
+            self.core._PEOPLE_API_MODULE = original_people
+
+
+    def test_person_scoped_emby_proxy_routes(self):
+        self.redis.hset(
+            self.core.PERSON_LINKS_KEY,
+            mapping={
+                "person_lee": json.dumps(
+                    {
+                        "music_source": "emby",
+                        "emby": {
+                            "server_url": "http://emby.local:8096",
+                            "auth_mode": "api_key",
+                            "api_key": "LEEKEY",
+                            "user_id": "u-lee",
+                        },
+                    }
+                )
+            },
+        )
+        provider = self.core._person_link_provider("person_lee", "emby", self.redis)
+        self.assertEqual(provider.stream_scope, "person_lee")
+        self.assertEqual(provider.api_key, "LEEKEY")
+        # Person-scoped proxy routes resolve to the linked person's credentials.
+        url, headers = self.core._emby_upstream_request("emby:person_lee", "song1")
+        self.assertTrue(url.startswith("http://emby.local:8096/Audio/song1/stream?"))
+        self.assertIn("api_key=LEEKEY", url)
+        art_url, _headers = self.core._emby_upstream_request("emby_art:person_lee", "song1")
+        self.assertTrue(art_url.startswith("http://emby.local:8096/Items/song1/Images/Primary?"))
 
 
 if __name__ == "__main__":
