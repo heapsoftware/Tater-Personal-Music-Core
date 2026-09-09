@@ -1,24 +1,40 @@
-"""Tater Tube music library, voice playback, queue, and built-in player for Tater."""
+"""Per-person Emby and network-share music library, voice playback, queue, and built-in player for Tater.
+
+Derived from Tater_Shop's ``cores/music_core.py`` (pure-rename commit) so upstream
+changes stay diffable, but rebuilt around a provider abstraction:
+
+- ``EmbyMusicProvider`` — a per-configuration Emby server (one server, one music
+  view) speaking Emby's REST API directly.
+- ``NetworkShareMusicProvider`` — a locally mounted SMB/NFS share (added in a
+  later phase) served to playback targets through this core's own Range-capable
+  stream server.
+
+Per-person linkage (Emby user or share subfolder per Person) is layered on top
+of the provider abstraction in a later phase using core-owned Redis keys.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import importlib.util
 import io
 import json
 import logging
 import math
 import random
+import socket
 import struct
 import threading
 import time
 import uuid
 import wave
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
-from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, quote, urlencode, urlparse
 
 import requests
 
@@ -30,17 +46,19 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.4.6"
+__version__ = "1.0.0"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
-    "Connect Tater Tube Server to Tater; browse music, build AI-named recommendations from listening history, and keep "
-    "voice-controlled queues playing with a smart continuous-radio refill across "
-    "clock-synchronized satellites, native Sonos groups, stereo pairs, and media players."
+    "Per-person music for Tater: link each Person to their own Emby user or network-share folder, browse and play "
+    "their library with voice control, and build AI-named recommendations from each Person's listening history "
+    "across clock-synchronized satellites, native Sonos groups, stereo pairs, and media players."
 )
 TAGS = [
     "music",
     "player",
-    "tater-tube",
+    "emby",
+    "network-share",
+    "per-person",
     "satellite",
     "stereo",
     "multi-room",
@@ -49,18 +67,36 @@ TAGS = [
     "album-art",
 ]
 
-logger = logging.getLogger("music_core")
+logger = logging.getLogger("custom_music_core")
 logger.setLevel(logging.INFO)
 
 CORE_SETTINGS = {
-    "category": "Music Core Settings",
+    "category": "Custom Music Core Settings",
     "hydra_tools_require_running": True,
     "required": {
+        "stream_bind_port": {
+            "label": "Stream Server Port",
+            "type": "number",
+            "default": 8621,
+            "description": (
+                "Local HTTP port this core serves music streams from so playback targets can fetch "
+                "Emby token-authenticated audio and network-share files. Requires a free port on the host."
+            ),
+        },
+        "stream_host": {
+            "label": "Stream Host (IP or name)",
+            "type": "text",
+            "default": "",
+            "description": (
+                "Address playback targets use to reach this Tater's stream server. Leave blank to use the "
+                "auto-detected LAN address."
+            ),
+        },
         "catalog_sync_interval_seconds": {
             "label": "Catalog Sync Interval (sec)",
             "type": "number",
             "default": 900,
-            "description": "How often Music Core refreshes artists, albums, genres, and tracks.",
+            "description": "How often Custom Music Core refreshes artists, albums, genres, and tracks.",
         },
         "default_targets": {
             "label": "Default Speakers",
@@ -120,7 +156,7 @@ CORE_SETTINGS = {
             "description": "Tater Native satellites, stereo pairs, AirPlay-capable Sonos players, or AirPlay speakers that play incoming audio.",
         },
         "recommendations_enabled": {
-            "label": "Tater Recommendations",
+            "label": "Music Recommendations",
             "type": "checkbox",
             "default": True,
             "description": "Use listening history and Tater's primary AI model to prepare named music mixes.",
@@ -129,7 +165,7 @@ CORE_SETTINGS = {
             "label": "Recommendation Refresh (hours)",
             "type": "number",
             "default": 12,
-            "description": "How often Music Core refreshes Tater Recommendations in the background.",
+            "description": "How often Custom Music Core refreshes music recommendations in the background.",
         },
         "recommendation_playlist_count": {
             "label": "Recommendation Playlists",
@@ -153,27 +189,33 @@ CORE_SETTINGS = {
             "label": "Music Profile Refresh (hours)",
             "type": "number",
             "default": 12,
-            "description": "How often Music Core refreshes the selected Person's prompt-ready listening profile.",
+            "description": "How often Custom Music Core refreshes the selected Person's prompt-ready listening profile.",
         },
     },
     "tags": TAGS,
 }
 
 CORE_WEBUI_TAB = {
-    "label": "Music",
-    "order": 36,
+    "label": "Custom Music",
+    "order": 37,
     "requires_running": True,
 }
 
-SETTINGS_KEY = "music_core_settings"
-RUNTIME_KEY = "music_core_runtime"
-CATALOG_KEY = "music_core_catalog_v1"
-PLAYER_KEY = "music_core_player_v1"
-HISTORY_KEY = "music_core_listening_history_v1"
-RECOMMENDATIONS_KEY = "music_core_recommendations_v1"
-PROMPT_PROFILE_KEY = "music_core_prompt_profile_v1"
-TATER_TUBE_ACTIVITY_KEY = "tater_tube_activity_feed_v1"
-MAX_TATER_TUBE_ACTIVITY_EVENTS = 200
+# Data keys use the "custom_music_core:" prefix so Tater's core data cleanup
+# (core_store.clear_core_redis_data) sweeps them for any installed core without
+# needing an entry in the host's audited ownership table. Settings and the
+# autostart marker use the conventional "<module_key>_settings/_running" forms.
+SETTINGS_KEY = "custom_music_core_settings"
+RUNTIME_KEY = "custom_music_core:runtime"
+PERSON_LINKS_KEY = "custom_music_core:person_links"
+CATALOG_KEY = "custom_music_core:catalog:v1"
+PLAYER_KEY = "custom_music_core:player"
+HISTORY_KEY = "custom_music_core:history:v1"
+RECOMMENDATIONS_KEY = "custom_music_core:recommendations:v1"
+PROMPT_PROFILE_KEY = "custom_music_core:profile:v1"
+ACTIVITY_KEY = "custom_music_core:activity_feed"
+EMBY_AUTH_CACHE_KEY = "custom_music_core:emby:auth"
+MAX_ACTIVITY_EVENTS = 200
 REQUEST_TIMEOUT_SECONDS = 30
 ARTWORK_CONNECT_TIMEOUT_SECONDS = 2.0
 ARTWORK_READ_TIMEOUT_SECONDS = 5.0
@@ -191,8 +233,12 @@ CATALOG_MEMORY_CACHE_TTL_SECONDS = 15.0
 CONTINUATION_TRIGGER_REMAINING_TRACKS = 2
 CONTINUATION_BATCH_TRACKS = 12
 MAX_CONTINUATION_CANDIDATES = 200
-PROVIDER_LABELS = {"tater_tube": "Tater Tube Server"}
-CATALOG_PROVIDER_IDS = {"tater_tube"}
+PROVIDER_LABELS = {"emby": "Emby", "network_share": "Network Share"}
+CATALOG_PROVIDER_IDS = {"emby"}
+EMBY_PAGE_SIZE = 500
+EMBY_ARTWORK_MAX_WIDTH = 1000
+STREAM_DEFAULT_PORT = 8621
+STREAM_CHUNK_SIZE = 128 * 1024
 GENERIC_SEARCH_WORDS = {
     "a",
     "an",
@@ -473,11 +519,13 @@ def _context_person_id(*sources: Any) -> str:
     return ""
 
 
-def _provider_id(value: Any, default: str = "tater_tube") -> str:
+def _provider_id(value: Any, default: str = "emby") -> str:
     token = _text(value).lower().replace("-", "_").replace(" ", "_")
-    if token in {"tater_tube", "tatertube", "tater_tube_server"}:
-        return "tater_tube"
-    return "tater_tube" if _text(default) == "tater_tube" else _text(default)
+    if token in {"emby"}:
+        return "emby"
+    if token in {"network_share", "share", "network", "smb", "nfs"}:
+        return "network_share"
+    return _text(default) if _text(default) in {"emby", "network_share"} else "emby"
 
 
 def _decode_hash(raw: Any) -> Dict[str, str]:
@@ -491,9 +539,7 @@ def _settings(client: Any = None) -> Dict[str, str]:
     if store is None:
         return {}
     try:
-        settings = _decode_hash(store.hgetall(SETTINGS_KEY) or {})
-        settings.pop("provider", None)
-        return settings
+        return _decode_hash(store.hgetall(SETTINGS_KEY) or {})
     except Exception:
         return {}
 
@@ -899,49 +945,14 @@ def _normalize_server_url(value: Any) -> str:
     parsed = urlparse(raw)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("Server URL must begin with http:// or https://")
-    if raw.endswith("/api"):
-        raw = raw[:-4]
     return raw.rstrip("/")
 
 
-def _api_url(server_url: str, path: str) -> str:
-    return f"{server_url.rstrip('/')}/api/{path.lstrip('/')}"
-
-
-def _sanitize_tater_artwork_reference(value: Any) -> tuple[str, str]:
-    """Keep only Tater's artwork route and remove the paired-player secret."""
-    raw = _text(value)
-    if not raw:
-        return "", ""
-    parsed = urlparse(raw)
-    if parsed.scheme and parsed.scheme not in {"http", "https"}:
-        return "", ""
-    if not parsed.scheme and parsed.netloc:
-        return "", ""
-    if parsed.path != "/api/tater/music/artwork":
-        return "", ""
-    query = [
-        (key, item)
-        for key, item in parse_qsl(parsed.query, keep_blank_values=True)
-        if key.casefold() != "player_token"
-    ]
-    version = next((item for key, item in query if key.casefold() == "v"), "")
-    clean_query = urlencode(query)
-    reference = parsed.path
-    if clean_query:
-        reference = f"{reference}?{clean_query}"
-    return reference, version
-
-
-def _normalize_cached_tater_artwork(track: Dict[str, Any]) -> None:
-    reference, version = _sanitize_tater_artwork_reference(track.get("artwork_path"))
-    track["provider"] = "tater_tube"
-    track["artwork_path"] = reference
-    track["artwork_item_id"] = ""
-    if reference:
+def _normalize_cached_artwork(track: Dict[str, Any]) -> None:
+    """Recompute provider artwork flags on a catalog track loaded from Redis."""
+    track["provider"] = _provider_id(track.get("provider"))
+    if _text(track.get("artwork_path")) or _text(track.get("artwork_item_id")):
         track["has_artwork"] = True
-        if version and not _text(track.get("artwork_version")):
-            track["artwork_version"] = version
     else:
         track["has_artwork"] = False
         track["artwork_version"] = ""
@@ -969,183 +980,361 @@ def _unwrap_response(response: Any) -> Any:
 
 
 @dataclass
-class TaterTubeMusicProvider:
+class EmbyMusicProvider:
+    """One Emby server music view, addressed with either a server API key or a per-user token.
+
+    Server API keys stream directly from Emby (``?api_key=`` query auth travels in the
+    URL a playback target fetches). Per-user access tokens can only travel in headers,
+    so those streams and artwork requests are proxied through this core's own stream
+    server, which attaches the bearer header server-side.
+    """
+
     server_url: str
-    token: str
-    provider_id = "tater_tube"
+    auth_mode: str = "user_token"
+    username: str = ""
+    password: str = ""
+    api_key: str = ""
+    user_id: str = ""
+    library_name: str = ""
+    provider_id = "emby"
 
     @classmethod
-    def from_settings(cls, settings: Dict[str, Any]) -> "TaterTubeMusicProvider":
+    def from_settings(cls, settings: Dict[str, Any]) -> "EmbyMusicProvider":
         return cls(
             server_url=_normalize_server_url(
-                settings.get("tater_tube_server_url") or settings.get("server_url")
+                settings.get("emby_server_url") or settings.get("server_url")
             ),
-            token=_text(settings.get("tater_tube_token") or settings.get("token")),
+            auth_mode="api_key"
+            if _text(settings.get("emby_auth_mode")).casefold() == "api_key"
+            else "user_token",
+            username=_text(settings.get("emby_username")),
+            password=_text(settings.get("emby_password")),
+            api_key=_text(settings.get("emby_api_key")),
+            user_id=_text(settings.get("emby_user_id")),
+            library_name=_text(settings.get("emby_library_name")),
         )
 
     @property
     def connected(self) -> bool:
-        return bool(self.server_url and self.token)
+        if not self.server_url:
+            return False
+        if self.auth_mode == "api_key":
+            return bool(self.api_key)
+        return bool(self.username and self.password)
+
+    @property
+    def device_id(self) -> str:
+        digest = hashlib.sha256(
+            f"custom_music_core\x00{self.server_url}\x00{self.username}".encode("utf-8")
+        ).hexdigest()[:32]
+        return f"tater-custom-music-{digest[:16]}"
+
+    def _emby_authorization_header(self, token: str = "") -> str:
+        parts = [
+            'MediaBrowser Client="Tater Custom Music Core"',
+            'Device="Tater"',
+            f'DeviceId="{self.device_id}"',
+            f'Version="{__version__}"',
+        ]
+        if token:
+            parts.append(f'Token="{token}"')
+        return ", ".join(parts)
+
+    def _cached_auth(self, client: Any = None) -> Dict[str, str]:
+        store = client or globals().get("redis_client")
+        if store is None:
+            return {}
+        try:
+            return _decode_hash(store.hgetall(EMBY_AUTH_CACHE_KEY) or {})
+        except Exception:
+            return {}
+
+    def _save_cached_auth(self, token: str, user_id: str, client: Any = None) -> None:
+        store = client or globals().get("redis_client")
+        if store is None:
+            return
+        _save_hash(
+            store,
+            EMBY_AUTH_CACHE_KEY,
+            {
+                "access_token": token,
+                "user_id": user_id,
+                "authenticated_at": time.time(),
+            },
+        )
+
+    def clear_cached_auth(self, client: Any = None) -> None:
+        store = client or globals().get("redis_client")
+        if store is not None:
+            try:
+                store.delete(EMBY_AUTH_CACHE_KEY)
+            except Exception:
+                pass
+
+    def authenticate(
+        self,
+        *,
+        force: bool = False,
+        client: Any = None,
+        timeout: int = REQUEST_TIMEOUT_SECONDS,
+    ) -> tuple[str, str]:
+        """Return (access_token, user_id), authenticating against Emby when needed."""
+        cached = {} if force else self._cached_auth(client)
+        token = _text(cached.get("access_token"))
+        user_id = _text(cached.get("user_id")) or self.user_id
+        if token and (not self.user_id or user_id == self.user_id):
+            return token, user_id
+        if not self.username or not self.password:
+            raise ValueError("Emby username and password are required for user sign-in.")
+        response = requests.post(
+            f"{self.server_url}/Users/AuthenticateByName",
+            headers={
+                "Content-Type": "application/json",
+                "X-Emby-Authorization": self._emby_authorization_header(),
+                "Accept": "application/json",
+            },
+            json={"Username": self.username, "Pw": self.password},
+            timeout=max(5, int(timeout)),
+        )
+        if response.status_code in (401, 403):
+            raise PermissionError("Emby rejected the username or password.")
+        if not response.ok:
+            raise RuntimeError(f"Emby sign-in failed with HTTP {response.status_code}.")
+        body = response.json() if response.content else {}
+        token = _text(body.get("AccessToken"))
+        user = body.get("User") if isinstance(body.get("User"), dict) else {}
+        user_id = _text(user.get("Id")) or _text(body.get("UserId"))
+        if not token or not user_id:
+            raise RuntimeError("Emby sign-in did not return an access token.")
+        self._save_cached_auth(token, user_id, client)
+        return token, user_id
+
+    def _access_token(self, client: Any = None, *, force_refresh: bool = False) -> str:
+        token, _user_id = self.authenticate(force=force_refresh, client=client)
+        return token
 
     def request(
         self,
         method: str,
         path: str,
         *,
+        params: Optional[Dict[str, Any]] = None,
         payload: Optional[Dict[str, Any]] = None,
         timeout: int = REQUEST_TIMEOUT_SECONDS,
         authenticated: bool = True,
+        client: Any = None,
     ) -> Any:
         if not self.server_url:
-            raise ValueError("Tater Tube Server URL is not configured.")
+            raise ValueError("Emby server URL is not configured.")
+        query: Dict[str, Any] = dict(params or {})
         headers = {"Accept": "application/json"}
         if payload is not None:
             headers["Content-Type"] = "application/json"
-        if authenticated and self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
+        if authenticated:
+            if self.auth_mode == "api_key":
+                query.setdefault("api_key", self.api_key)
+            else:
+                headers["X-Emby-Token"] = self._access_token(client=client)
+        url = f"{self.server_url}/{path.lstrip('/')}"
         response = requests.request(
             method.upper(),
-            _api_url(self.server_url, path),
+            url,
+            params=query,
             headers=headers,
             json=payload,
             timeout=max(5, int(timeout)),
         )
-        return _unwrap_response(response)
+        if response.status_code == 401:
+            self.clear_cached_auth(client)
+            raise PermissionError("Emby rejected this core's credentials.")
+        if not response.ok:
+            raise RuntimeError(f"Emby returned HTTP {response.status_code} for {path}.")
+        try:
+            return response.json()
+        except Exception:
+            return {}
 
-    @classmethod
-    def pair(cls, server_url: str, pin: str, name: str) -> Dict[str, Any]:
-        provider = cls(server_url=_normalize_server_url(server_url), token="")
-        return provider.request(
-            "POST",
-            "tater/players/pair",
-            payload={"pin": pin, "name": name},
-            authenticated=False,
+    def resolve_user_id(self, client: Any = None) -> str:
+        """Best-effort Emby user id for this configuration."""
+        if self.user_id:
+            return self.user_id
+        if self.auth_mode == "user_token":
+            _token, user_id = self.authenticate(client=client)
+            return user_id
+        users = self.request("GET", "Users", client=client) or []
+        rows = users.get("Items") if isinstance(users, dict) else users
+        if isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict):
+            return _text(rows[0].get("Id"))
+        if self.username and isinstance(rows, list):
+            for row in rows:
+                if isinstance(row, dict) and _text(row.get("Name")).casefold() == self.username.casefold():
+                    return _text(row.get("Id"))
+        raise ValueError(
+            "Set the Emby User ID in settings, or use one Emby user account with username sign-in."
         )
+
+    def music_view(self, client: Any = None) -> Dict[str, Any]:
+        user_id = self.resolve_user_id(client)
+        views = self.request("GET", f"Users/{quote(str(user_id), safe='')}/Views", client=client) or {}
+        rows = views.get("Items") if isinstance(views, dict) else views
+        candidates = [row for row in (rows or []) if isinstance(row, dict)]
+        wanted = self.library_name.casefold()
+        for row in candidates:
+            if wanted and _text(row.get("Name")).casefold() == wanted:
+                return row
+        for row in candidates:
+            if _text(row.get("CollectionType")).casefold() == "music":
+                return row
+        if wanted:
+            raise ValueError(f"No Emby music library named '{self.library_name}' is visible to this Emby user.")
+        if candidates:
+            raise ValueError(
+                "No Emby library with a music collection type is visible to this Emby user. "
+                "Set a Library Name in the Emby source settings."
+            )
+        raise ValueError("This Emby user cannot see any libraries.")
 
     def stream_url(self, track: Dict[str, Any], *, audio_sync: bool = False) -> str:
-        category_id = _text(track.get("category_id"))
-        if category_id.startswith("local:"):
-            category_id = category_id[len("local:") :]
-        path = _text(track.get("path"))
-        if not category_id or not path:
+        item_id = _text(track.get("provider_track_id")) or _text(track.get("id"))
+        if not item_id:
             return _text(track.get("stream_url"))
-        values = {
-            "category_id": category_id,
-            "source": _as_int(track.get("source_index"), 0, 0, 10000),
-            "path": path,
-            "player_token": self.token,
-        }
-        if audio_sync:
-            values.update({"transcode": "1", "profile": "audio_sync"})
-        query = urlencode(values)
-        return f"{self.server_url}/api/tater/local/stream?{query}"
+        if self.auth_mode == "api_key":
+            values: Dict[str, Any] = {"api_key": self.api_key}
+            if audio_sync:
+                # Mixed Tater satellite + Sonos/AirPlay groups share one normalized
+                # PCM source so every target can stay clock-aligned.
+                values.update(
+                    {
+                        "AudioCodec": "wav",
+                        "AudioSampleRate": 44100,
+                        "AudioChannels": 2,
+                    }
+                )
+            else:
+                values["Static"] = "true"
+            query = urlencode(values)
+            return f"{self.server_url}/Audio/{quote(str(item_id), safe='')}/stream?{query}"
+        return _stream_proxy_url("emby", item_id)
 
     def artwork_url(self, track: Dict[str, Any]) -> str:
-        reference, _version = _sanitize_tater_artwork_reference(track.get("artwork_path"))
-        if not reference:
+        item_id = _text(track.get("artwork_item_id")) or _text(track.get("provider_track_id")) or _text(track.get("id"))
+        if not item_id:
             return ""
-        parsed = urlparse(reference)
-        query = [
-            (key, item)
-            for key, item in parse_qsl(parsed.query, keep_blank_values=True)
-            if key.casefold() != "player_token"
-        ]
-        if self.token:
-            query.append(("player_token", self.token))
-        server = urlparse(self.server_url)
-        return urlunparse(
-            (
-                server.scheme,
-                server.netloc,
-                parsed.path,
-                "",
-                urlencode(query),
-                "",
-            )
-        )
+        if self.auth_mode == "api_key":
+            values = {
+                "api_key": self.api_key,
+                "MaxWidth": EMBY_ARTWORK_MAX_WIDTH,
+                "Quality": 90,
+            }
+            tag = _text(track.get("artwork_version"))
+            if tag:
+                values["tag"] = tag
+            query = urlencode(values)
+            return f"{self.server_url}/Items/{quote(str(item_id), safe='')}/Images/Primary?{query}"
+        return _stream_proxy_url("emby_art", item_id)
 
     def catalog(self) -> Dict[str, Any]:
-        try:
-            data = self.request(
-                "GET",
-                f"tater/music/catalog?limit={MAX_CATALOG_TRACKS}",
-                timeout=180,
-            )
-            if isinstance(data, dict) and isinstance(data.get("tracks"), list):
-                return data
-        except RuntimeError as exc:
-            if "HTTP 404" not in _text(exc):
-                raise
-        return self._legacy_catalog()
-
-    def _legacy_catalog(self) -> Dict[str, Any]:
-        libraries_payload = self.request("GET", "tater/music/libraries", timeout=60)
-        libraries = libraries_payload.get("libraries") if isinstance(libraries_payload, dict) else []
+        view = self.music_view()
+        view_id = _text(view.get("Id"))
+        view_name = _text(view.get("Name")) or "Music"
+        user_id = self.resolve_user_id()
         tracks: List[Dict[str, Any]] = []
-        library_names: Dict[str, str] = {}
-        for library in libraries if isinstance(libraries, list) else []:
-            if not isinstance(library, dict):
-                continue
-            library_id = _text(library.get("ratingKey") or library.get("key"))
-            if not library_id:
-                continue
-            library_names[library_id] = _text(library.get("title"))
-            albums_payload = self.request(
+        start_index = 0
+        while len(tracks) < MAX_CATALOG_TRACKS:
+            page = self.request(
                 "GET",
-                f"tater/music/albums?category_id={quote(library_id, safe='')}",
+                f"Users/{quote(str(user_id), safe='')}/Items",
+                params={
+                    "ParentId": view_id,
+                    "Recursive": "true",
+                    "IncludeItemTypes": "Song",
+                    "Fields": "Genres,MediaSources",
+                    "SortBy": "Album,SortName",
+                    "SortOrder": "Ascending",
+                    "StartIndex": start_index,
+                    "Limit": EMBY_PAGE_SIZE,
+                },
                 timeout=180,
-            )
-            albums = albums_payload.get("albums") if isinstance(albums_payload, dict) else []
-            for album in albums if isinstance(albums, list) else []:
-                if not isinstance(album, dict):
-                    continue
-                album_id = _text(album.get("ratingKey") or album.get("key"))
-                if not album_id:
-                    continue
-                track_payload = self.request(
-                    "GET",
-                    f"tater/music/tracks?album_id={quote(album_id, safe='')}",
-                    timeout=180,
-                )
-                rows = track_payload.get("tracks") if isinstance(track_payload, dict) else []
-                for row in rows if isinstance(rows, list) else []:
-                    if not isinstance(row, dict):
-                        continue
-                    item = dict(row)
-                    item.setdefault("album", album.get("title"))
-                    item.setdefault("artist", album.get("artist"))
-                    item.setdefault("albumArtist", album.get("albumArtist"))
-                    item.setdefault("genres", album.get("genres"))
-                    if _text(album.get("poster")) and _as_bool(album.get("hasArtwork"), False):
-                        item["poster"] = album.get("poster")
-                        item["hasArtwork"] = True
-                    tracks.append(item)
+            ) or {}
+            rows = page.get("Items") if isinstance(page, dict) else page
+            if not isinstance(rows, list):
+                break
+            for row in rows:
+                if isinstance(row, dict):
+                    tracks.append(row)
+            total = _as_int(page.get("TotalRecordCount") if isinstance(page, dict) else 0, 0, 0, 10**9)
+            start_index += len(rows)
+            if not rows or (total and start_index >= total) or start_index >= MAX_CATALOG_TRACKS:
+                break
         return {
-            "catalog_id": "",
-            "tracks": tracks,
+            "catalog_id": view_id,
+            "tracks": tracks[:MAX_CATALOG_TRACKS],
             "total": len(tracks),
-            "libraries": library_names,
-            "artists": [],
-            "albums": [],
-            "genres": [],
-            "legacy": True,
+            "libraries": {view_id: view_name},
         }
 
 def _provider(client: Any = None, provider_id: Any = "") -> Any:
-    del provider_id
-    return TaterTubeMusicProvider.from_settings(_settings(client))
+    selected = _provider_id(provider_id)
+    if selected == "emby":
+        return EmbyMusicProvider.from_settings(_settings(client))
+    raise ValueError(
+        f"{PROVIDER_LABELS.get(selected, selected)} support is not enabled in this build."
+    )
 
 
 def _paired(
     settings: Optional[Dict[str, Any]] = None,
     provider_id: Any = "",
 ) -> bool:
-    cfg = settings if isinstance(settings, dict) else _settings()
-    del provider_id
+    del settings
     try:
-        return bool(TaterTubeMusicProvider.from_settings(cfg).connected)
+        return bool(_provider(None, provider_id).connected)
     except Exception:
         return False
+
+
+def _detected_lan_address() -> str:
+    """Best-effort LAN address of this host, without sending any traffic."""
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect(("10.255.255.255", 1))
+            return _text(probe.getsockname()[0])
+        finally:
+            probe.close()
+    except Exception:
+        return "127.0.0.1"
+
+
+def _stream_port(client: Any = None) -> int:
+    cfg = _settings(client)
+    return _as_int(cfg.get("stream_bind_port"), STREAM_DEFAULT_PORT, 1, 65535)
+
+
+def _stream_base_url(client: Any = None) -> str:
+    cfg = _settings(client)
+    host = _text(cfg.get("stream_host")) or _detected_lan_address()
+    return f"http://{host}:{_stream_port(client)}"
+
+
+def _stream_token(client: Any = None) -> str:
+    cfg = _settings(client)
+    token = _text(cfg.get("stream_token"))
+    if token:
+        return token
+    token = uuid.uuid4().hex
+    _save_hash(client or globals().get("redis_client"), SETTINGS_KEY, {"stream_token": token})
+    return token
+
+
+def _stream_proxy_url(kind: str, item_id: Any) -> str:
+    item_id = _text(item_id)
+    if not item_id:
+        return ""
+    return (
+        f"{_stream_base_url()}/stream/{quote(_stream_token(), safe='')}"
+        f"/{kind}/{quote(str(item_id), safe='')}"
+    )
 
 
 def _genre_key(value: Any) -> str:
@@ -1189,22 +1378,43 @@ def _genres(value: Any, fallback: Any = "") -> List[str]:
     return result
 
 
+def _format_duration(seconds: Any) -> str:
+    duration = max(0, int(_as_float(seconds)))
+    minutes, secs = divmod(duration, 60)
+    if minutes >= 60:
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
 def _normalize_track(row: Dict[str, Any]) -> Dict[str, Any]:
-    track_id = _text(row.get("ratingKey") or row.get("rating_key") or row.get("key") or row.get("id"))
-    title = _text(row.get("title")) or "Untitled"
-    artist = _text(row.get("artist"))
-    album_artist = _text(row.get("albumArtist") or row.get("album_artist"))
-    album = _text(row.get("album"))
-    genres = _genres(row.get("genres"), row.get("genre"))
-    duration = _as_float(row.get("durationSeconds") or row.get("duration_seconds") or row.get("duration"))
+    # Accepts provider-native rows (Emby BaseItemDto) plus the generic row shape
+    # used by this file's own catalog helpers.
+    track_id = _text(row.get("Id") or row.get("ratingKey") or row.get("rating_key") or row.get("key") or row.get("id"))
+    title = _text(row.get("Name") or row.get("title")) or "Untitled"
+    raw_artists = row.get("Artists")
+    if isinstance(raw_artists, list) and raw_artists:
+        artist = ", ".join(_text(value) for value in raw_artists if _text(value))
+    else:
+        artist = _text(row.get("artist"))
+    album_artist = _text(row.get("AlbumArtist") or row.get("albumArtist") or row.get("album_artist"))
+    album = _text(row.get("Album") or row.get("album"))
+    genres = _genres(row.get("Genres") or row.get("genres"), row.get("genre"))
+    runtime_ticks = _as_float(row.get("RunTimeTicks"))
+    duration = _as_float(
+        row.get("durationSeconds")
+        or row.get("duration_seconds")
+        or row.get("duration")
+        or (runtime_ticks / 10_000_000.0 if runtime_ticks > 0 else 0.0)
+    )
     if duration > 100000:
         duration /= 1000.0
     source_index = _as_int(row.get("sourceIndex") or row.get("source_index"), 0, 0, 10000)
-    path = _text(row.get("path") or row.get("partKey") or row.get("part_key"))
-    artwork_path, artwork_query_version = _sanitize_tater_artwork_reference(
-        row.get("poster") or row.get("artwork_url") or row.get("artwork_path")
-    )
-    artwork_version = _text(row.get("artwork_version")) or artwork_query_version
+    path = _text(row.get("Path") or row.get("path") or row.get("partKey") or row.get("part_key"))
+    artwork_path = _text(row.get("artwork_path"))
+    artwork_item_id = _text(row.get("artwork_item_id") or track_id)
+    image_tags = row.get("ImageTags") if isinstance(row.get("ImageTags"), dict) else {}
+    artwork_version = _text(row.get("artwork_version")) or _text(image_tags.get("Primary"))
     if not track_id:
         identity = "\x00".join(
             [
@@ -1217,6 +1427,13 @@ def _normalize_track(row: Dict[str, Any]) -> Dict[str, Any]:
             ]
         )
         track_id = "track:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+    duration_display = _text(row.get("durationDisplay") or row.get("duration_display"))
+    if not duration_display and duration > 0:
+        duration_display = _format_duration(duration)
+    year = _text(row.get("ProductionYear") or row.get("date") or row.get("year"))
+    if not year:
+        premiere = _text(row.get("PremiereDate"))
+        year = premiere[:4] if len(premiere) >= 4 else ""
     return {
         "id": track_id,
         "title": title,
@@ -1225,35 +1442,38 @@ def _normalize_track(row: Dict[str, Any]) -> Dict[str, Any]:
         "album": album,
         "genres": genres,
         "genre": ", ".join(genres),
-        "year": _text(row.get("date") or row.get("year")),
-        "track_number": _as_int(row.get("index") or row.get("track_number"), 0, 0, 10000),
+        "year": year,
+        "track_number": _as_int(row.get("IndexNumber") or row.get("index") or row.get("track_number"), 0, 0, 10000),
         "disc_number": _as_int(
-            row.get("disc") or row.get("disc_number"),
+            row.get("ParentIndexNumber") or row.get("disc") or row.get("disc_number"),
             0,
             0,
             1000,
         ),
         "duration_seconds": max(0.0, duration),
-        "duration_display": _text(row.get("durationDisplay") or row.get("duration_display")),
+        "duration_display": duration_display,
         "category_id": _text(row.get("categoryId") or row.get("category_id")),
         "source_index": source_index,
         "path": path,
         "stream_path": _text(row.get("stream_path")),
         "provider_track_id": _text(
             row.get("provider_track_id")
+            or row.get("Id")
             or row.get("ratingKey")
             or row.get("rating_key")
             or row.get("key")
         ),
-        "container": _text(row.get("container") or Path(path).suffix.lstrip(".")).lower(),
+        "container": _text(
+            row.get("Container") or row.get("container") or Path(path).suffix.lstrip(".")
+        ).lower(),
         "media_type": _text(row.get("media_type") or row.get("content_type")).lower(),
         "size_bytes": _as_int(row.get("sizeBytes") or row.get("size_bytes"), 0, 0, 10**15),
         "modified_unix": _as_int(row.get("modifiedUnix") or row.get("modified_unix"), 0, 0, 10**12),
         "artwork_path": artwork_path,
-        "artwork_item_id": "",
+        "artwork_item_id": artwork_item_id,
         "artwork_version": artwork_version,
-        "has_artwork": bool(artwork_path),
-        "provider": "tater_tube",
+        "has_artwork": bool(artwork_path or (artwork_item_id and artwork_version)),
+        "provider": _provider_id(row.get("provider")),
     }
 
 
@@ -1273,7 +1493,6 @@ def _facet_values(tracks: Iterable[Dict[str, Any]], key: str) -> List[str]:
 
 
 def _catalog(client: Any = None, provider_id: Any = "") -> Dict[str, Any]:
-    del provider_id
     store = client or globals().get("redis_client")
     now = time.monotonic()
     with _catalog_memory_cache_lock:
@@ -1284,16 +1503,18 @@ def _catalog(client: Any = None, provider_id: Any = "") -> Dict[str, Any]:
             and now - float(_catalog_memory_cache.get("loaded_at") or 0.0)
             < CATALOG_MEMORY_CACHE_TTL_SECONDS
         ):
+            if _provider_id(cached.get("provider")) != _provider_id(provider_id):
+                return {}
             return cached
 
         payload = _load_json(store, CATALOG_KEY, {})
         if not isinstance(payload, dict):
             payload = {}
-        if _text(payload.get("provider") or "tater_tube").lower() != "tater_tube":
+        if _provider_id(payload.get("provider")) != _provider_id(provider_id):
             payload = {}
         for track in payload.get("tracks") or []:
             if isinstance(track, dict):
-                _normalize_cached_tater_artwork(track)
+                _normalize_cached_artwork(track)
                 genres = _genres(track.get("genres"), track.get("genre"))
                 track["genres"] = genres
                 track["genre"] = ", ".join(genres)
@@ -1313,26 +1534,26 @@ def _catalog_needs_artwork_refresh(client: Any = None, provider_id: Any = "") ->
     if not isinstance(payload, dict) or not payload:
         return True
     return (
-        _text(payload.get("provider") or "tater_tube").lower() != "tater_tube"
+        _provider_id(payload.get("provider")) != _provider_id(provider_id)
         or _as_int(payload.get("artwork_schema"), 0, 0, 100) < CATALOG_ARTWORK_SCHEMA
     )
 
 
 def _sync_catalog_impl(client: Any = None, provider_id: Any = "") -> Dict[str, Any]:
-    del provider_id
     store = client or globals().get("redis_client")
-    selected = "tater_tube"
-    provider = _provider(store)
+    selected = _provider_id(provider_id)
+    provider = _provider(store, selected)
     if not provider.connected:
         raise ValueError(
             f"Connect {PROVIDER_LABELS.get(selected, selected)} before syncing its music library."
         )
     raw = provider.catalog()
-    tracks = [
-        _normalize_track(row)
-        for row in (raw.get("tracks") if isinstance(raw, dict) else []) or []
-        if isinstance(row, dict)
-    ]
+    tracks = []
+    for row in (raw.get("tracks") if isinstance(raw, dict) else []) or []:
+        if isinstance(row, dict):
+            track = _normalize_track(row)
+            track["provider"] = selected
+            tracks.append(track)
     artists = _facet_values(
         [
             {
@@ -1354,7 +1575,6 @@ def _sync_catalog_impl(client: Any = None, provider_id: Any = "") -> Dict[str, A
         "genres": genres,
         "libraries": raw.get("libraries") if isinstance(raw, dict) and isinstance(raw.get("libraries"), dict) else {},
         "synced_at": time.time(),
-        "legacy_provider_api": bool(raw.get("legacy")) if isinstance(raw, dict) else False,
     }
     _save_json(store, CATALOG_KEY, payload)
     with _catalog_memory_cache_lock:
@@ -1564,9 +1784,11 @@ def _player(client: Any = None) -> Dict[str, Any]:
     payload = _load_json(store, PLAYER_KEY, {})
     if not isinstance(payload, dict):
         payload = {}
-    stale_provider = _text(payload.get("provider")).casefold() not in {"", "tater_tube"}
+    stale_provider = (
+        _text(payload.get("provider")).casefold() not in {"", *CATALOG_PROVIDER_IDS}
+    )
     payload.setdefault("status", "idle")
-    payload["provider"] = "tater_tube"
+    payload.setdefault("provider", "emby")
     payload.setdefault("queue", [])
     if stale_provider:
         payload.update(
@@ -1583,10 +1805,10 @@ def _player(client: Any = None) -> Dict[str, Any]:
     for collection_key in ("queue", "queue_original"):
         for track in payload.get(collection_key) or []:
             if isinstance(track, dict):
-                _normalize_cached_tater_artwork(track)
+                _normalize_cached_artwork(track)
     current = payload.get("current") if isinstance(payload.get("current"), dict) else {}
     if current:
-        _normalize_cached_tater_artwork(current)
+        _normalize_cached_artwork(current)
     payload.setdefault("index", -1)
     targets = _normalize_stereo_targets(payload.get("targets") or payload.get("target"))
     payload["targets"] = targets
@@ -1651,24 +1873,24 @@ def _listening_history(client: Any = None) -> List[Dict[str, Any]]:
     return [dict(row) for row in payload if isinstance(row, dict)]
 
 
-def get_tater_tube_activity_events(
+def get_music_activity_events(
     *, redis_client=None, limit: int = 100, **_kwargs
 ) -> List[Dict[str, Any]]:
-    """Expose privacy-safe listening activity to Tater Tube Core."""
+    """Expose privacy-safe listening activity from this core's own feed key."""
     store = redis_client or globals().get("redis_client")
-    payload = _load_json(store, TATER_TUBE_ACTIVITY_KEY, [])
+    payload = _load_json(store, ACTIVITY_KEY, [])
     rows = [dict(row) for row in payload if isinstance(row, dict)] if isinstance(payload, list) else []
-    return rows[-_as_int(limit, 100, 1, MAX_TATER_TUBE_ACTIVITY_EVENTS):]
+    return rows[-_as_int(limit, 100, 1, MAX_ACTIVITY_EVENTS):]
 
 
-def _publish_tater_tube_activity(track: Dict[str, Any], *, client: Any = None) -> None:
+def _publish_music_activity(track: Dict[str, Any], *, client: Any = None) -> None:
     store = client or globals().get("redis_client")
     title = _text(track.get("title"))
     if store is None or not title:
         return
     now = time.time()
-    rows = get_tater_tube_activity_events(
-        redis_client=store, limit=MAX_TATER_TUBE_ACTIVITY_EVENTS
+    rows = get_music_activity_events(
+        redis_client=store, limit=MAX_ACTIVITY_EVENTS
     )
     track_id = _text(track.get("id"))
     if rows:
@@ -1680,7 +1902,7 @@ def _publish_tater_tube_activity(track: Dict[str, Any], *, client: Any = None) -
             return
     rows.append(
         {
-            "source": "music_core",
+            "source": "custom_music_core",
             "media_id": track_id or title,
             "media_type": "music",
             "title": title,
@@ -1695,7 +1917,7 @@ def _publish_tater_tube_activity(track: Dict[str, Any], *, client: Any = None) -
             },
         }
     )
-    _save_json(store, TATER_TUBE_ACTIVITY_KEY, rows[-MAX_TATER_TUBE_ACTIVITY_EVENTS:])
+    _save_json(store, ACTIVITY_KEY, rows[-MAX_ACTIVITY_EVENTS:])
 
 
 def _record_listening_history(
@@ -1738,7 +1960,7 @@ def _record_listening_history(
         }
     )
     _save_json(store, HISTORY_KEY, history[-MAX_HISTORY_EVENTS:])
-    _publish_tater_tube_activity(track, client=store)
+    _publish_music_activity(track, client=store)
 
 
 def _recommendations(client: Any = None) -> Dict[str, Any]:
@@ -1966,10 +2188,10 @@ def _generate_music_prompt_profile_impl(
     cfg = _settings(store)
     person_id = _text(cfg.get("prompt_person_id"))
     if not person_id:
-        raise ValueError("Choose a Person in Music Core Settings before building music prompt context.")
+        raise ValueError("Choose a Person in Custom Music Core Settings before building music prompt context.")
     person_name = _people_person_name(person_id, store)
     if not person_name:
-        raise ValueError("The selected Music Core Person no longer exists.")
+        raise ValueError("The selected Custom Music Core Person no longer exists.")
     provider_id = _provider_id(cfg.get("provider"))
     history = _profile_history(store, person_id=person_id, provider_id=provider_id)
     if not history:
@@ -2056,7 +2278,7 @@ def _generate_music_prompt_profile(
 ) -> Dict[str, Any]:
     global _profile_started_at
     if not _profile_lock.acquire(blocking=False):
-        raise RuntimeError("The Music Core prompt profile is already being refreshed.")
+        raise RuntimeError("The Custom Music Core prompt profile is already being refreshed.")
     store = client or globals().get("redis_client")
     _profile_started_at = time.time()
     owns_loop = loop is None
@@ -4318,7 +4540,7 @@ def _validate_catalog_provider_targets(targets: Any) -> None:
     ]
     if roon_targets:
         raise ValueError(
-            "Roon zones cannot receive Music Core streams. Choose satellites, stereo pairs, "
+            "Roon zones cannot receive Custom Music Core streams. Choose satellites, stereo pairs, "
             "or another supported media player."
         )
 
@@ -4400,50 +4622,54 @@ def _play_request(args: Dict[str, Any], origin: Optional[Dict[str, Any]], client
 
 
 def get_hydra_kernel_tools(*, platform: str = "", **_kwargs) -> List[Dict[str, Any]]:
+    # Tool ids are globally namespaced across cores and first-declared wins, so
+    # every id here carries the custom_music_ prefix and never collides with the
+    # upstream Music Core's music_* tools when both cores run side by side.
     return [
         {
-            "id": "music_play",
+            "id": "custom_music_play",
             "description": (
-                "Use when the user asks to play music by song, artist, album, genre, or description. "
-                "Put user-named rooms in rooms, specific user-named speakers in targets, and leave both "
-                "empty when playback should follow the speaking room."
+                "Use when the user asks to play music from their personal Emby or network-share library by "
+                "song, artist, album, genre, or description. Put user-named rooms in rooms, specific "
+                "user-named speakers in targets, and leave both empty when playback should follow the "
+                "speaking room."
             ),
             "usage": (
-                '{"function":"music_play","arguments":{"query":"reggae music","genre":"reggae",'
+                '{"function":"custom_music_play","arguments":{"query":"reggae music","genre":"reggae",'
                 '"artist":"","album":"","title":"","targets":[],'
                 '"rooms":["Family Room"],"shuffle":true,"volume_percent":75}}'
             ),
         },
         {
-            "id": "music_search",
-            "description": "Search Music Core without starting playback.",
+            "id": "custom_music_search",
+            "description": "Search the personal Custom Music library without starting playback.",
             "usage": (
-                '{"function":"music_search","arguments":{"query":"","genre":"","artist":"","album":"","title":"",'
+                '{"function":"custom_music_search","arguments":{"query":"","genre":"","artist":"","album":"","title":"",'
                 '"limit":10}}'
             ),
         },
         {
-            "id": "music_control",
+            "id": "custom_music_control",
             "description": (
-                "Control the Music Core queue: next, previous, stop, replay, shuffle, repeat, "
+                "Control the Custom Music queue: next, previous, stop, replay, shuffle, repeat, "
                 "or set one or more playback destinations."
             ),
             "usage": (
-                '{"function":"music_control","arguments":'
+                '{"function":"custom_music_control","arguments":'
                 '{"action":"next|previous|stop|replay|shuffle|repeat|set_targets",'
                 '"targets":["Kitchen","Living Room"],"enabled":true,"mode":"off|all|one"}}'
             ),
         },
         {
-            "id": "music_now_playing",
-            "description": "Read the current Music Core track, queue, target, and playback state.",
-            "usage": '{"function":"music_now_playing","arguments":{}}',
+            "id": "custom_music_now_playing",
+            "description": "Read the current Custom Music track, queue, target, and playback state.",
+            "usage": '{"function":"custom_music_now_playing","arguments":{}}',
         },
         {
-            "id": "music_browse",
-            "description": "Browse artists, albums, genres, or tracks from Tater Tube Server.",
+            "id": "custom_music_browse",
+            "description": "Browse artists, albums, genres, or tracks from the linked Emby or network-share library.",
             "usage": (
-                '{"function":"music_browse","arguments":{"category":"artists|albums|genres|tracks",'
+                '{"function":"custom_music_browse","arguments":{"category":"artists|albums|genres|tracks",'
                 '"limit":50}}'
             ),
         },
@@ -4460,16 +4686,16 @@ async def run_hydra_kernel_tool(
 ) -> Optional[Dict[str, Any]]:
     store = redis_client or globals().get("redis_client")
     values = args if isinstance(args, dict) else {}
-    if tool_id == "music_play":
+    if tool_id == "custom_music_play":
         try:
             return await asyncio.to_thread(_play_request, values, origin, store)
         except Exception as exc:
             return {
                 "ok": False,
-                "error": {"code": "music_play_failed", "message": _text(exc)},
+                "error": {"code": "custom_music_play_failed", "message": _text(exc)},
                 "say_hint": "Explain the music playback problem and ask for any missing song or destination detail.",
             }
-    if tool_id == "music_search":
+    if tool_id == "custom_music_search":
         try:
             cfg = _settings(store)
             selected_provider = _provider_id(
@@ -4497,8 +4723,8 @@ async def run_hydra_kernel_tool(
                 "summary_for_user": f"Found {len(public)} matching track{'' if len(public) == 1 else 's'}.",
             }
         except Exception as exc:
-            return {"ok": False, "error": {"code": "music_search_failed", "message": _text(exc)}}
-    if tool_id == "music_control":
+            return {"ok": False, "error": {"code": "custom_music_search_failed", "message": _text(exc)}}
+    if tool_id == "custom_music_control":
         action = _text(values.get("action")).lower()
         try:
             if action == "next":
@@ -4574,8 +4800,8 @@ async def run_hydra_kernel_tool(
                 ),
             }
         except Exception as exc:
-            return {"ok": False, "error": {"code": "music_control_failed", "message": _text(exc)}}
-    if tool_id == "music_now_playing":
+            return {"ok": False, "error": {"code": "custom_music_control_failed", "message": _text(exc)}}
+    if tool_id == "custom_music_now_playing":
         player = _player(store)
         targets = _list(player.get("targets") or player.get("target"))
         return {
@@ -4595,10 +4821,10 @@ async def run_hydra_kernel_tool(
                 f"{_track_label(player.get('current') or {})} is {_text(player.get('status'))} "
                 f"on {_target_summary(targets)}."
                 if player.get("current")
-                else "Music Core is idle."
+                else "Custom Music Core is idle."
             ),
         }
-    if tool_id == "music_browse":
+    if tool_id == "custom_music_browse":
         selected_provider = _provider_id(
             values.get("provider"),
             _provider_id(_settings(store).get("provider")),
@@ -4619,7 +4845,7 @@ async def run_hydra_kernel_tool(
             return {
                 "ok": False,
                 "error": {
-                    "code": "music_browse_category",
+                    "code": "custom_music_browse_category",
                     "message": "Choose artists, albums, genres, or tracks.",
                 },
             }
@@ -4629,7 +4855,7 @@ async def run_hydra_kernel_tool(
             "category": category,
             "items": items,
             "count": len(items),
-            "summary_for_user": f"Music Core has {len(items)} {category} in this result.",
+            "summary_for_user": f"The Custom Music library has {len(items)} {category} in this result.",
         }
     return None
 
@@ -4675,7 +4901,7 @@ def _artwork_proxy_url(track: Dict[str, Any]) -> str:
     )
     if version and version != "0":
         query["v"] = version[:128]
-    return f"/api/cores/music_core/webhook/artwork?{urlencode(query)}"
+    return f"/api/cores/custom_music_core/webhook/artwork?{urlencode(query)}"
 
 
 def _artwork_display_url(track: Dict[str, Any]) -> str:
@@ -5709,40 +5935,71 @@ def _provider_connection_detail(
 ) -> str:
     del provider_id
     return _text(
-        cfg.get("tater_tube_server_url") or cfg.get("server_url")
-    ) or "Pair with a Player PIN from Tater Tube Server."
+        cfg.get("emby_server_url") or cfg.get("server_url")
+    ) or "Point this core at your Emby server to begin."
 
 
 def _provider_fields(cfg: Dict[str, Any], provider_id: str) -> List[Dict[str, Any]]:
     del provider_id
+    auth_mode = _text(cfg.get("emby_auth_mode")).casefold() or "user_token"
     return [
         {
-            "key": "server_url",
-            "label": "Tater Tube Server URL",
+            "key": "emby_server_url",
+            "label": "Emby Server URL",
             "type": "text",
             "required": True,
             "value": _text(
-                cfg.get("tater_tube_server_url") or cfg.get("server_url")
+                cfg.get("emby_server_url") or cfg.get("server_url")
             ),
-            "placeholder": "http://tater-tube-server:8080",
+            "placeholder": "http://emby.local:8096",
         },
         {
-            "key": "name",
-            "label": "Music Player Name",
+            "key": "emby_auth_mode",
+            "label": "Sign-In Style",
+            "type": "select",
+            "value": auth_mode,
+            "options": [
+                {"value": "user_token", "label": "Emby username & password"},
+                {"value": "api_key", "label": "Server API key"},
+            ],
+            "description": (
+                "Username sign-in streams through Tater's built-in proxy and honors each Emby user's "
+                "library access. An API key streams directly from Emby and needs the User ID below."
+            ),
+        },
+        {
+            "key": "emby_username",
+            "label": "Emby Username",
             "type": "text",
-            "value": _text(
-                cfg.get("tater_tube_player_name") or cfg.get("player_name")
-            )
-            or "Tater Music Core",
+            "value": _text(cfg.get("emby_username")),
         },
         {
-            "key": "pin",
-            "label": "6-digit Player Pairing PIN",
+            "key": "emby_password",
+            "label": "Emby Password",
             "type": "password",
             "value": "",
-            "description": (
-                "Required for first connection. Leave blank to keep the existing pairing."
-            ),
+            "description": "Used for username sign-in. Leave blank to keep the saved password.",
+        },
+        {
+            "key": "emby_api_key",
+            "label": "Emby API Key",
+            "type": "password",
+            "value": _text(cfg.get("emby_api_key")),
+            "description": "Server API key from Emby Dashboard > Advanced > Security, for API-key sign-in.",
+        },
+        {
+            "key": "emby_user_id",
+            "label": "Emby User ID (optional)",
+            "type": "text",
+            "value": _text(cfg.get("emby_user_id")),
+            "description": "Required for API-key sign-in when the server has more than one user.",
+        },
+        {
+            "key": "emby_library_name",
+            "label": "Emby Library Name (optional)",
+            "type": "text",
+            "value": _text(cfg.get("emby_library_name")),
+            "description": "Only needed when this Emby user can see several music libraries.",
         },
     ]
 
@@ -5753,7 +6010,7 @@ def _provider_cards(
     active_provider: str,
 ) -> List[Dict[str, Any]]:
     del active_provider
-    provider_id = "tater_tube"
+    provider_id = "emby"
     label = PROVIDER_LABELS[provider_id]
     connected = _paired(cfg)
     actions: List[Dict[str, Any]] = [
@@ -5777,13 +6034,13 @@ def _provider_cards(
                     "action": "music_provider_disconnect",
                     "label": "Disconnect",
                     "tone": "danger",
-                    "confirm": f"Disconnect Music Core from {label}?",
+                    "confirm": f"Disconnect Custom Music Core from {label}?",
                 },
             ]
         )
     return [
         {
-            "id": "provider:tater_tube",
+            "id": "provider:emby",
             "group": "providers",
             "title": label,
             "subtitle": "Connected music source" if connected else "Not connected",
@@ -6273,7 +6530,7 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
         ]
     )
     return {
-        "summary": "Tater Tube music with voice control, personalized recommendations, and multi-room playback.",
+        "summary": "Personal Emby and network-share music with voice control, per-person recommendations, and multi-room playback.",
         "stats": [
             {
                 "label": "Music Source",
@@ -6299,10 +6556,10 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
             },
         ],
         "items": [],
-        "empty_message": "Connect Tater Tube Server to load your music library.",
+        "empty_message": "Connect your Emby server to load your music library.",
         "ui": {
             "kind": "settings_manager",
-            "title": "Music Core",
+            "title": "Custom Music Core",
             "appearance": "music_library",
             "live_updates": True,
             "poll_interval_ms": 3000,
@@ -6360,7 +6617,7 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
                     "item_group": "recommendations",
                     "empty_message": f"Play some music to help {assistant_name} build recommendations.",
                 },
-                {"key": "providers", "label": "Tater Tube", "source": "items", "item_group": "providers"},
+                {"key": "providers", "label": "Sources", "source": "items", "item_group": "providers"},
                 {
                     "key": "airplay",
                     "label": "AirPlay",
@@ -6384,12 +6641,12 @@ def _payload_values(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _provider_from_card(payload: Dict[str, Any], fallback: Any = "") -> str:
     item_id = _text(payload.get("id"))
-    if item_id and item_id != "provider:tater_tube":
-        raise ValueError("Music Core only supports Tater Tube Server.")
-    candidate = _text(payload.get("provider") or fallback).lower().replace("-", "_")
-    if candidate and candidate not in {"tater_tube", "tatertube", "tater_tube_server"}:
-        raise ValueError("Music Core only supports Tater Tube Server.")
-    return "tater_tube"
+    if item_id and item_id != "provider:emby":
+        raise ValueError("Unknown music source.")
+    candidate = _provider_id(_text(payload.get("provider") or fallback))
+    if candidate != "emby":
+        raise ValueError("Only the Emby source can be connected in this build.")
+    return "emby"
 
 
 def _connect_provider(
@@ -6397,48 +6654,60 @@ def _connect_provider(
     values: Dict[str, Any],
     client: Any,
 ) -> Dict[str, Any]:
-    if provider_id != "tater_tube":
-        raise ValueError("Music Core only supports Tater Tube Server.")
+    if provider_id != "emby":
+        raise ValueError("Only the Emby source can be connected in this build.")
     cfg = _settings(client)
-    updates: Dict[str, Any] = {}
+    auth_mode = (
+        "api_key"
+        if _text(values.get("emby_auth_mode")).casefold() == "api_key"
+        else "user_token"
+    )
     server_url = _normalize_server_url(
-        values.get("server_url")
-        or cfg.get("tater_tube_server_url")
+        values.get("emby_server_url")
+        or values.get("server_url")
+        or cfg.get("emby_server_url")
         or cfg.get("server_url")
     )
-    name = _text(
-        values.get("name")
-        or cfg.get("tater_tube_player_name")
-        or cfg.get("player_name")
-    ) or "Tater Music Core"
-    pin = "".join(char for char in _text(values.get("pin")) if char.isdigit())
-    token = _text(cfg.get("tater_tube_token") or cfg.get("token"))
-    player_id = _text(cfg.get("tater_tube_player_id") or cfg.get("player_id"))
-    if pin:
-        if len(pin) != 6:
-            raise ValueError("Enter the 6-digit Player PIN created by Tater Tube Server.")
-        paired = TaterTubeMusicProvider.pair(server_url, pin, name)
-        if not isinstance(paired, dict) or not _text(paired.get("token")):
-            raise RuntimeError("Tater Tube Server did not return a music player token.")
-        token = _text(paired.get("token"))
-        player_id = _text(paired.get("player_id"))
-        name = _text(paired.get("player_name")) or name
-    if not token:
-        raise ValueError("Enter a 6-digit Player PIN to pair Tater Tube Server.")
-    updates.update(
-        {
-            "tater_tube_server_url": server_url,
-            "tater_tube_player_name": name,
-            "tater_tube_player_id": player_id,
-            "tater_tube_token": token,
-            "server_url": server_url,
-            "player_name": name,
-            "player_id": player_id,
-            "token": token,
-        }
+    username = _text(values.get("emby_username") or cfg.get("emby_username"))
+    password = _text(values.get("emby_password")) or _text(cfg.get("emby_password"))
+    api_key = _text(values.get("emby_api_key")) or _text(cfg.get("emby_api_key"))
+    user_id = _text(values.get("emby_user_id") or cfg.get("emby_user_id"))
+    library_name = _text(values.get("emby_library_name") or cfg.get("emby_library_name"))
+    provider = EmbyMusicProvider(
+        server_url=server_url,
+        auth_mode=auth_mode,
+        username=username,
+        password=password,
+        api_key=api_key,
+        user_id=user_id,
+        library_name=library_name,
     )
+    if not provider.connected:
+        raise ValueError("Enter the Emby server URL plus a username and password, or an API key.")
+    provider.clear_cached_auth(client)
+    resolved_user_id = user_id
+    try:
+        if auth_mode == "user_token":
+            _token, resolved_user_id = provider.authenticate(force=True, client=client)
+        else:
+            resolved_user_id = provider.resolve_user_id(client)
+    except PermissionError as exc:
+        raise ValueError(f"{PROVIDER_LABELS[provider_id]} rejected the credentials: {exc}") from exc
 
-    _save_hash(client, SETTINGS_KEY, updates)
+    _save_hash(
+        client,
+        SETTINGS_KEY,
+        {
+            "emby_server_url": server_url,
+            "emby_auth_mode": auth_mode,
+            "emby_username": username,
+            "emby_password": password,
+            "emby_api_key": api_key,
+            "emby_user_id": resolved_user_id,
+            "emby_library_name": library_name,
+            "server_url": server_url,
+        },
+    )
     catalog = _sync_catalog(client, provider_id)
     return {
         "ok": True,
@@ -6450,23 +6719,27 @@ def _connect_provider(
 
 
 def _disconnect_provider(provider_id: str, client: Any) -> Dict[str, Any]:
-    if provider_id != "tater_tube":
-        raise ValueError("Music Core only supports Tater Tube Server.")
+    if provider_id != "emby":
+        raise ValueError("Only the Emby source can be disconnected in this build.")
     fields = (
-        "tater_tube_server_url",
-        "tater_tube_player_name",
-        "tater_tube_player_id",
-        "tater_tube_token",
+        "emby_server_url",
+        "emby_auth_mode",
+        "emby_username",
+        "emby_password",
+        "emby_api_key",
+        "emby_user_id",
+        "emby_library_name",
         "server_url",
-        "player_name",
-        "player_id",
-        "token",
     )
     player = _player(client)
     if _provider_id(player.get("provider")) == provider_id:
         _stop_player(client=client)
     if client is not None:
         client.hdel(SETTINGS_KEY, *fields)
+        try:
+            client.delete(EMBY_AUTH_CACHE_KEY)
+        except Exception:
+            pass
         cached = _load_json(client, CATALOG_KEY, {})
         if _provider_id(cached.get("provider")) == provider_id:
             client.delete(CATALOG_KEY)
@@ -6560,13 +6833,8 @@ def handle_htmlui_tab_action(
     body = payload if isinstance(payload, dict) else {}
     values = _payload_values(body)
 
-    if action_name in {"music_pair_tater_tube", "music_provider_connect"}:
-        provider_id = (
-            "tater_tube"
-            if action_name == "music_pair_tater_tube"
-            else _provider_from_card(body)
-        )
-        return _connect_provider(provider_id, values, store)
+    if action_name == "music_provider_connect":
+        return _connect_provider(_provider_from_card(body), values, store)
 
     if action_name == "music_provider_activate":
         provider_id = _provider_from_card(body)
@@ -6582,12 +6850,7 @@ def handle_htmlui_tab_action(
         }
 
     if action_name in {"music_disconnect", "music_provider_disconnect"}:
-        provider_id = (
-            "tater_tube"
-            if action_name == "music_disconnect"
-            else _provider_from_card(body)
-        )
-        return _disconnect_provider(provider_id, store)
+        return _disconnect_provider(_provider_from_card(body), store)
 
     if action_name == "music_sync_now":
         selected_provider = _provider_id(_settings(store).get("provider"))
@@ -6683,7 +6946,7 @@ def handle_htmlui_tab_action(
             _schedule_music_prompt_profile_refresh(store)
         if any(key.startswith("airplay_receiver_") for key in updates):
             _configure_external_audio(next_settings, _player(store))
-        return {"ok": True, "message": "Music Core settings saved."}
+        return {"ok": True, "message": "Custom Music Core settings saved."}
 
     if action_name == "music_airplay_stop":
         module = _external_audio_module()
@@ -6788,7 +7051,7 @@ def handle_htmlui_tab_action(
     if action_name == "music_ui_save_player":
         player = _player(store)
         current_settings = _settings(store)
-        selected_provider = "tater_tube"
+        selected_provider = "emby"
         old_targets = _list(player.get("targets") or player.get("target"))
         old_player_settings = _selected_player_settings(
             old_targets,
@@ -7059,7 +7322,7 @@ def handle_htmlui_tab_action(
         )
         return {"ok": True, "message": _text(player_result.get("summary_for_user"))}
 
-    raise ValueError(f"Unknown Music Core action: {action_name}")
+    raise ValueError(f"Unknown Custom Music Core action: {action_name}")
 
 
 def _fetch_track_artwork(track: Dict[str, Any], client: Any = None) -> Dict[str, Any]:
@@ -7162,7 +7425,7 @@ def handle_core_webhook(
     **_kwargs,
 ) -> Any:
     if _text(webhook).lower() != "artwork":
-        raise KeyError(f"Unsupported Music Core webhook: {webhook}")
+        raise KeyError(f"Unsupported Custom Music Core webhook: {webhook}")
     params = query if isinstance(query, dict) else {}
     provider_id = _provider_id(
         params.get("provider"),
@@ -7259,8 +7522,8 @@ def get_core_system_tasks(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
         and has_profile_history
     )
     return {
-        "label": "Music Core",
-        "order": 35,
+        "label": "Custom Music Core",
+        "order": 36,
         "tasks": [
             {
                 "id": "catalog_sync",
@@ -7338,9 +7601,9 @@ def get_core_system_tasks(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
                 "unavailable_reason": (
                     f"Connect {PROVIDER_LABELS.get(provider_id, provider_id)} before building a music profile."
                     if not connected
-                    else "Turn on Music Prompt Context in Music Core Settings."
+                    else "Turn on Music Prompt Context in Custom Music Core Settings."
                     if not prompt_context_enabled
-                    else "Choose an existing Person in Music Core Settings."
+                    else "Choose an existing Person in Custom Music Core Settings."
                     if not prompt_person_id or not prompt_person_name
                     else f"Play some music for {prompt_person_name} first."
                 ),
@@ -7398,7 +7661,208 @@ def run_core_system_task(*, task_id: str, redis_client=None, **_kwargs) -> Dict[
             "person_id": _text(profile.get("person_id")),
             "history_event_count": _as_int(profile.get("history_event_count"), 0, 0, 1_000_000_000),
         }
-    raise KeyError(f"Unknown Music Core task: {task_id}")
+    raise KeyError(f"Unknown Custom Music Core task: {task_id}")
+
+
+def _emby_upstream_request(
+    kind: str,
+    item_id: str,
+    *,
+    sync: bool = False,
+) -> tuple[str, Dict[str, str]]:
+    """Build (url, headers) for proxying one Emby stream or artwork request."""
+    if kind not in ("emby", "emby_art"):
+        raise LookupError("Unknown stream request.")
+    provider = EmbyMusicProvider.from_settings(_settings())
+    if not provider.connected:
+        raise RuntimeError("Emby is not connected.")
+    params: Dict[str, Any] = {}
+    headers = {"Accept": "*/*"}
+    if kind == "emby":
+        if sync:
+            # Mixed Tater satellite + Sonos/AirPlay groups share one normalized
+            # PCM source so every target can stay clock-aligned.
+            params.update({"AudioCodec": "wav", "AudioSampleRate": 44100, "AudioChannels": 2})
+        else:
+            params["Static"] = "true"
+        path = f"Audio/{quote(str(item_id), safe='')}/stream"
+    else:
+        params.update({"MaxWidth": EMBY_ARTWORK_MAX_WIDTH, "Quality": 90})
+        path = f"Items/{quote(str(item_id), safe='')}/Images/Primary"
+    if provider.auth_mode == "api_key":
+        params["api_key"] = provider.api_key
+    else:
+        headers["X-Emby-Token"] = provider._access_token()
+    return f"{provider.server_url}/{path}?{urlencode(params)}", headers
+
+
+class _MusicStreamHandler(BaseHTTPRequestHandler):
+    """Range-capable proxy that keeps Emby per-user tokens out of stream URLs."""
+
+    server_version = "TaterCustomMusic/1.0"
+    protocol_version = "HTTP/1.1"
+    upstream = None
+
+    def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A002 - stdlib signature
+        logger.debug("[Music] stream server: " + fmt % args)
+
+    def do_GET(self) -> None:  # noqa: N802 - stdlib signature
+        self._handle()
+
+    def do_HEAD(self) -> None:  # noqa: N802 - stdlib signature
+        self._handle()
+
+    def _handle(self) -> None:
+        try:
+            parsed = urlparse(self.path)
+            parts = [part for part in parsed.path.split("/") if part]
+            if len(parts) != 4 or parts[0] != "stream":
+                raise LookupError("not found")
+            token, kind, item_id = parts[1], parts[2], parts[3]
+            if not hmac.compare_digest(token, _stream_token()):
+                self._send_error(403, "Invalid stream token.")
+                return
+            sync = any(
+                key.casefold() == "sync" and _text(value) not in {"0", "false", "no"}
+                for key, value in parse_qsl(parsed.query)
+            )
+            upstream_url, headers = _emby_upstream_request(kind, item_id, sync=sync)
+            forward_headers = {
+                key.title(): value
+                for key, value in (
+                    ("range", self.headers.get("Range")),
+                    ("if-range", self.headers.get("If-Range")),
+                )
+                if value
+            }
+            headers.update(forward_headers)
+            upstream = requests.request(
+                "HEAD" if self.command == "HEAD" else "GET",
+                upstream_url,
+                headers=headers,
+                stream=True,
+                timeout=(10, 60),
+            )
+            if upstream.status_code >= 400:
+                upstream.close()
+                self._send_error(
+                    502 if upstream.status_code >= 500 else upstream.status_code,
+                    "Emby rejected the stream request.",
+                )
+                return
+            response_headers = {"Cache-Control": "private, max-age=300"}
+            for name in (
+                "Accept-Ranges",
+                "Content-Length",
+                "Content-Range",
+                "Content-Type",
+                "ETag",
+                "Last-Modified",
+            ):
+                value = upstream.headers.get(name)
+                if value:
+                    response_headers[name] = value
+            media_type = _text(upstream.headers.get("Content-Type")).split(";", 1)[0].strip()
+            if media_type:
+                response_headers["Content-Type"] = media_type
+            self.send_response(upstream.status_code)
+            for name, value in response_headers.items():
+                self.send_header(name, value)
+            self.end_headers()
+            if self.command == "HEAD":
+                upstream.close()
+                return
+            try:
+                for chunk in upstream.iter_content(chunk_size=STREAM_CHUNK_SIZE):
+                    if chunk:
+                        self.wfile.write(chunk)
+            except Exception:
+                # Client disconnected mid-stream; nothing further to clean up.
+                pass
+            finally:
+                upstream.close()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except LookupError as exc:
+            # Unknown stream route/kind: a client error, not an upstream fault.
+            try:
+                self._send_error(404, _text(exc) or "Not found.")
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.warning("[Music] stream server request failed: %s", exc)
+            try:
+                self._send_error(502, _text(exc) or "Stream request failed.")
+            except Exception:
+                pass
+
+    def _send_error(self, status: int, message: str) -> None:
+        body = message.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+
+_stream_server_lock = threading.Lock()
+_stream_server: Optional["ThreadingHTTPServer"] = None
+_stream_server_signature = ""
+
+
+def _ensure_stream_server() -> Dict[str, Any]:
+    """Start or restart the internal stream server when its port changes."""
+    global _stream_server, _stream_server_signature
+    port = _stream_port()
+    token = _stream_token()
+    signature = f"{port}:{hashlib.sha256(token.encode('utf-8')).hexdigest()[:12]}"
+    with _stream_server_lock:
+        if (
+            _stream_server is not None
+            and _stream_server_signature == signature
+        ):
+            return {"ok": True, "status": "ready", "port": port}
+        if _stream_server is not None:
+            try:
+                _stream_server.shutdown()
+                _stream_server.server_close()
+            except Exception:
+                pass
+            _stream_server = None
+        try:
+            server = ThreadingHTTPServer(("", port), _MusicStreamHandler)
+            server.daemon_threads = True
+        except Exception as exc:
+            return {
+                "ok": False,
+                "status": "error",
+                "port": port,
+                "error": f"Could not start the stream server on port {port}: {exc}",
+            }
+        thread = threading.Thread(
+            target=server.serve_forever,
+            name="custom-music-stream-server",
+            daemon=True,
+        )
+        thread.start()
+        _stream_server = server
+        _stream_server_signature = signature
+        return {"ok": True, "status": "ready", "port": port}
+
+
+def _shutdown_stream_server() -> None:
+    global _stream_server, _stream_server_signature
+    with _stream_server_lock:
+        if _stream_server is not None:
+            try:
+                _stream_server.shutdown()
+                _stream_server.server_close()
+            except Exception:
+                pass
+        _stream_server = None
+        _stream_server_signature = ""
 
 
 def run(stop_event: Optional[object] = None) -> None:
@@ -7414,6 +7878,17 @@ def run(stop_event: Optional[object] = None) -> None:
                 continue
             runtime = _runtime()
             now = time.time()
+            stream_status = _ensure_stream_server()
+            if not stream_status.get("ok"):
+                _save_hash(
+                    redis_client,
+                    RUNTIME_KEY,
+                    {
+                        "stream_server_status": "error",
+                        "stream_server_error": _text(stream_status.get("error"))[:500],
+                    },
+                )
+                logger.warning("[Music] %s", stream_status.get("error"))
             interval = _as_int(
                 cfg.get("catalog_sync_interval_seconds"),
                 DEFAULT_SYNC_INTERVAL_SECONDS,
@@ -7481,7 +7956,7 @@ def run(stop_event: Optional[object] = None) -> None:
                     _schedule_music_prompt_profile_refresh()
             except PermissionError as exc:
                 logger.warning("[Music] provider authorization was revoked: %s", exc)
-                redis_client.hdel(SETTINGS_KEY, "tater_tube_token", "token")
+                redis_client.delete(EMBY_AUTH_CACHE_KEY)
                 _save_hash(
                     redis_client,
                     RUNTIME_KEY,
@@ -7504,6 +7979,7 @@ def run(stop_event: Optional[object] = None) -> None:
                 )
             time.sleep(1.0)
     finally:
+        _shutdown_stream_server()
         module = _external_audio_module()
         if module is not None:
             try:

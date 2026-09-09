@@ -3,18 +3,20 @@
   "cores": [
     {
       "id": "custom_music",
-      "name": "Music Core",
+      "name": "Custom Music Core",
       "module_key": "custom_music_core",
-      "version": "3.4.6",
+      "version": "1.0.0",
       "min_tater_version": "99.5",
-      "description": "Connect Tater Tube Server to Tater; browse music, build AI-named recommendations from listening history, and keep voice-controlled queues playing with a smart continuous-radio refill across clock-synchronized satellites, native Sonos groups, stereo pairs, and media players.",
-      "settings_category": "Music Core Settings",
-      "required_settings_count": 16,
+      "description": "Per-person music for Tater: link each Person to their own Emby user or network-share folder, browse and play their library with voice control, and build AI-named recommendations from each Person's listening history across clock-synchronized satellites, native Sonos groups, stereo pairs, and media players.",
+      "settings_category": "Custom Music Core Settings",
+      "required_settings_count": 18,
       "autostart_key": "custom_music_core_running",
       "tags": [
         "music",
         "player",
-        "tater-tube",
+        "emby",
+        "network-share",
+        "per-person",
         "satellite",
         "stereo",
         "multi-room",
@@ -23,7 +25,7 @@
         "album-art"
       ],
       "entry": "cores/custom_music_core.py",
-      "sha256": "9f2bce40ad9c53b450e6c31caca33ecf0a62fab7b4257a03abf8a8c5fbb2503a"
+      "sha256": "ca282ec068f24527c02b8b8b0bc0a343bd424521852b7cc280832375f4411cb3"
     }
   ]
 }
