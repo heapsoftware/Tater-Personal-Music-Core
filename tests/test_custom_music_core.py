@@ -931,5 +931,136 @@ class PerPersonLinkageTests(unittest.TestCase):
         self.assertTrue(art_url.startswith("http://emby.local:8096/Items/song1/Images/Primary?"))
 
 
+class UpstreamCoexistenceTests(unittest.TestCase):
+    """Both this core and the upstream Music Core enabled side by side."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.core = load_custom_music_core()
+        # Snapshot of Tater_Shop's cores/music_core.py this file was renamed
+        # from (pre-divergence), kept so coexistence is testable offline.
+        upstream_path = (
+            Path(__file__).resolve().parent / "fixtures" / "upstream_music_core.py"
+        )
+        if not upstream_path.exists():
+            raise unittest.SkipTest("upstream music_core.py snapshot not present")
+        spec = importlib.util.spec_from_file_location("tater_upstream_music_core", upstream_path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        cls.upstream = module
+
+    def test_redis_keys_never_overlap(self):
+        ours = {
+            value
+            for name, value in vars(self.core).items()
+            if name.isupper() and isinstance(value, str) and "custom_music_core" in value
+        }
+        theirs = {
+            value
+            for name, value in vars(self.upstream).items()
+            if name.isupper() and isinstance(value, str) and "music" in value
+        }
+        overlap = {
+            key
+            for key in ours & theirs
+            if key.startswith(("music_core", "custom_music_core"))
+        }
+        self.assertEqual(overlap, set())
+
+    def test_hydra_tool_ids_do_not_collide(self):
+        # Hydra kernel tool ids are a global first-declared-wins namespace, so a
+        # collision here would silently drop one core's tools.
+        ours = {row["id"] for row in self.core.get_hydra_kernel_tools()}
+        theirs = {row["id"] for row in self.upstream.get_hydra_kernel_tools()}
+        self.assertEqual(ours & theirs, set())
+
+    def test_settings_category_and_tab_labels_differ(self):
+        self.assertNotEqual(
+            self.core.CORE_SETTINGS["category"],
+            self.upstream.CORE_SETTINGS["category"],
+        )
+        self.assertNotEqual(
+            self.core.CORE_WEBUI_TAB["label"],
+            self.upstream.CORE_WEBUI_TAB["label"],
+        )
+
+    def test_provider_namespaces_are_disjoint(self):
+        self.assertEqual(
+            self.core.PROVIDER_LABELS.keys() & self.upstream.PROVIDER_LABELS.keys(),
+            set(),
+        )
+        self.assertEqual(
+            self.core.CATALOG_PROVIDER_IDS & self.upstream.CATALOG_PROVIDER_IDS,
+            set(),
+        )
+
+    def test_both_cores_sync_catalogs_into_the_same_store_without_interference(self):
+        store = self.core.redis_client
+
+        class FakeEmby:
+            provider_id = "emby"
+            connected = True
+
+            def catalog(self):
+                return {
+                    "catalog_id": "v1",
+                    "tracks": [
+                        {
+                            "Id": "song1",
+                            "Name": "Emby Song",
+                            "Artists": ["Emby Artist"],
+                            "Album": "Emby Album",
+                            "RunTimeTicks": 180_000_000,
+                            "ImageTags": {"Primary": "t"},
+                        }
+                    ],
+                    "total": 1,
+                    "libraries": {"v1": "Music"},
+                }
+
+        class FakeTaterTube:
+            connected = True
+
+            def catalog(self):
+                return {
+                    "tracks": [
+                        {
+                            "id": "tt1",
+                            "title": "Tube Song",
+                            "artist": "Tube Artist",
+                            "album": "Tube Album",
+                            "duration_seconds": 120,
+                        }
+                    ],
+                    "total": 1,
+                }
+
+        original_core_provider = self.core._provider
+        original_upstream_provider = self.upstream._provider
+        self.core._provider = lambda client=None, provider_id="", person_id="": FakeEmby()
+        self.upstream._provider = lambda *args, **kwargs: FakeTaterTube()
+        try:
+            ours = self.core._sync_catalog()
+            theirs = self.upstream._sync_catalog()
+            self.assertEqual(ours["provider"], "emby")
+            self.assertEqual(theirs["provider"], "tater_tube")
+            # Each core reads back exactly its own library from the shared store.
+            self.assertEqual(
+                [track["title"] for track in self.core._catalog()["tracks"]],
+                ["Emby Song"],
+            )
+            self.assertEqual(
+                [track["title"] for track in self.upstream._catalog()["tracks"]],
+                ["Tube Song"],
+            )
+            # The upstream core's history stays untouched by ours.
+            self.core._record_listening_history(dict(ours["tracks"][0]), ["t1"], client=store)
+            self.assertEqual(self.upstream._listening_history(), [])
+        finally:
+            self.core._provider = original_core_provider
+            self.upstream._provider = original_upstream_provider
+
+
 if __name__ == "__main__":
     unittest.main()
