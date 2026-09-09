@@ -53,7 +53,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby user or network-share folder, browse and play "
@@ -198,6 +198,20 @@ CORE_SETTINGS = {
             "default": 12,
             "description": "How often Custom Music Core refreshes the selected Person's prompt-ready listening profile.",
         },
+        "queue_conflict_mode": {
+            "label": "Playback Conflicts",
+            "type": "select",
+            "default": "ask",
+            "options": [
+                {"value": "ask", "label": "Ask before taking over"},
+                {"value": "auto_move", "label": "Auto-move / take over"},
+            ],
+            "description": (
+                "What to do when requested rooms are already playing someone else's music, or a "
+                "Person asks for music while their own music plays elsewhere. Each Person can "
+                "override this on their link card in the People section."
+            ),
+        },
     },
     "tags": TAGS,
 }
@@ -217,6 +231,15 @@ RUNTIME_KEY = "custom_music_core:runtime"
 PERSON_LINKS_KEY = "custom_music_core:person_links"
 CATALOG_KEY = "custom_music_core:catalog:v1"
 PLAYER_KEY = "custom_music_core:player"
+# Per-person queues live at "custom_music_core:player:<person_id>" while the
+# shared household queue stays at "custom_music_core:player" ("" queue id), so
+# existing installs keep their global player state untouched.
+QUEUE_REGISTRY_KEY = "custom_music_core:queues"
+ROOM_BINDINGS_KEY = "custom_music_core:room_bindings"
+PENDING_CONFIRM_KEY_PREFIX = "custom_music_core:pending:"
+PENDING_CONFIRM_TTL_SECONDS = 600.0
+QUEUE_CONFLICT_MODES = ("ask", "auto_move")
+DEFAULT_QUEUE_CONFLICT_MODE = "ask"
 HISTORY_KEY = "custom_music_core:history:v1"
 RECOMMENDATIONS_KEY = "custom_music_core:recommendations:v1"
 PROMPT_PROFILE_KEY = "custom_music_core:profile:v1"
@@ -392,7 +415,9 @@ _profile_started_at = 0.0
 _profile_thread: Optional[threading.Thread] = None
 _continuation_lock = threading.Lock()
 _continuation_started_at = 0.0
-_continuation_thread: Optional[threading.Thread] = None
+# One radio-continuation worker per queue slot ("" = shared household queue) so
+# two Person queues can extend their queues at the same time.
+_continuation_threads: Dict[str, Optional[threading.Thread]] = {}
 _client_continuation_lock = threading.Lock()
 
 
@@ -2680,11 +2705,290 @@ def _public_track(track: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
-def _player(client: Any = None) -> Dict[str, Any]:
+def _player_key(person_id: Any = "") -> str:
+    """Queue storage key: shared household queue for "", per-Person otherwise."""
+    wanted = _text(person_id)
+    return f"{PLAYER_KEY}:{wanted}" if wanted else PLAYER_KEY
+
+
+def _queue_id_for_person(person_id: Any) -> str:
+    """Every Person gets their own queue; only personless requests share one."""
+    return _text(person_id)
+
+
+def _register_queue(person_id: Any, client: Any = None) -> None:
+    """Track queue slots so the background loop advances every active queue."""
     store = client or globals().get("redis_client")
-    payload = _load_json(store, PLAYER_KEY, {})
+    queue_id = _queue_id_for_person(person_id)
+    if store is None or not queue_id:
+        return
+    registry = _queue_registry(store)
+    if queue_id in registry:
+        return
+    registry[queue_id] = {"person_id": queue_id, "created_at": time.time()}
+    _save_json(store, QUEUE_REGISTRY_KEY, registry)
+
+
+def _queue_registry(client: Any = None) -> Dict[str, Dict[str, Any]]:
+    store = client or globals().get("redis_client")
+    payload = _load_json(store, QUEUE_REGISTRY_KEY, {})
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        _text(queue_id): row
+        for queue_id, row in payload.items()
+        if _text(queue_id) and isinstance(row, dict)
+    }
+
+
+def _active_queue_ids(client: Any = None) -> List[str]:
+    """All queue slots that exist: the shared queue plus every Person queue."""
+    store = client or globals().get("redis_client")
+    return ["", *_queue_registry(store).keys()]
+
+
+# --------------------------------------------------------------------------
+# Multi-queue coordination: room occupancy, room bindings, conflict handling,
+# and pending confirmations. A room plays at most one queue's stream at a
+# time; these helpers decide who owns a room and how takeovers are resolved.
+# --------------------------------------------------------------------------
+
+def _queue_conflict_mode(person_id: Any, client: Any = None) -> str:
+    """Per-Person conflict behavior from their link, else the shared default."""
+    mode = ""
+    if _text(person_id):
+        mode = _text(_person_link(person_id, client).get("queue_conflict_mode")).casefold()
+    if mode not in QUEUE_CONFLICT_MODES:
+        mode = _text(_settings(client).get("queue_conflict_mode")).casefold()
+    return mode if mode in QUEUE_CONFLICT_MODES else DEFAULT_QUEUE_CONFLICT_MODE
+
+
+def _room_bindings(client: Any = None) -> Dict[str, str]:
+    """Persistent room -> Person bindings ("the Kitchen plays Alex's music")."""
+    store = client or globals().get("redis_client")
+    if store is None:
+        return {}
+    try:
+        raw = store.hgetall(ROOM_BINDINGS_KEY) or {}
+    except Exception:
+        return {}
+    bindings: Dict[str, str] = {}
+    for target, person in raw.items():
+        target_name = _text(target)
+        person_id = _text(person)
+        if target_name and person_id:
+            bindings[target_name] = person_id
+    return bindings
+
+
+def _bound_targets_for_person(person_id: Any, client: Any = None) -> List[str]:
+    wanted = _text(person_id)
+    if not wanted:
+        return []
+    return sorted(
+        target for target, person in _room_bindings(client).items() if person == wanted
+    )
+
+
+def _set_room_bindings(targets: Any, person_id: Any, client: Any = None) -> List[str]:
+    """Bind rooms to a Person's queue (or clear them when person_id is empty)."""
+    store = client or globals().get("redis_client")
+    wanted = _text(person_id)
+    changed: List[str] = []
+    for target in _normalize_stereo_targets(targets):
+        target_name = _text(target)
+        if not target_name:
+            continue
+        try:
+            if wanted:
+                store.hset(ROOM_BINDINGS_KEY, target_name, wanted)
+            else:
+                store.hdel(ROOM_BINDINGS_KEY, target_name)
+        except Exception:
+            continue
+        changed.append(target_name)
+    return changed
+
+
+def _occupied_targets(client: Any = None) -> Dict[str, str]:
+    """Map each destination with a live (playing or paused) queue to its queue id."""
+    store = client or globals().get("redis_client")
+    occupied: Dict[str, str] = {}
+    for queue_id in _active_queue_ids(store):
+        player = _player(store, queue_id)
+        if _text(player.get("status")).lower() not in {"playing", "paused"}:
+            continue
+        for target in _list(player.get("targets") or player.get("target")):
+            occupied[target] = queue_id
+    return occupied
+
+
+def _queue_conflicts(
+    client: Any,
+    person_id: Any,
+    targets: Any,
+) -> Dict[str, Any]:
+    """Who is playing on the requested rooms, and is the Person's own queue elsewhere?"""
+    store = client or globals().get("redis_client")
+    queue_id = _queue_id_for_person(person_id)
+    wanted = set(_normalize_stereo_targets(targets))
+    occupied = _occupied_targets(store)
+    foreign = {target: qid for target, qid in occupied.items() if qid != queue_id}
+    own = _player(store, queue_id)
+    own_targets = _list(own.get("targets") or own.get("target"))
+    own_playing_elsewhere = (
+        _text(own.get("status")).lower() in {"playing", "paused"}
+        and bool(own_targets)
+        and not (set(own_targets) & wanted)
+    )
+    return {
+        "foreign_targets": sorted(foreign),
+        "foreign_queues": sorted(set(foreign.values())),
+        "own_playing_elsewhere": own_playing_elsewhere,
+        "own_queue": own,
+    }
+
+
+def _release_targets_to(
+    store: Any,
+    targets: Any,
+    *,
+    except_queue_id: Any = "",
+) -> List[str]:
+    """Stop other queues on the given rooms and shrink their target lists.
+
+    A queue that keeps at least one room is paused with its position intact, so
+    its owner can resume it elsewhere; a queue with no rooms left is stopped.
+    """
+    wanted = set(_normalize_stereo_targets(targets))
+    except_queue_id = _queue_id_for_person(except_queue_id)
+    released: List[str] = []
+    for queue_id in _active_queue_ids(store):
+        if queue_id == except_queue_id:
+            continue
+        with _state_lock:
+            other = _player(store, queue_id)
+            if _text(other.get("status")).lower() not in {"playing", "paused"}:
+                continue
+            old_targets = _list(other.get("targets") or other.get("target"))
+            stolen = [target for target in old_targets if target in wanted]
+            if not stolen:
+                continue
+            # Only stop the media sessions that belong to the stolen rooms.
+            sessions = _playback_voice_core_sessions(other)
+            sessions_for_stolen = [
+                session
+                for session in sessions
+                if set(
+                    _expand_session_selectors(session)
+                )
+                & wanted
+            ]
+            try:
+                warnings = _stop_target(
+                    stolen,
+                    expected_voice_core_sessions=sessions_for_stolen,
+                )
+            except Exception as exc:
+                warnings = [_text(exc)]
+            remaining = [target for target in old_targets if target not in wanted]
+            position = _player_position_seconds(other)
+            if remaining:
+                other.update(
+                    {
+                        "status": "paused",
+                        "started_at": 0.0,
+                        "position_offset_seconds": position,
+                        "targets": remaining,
+                    }
+                )
+            else:
+                other.update(
+                    {
+                        "status": "stopped",
+                        "started_at": 0.0,
+                        "position_offset_seconds": 0.0,
+                        "targets": [],
+                    }
+                )
+            if warnings:
+                other["warnings"] = [
+                    *_list(other.get("warnings")),
+                    *warnings,
+                ]
+            _save_player(other, store, queue_id)
+            released.extend(stolen)
+    return released
+
+
+def _expand_session_selectors(session: Dict[str, Any]) -> List[str]:
+    """Every speaker a playback session covers, including stereo pair members."""
+    selectors = _list(session.get("selectors") or session.get("target"))
+    expanded: List[str] = list(selectors)
+    try:
+        from tater_voice import stereo_pairs
+
+        for selector in selectors:
+            pair = (
+                stereo_pairs.get_pair(selector)
+                if stereo_pairs.is_stereo_selector(selector)
+                else {}
+            )
+            if isinstance(pair, dict):
+                expanded.extend(
+                    value
+                    for value in (
+                        _text(pair.get("left_selector")),
+                        _text(pair.get("right_selector")),
+                    )
+                    if value
+                )
+    except Exception:
+        pass
+    return expanded
+
+
+def _pending_confirmation_key(person_id: Any) -> str:
+    return f"{PENDING_CONFIRM_KEY_PREFIX}{_text(person_id) or 'shared'}"
+
+
+def _save_pending_confirmation(
+    store: Any,
+    person_id: Any,
+    payload: Dict[str, Any],
+) -> None:
+    body = dict(payload)
+    body["expires_at"] = time.time() + PENDING_CONFIRM_TTL_SECONDS
+    _save_json(store, _pending_confirmation_key(person_id), body)
+
+
+def _load_pending_confirmation(
+    store: Any,
+    person_id: Any,
+) -> Dict[str, Any]:
+    payload = _load_json(store, _pending_confirmation_key(person_id), {})
+    if not isinstance(payload, dict) or not payload:
+        return {}
+    if _as_float(payload.get("expires_at")) < time.time():
+        _clear_pending_confirmation(store, person_id)
+        return {}
+    return payload
+
+
+def _clear_pending_confirmation(store: Any, person_id: Any) -> None:
+    try:
+        store.delete(_pending_confirmation_key(person_id))
+    except Exception:
+        pass
+
+
+def _player(client: Any = None, person_id: Any = "") -> Dict[str, Any]:
+    store = client or globals().get("redis_client")
+    queue_id = _queue_id_for_person(person_id)
+    payload = _load_json(store, _player_key(queue_id), {})
     if not isinstance(payload, dict):
         payload = {}
+    payload["queue_id"] = queue_id
     stale_provider = (
         _text(payload.get("provider")).casefold() not in {"", *CATALOG_PROVIDER_IDS}
     )
@@ -2723,16 +3027,33 @@ def _player(client: Any = None) -> Dict[str, Any]:
     )
     payload.setdefault("continuation_pending", False)
     payload.setdefault("radio_name", "Tater Continuous Radio")
+    if queue_id:
+        # Person queues always know their owner so history attribution and the
+        # queue registry stay consistent even for queues created earlier.
+        payload.setdefault("person_id", queue_id)
     return payload
 
 
-def _save_player(player: Dict[str, Any], client: Any = None) -> None:
+def _save_player(
+    player: Dict[str, Any],
+    client: Any = None,
+    person_id: Any = None,
+) -> None:
     store = client or globals().get("redis_client")
+    queue_id = _queue_id_for_person(
+        person_id if person_id is not None else player.get("queue_id")
+    )
+    player["queue_id"] = queue_id
+    if queue_id:
+        player["person_id"] = queue_id
+        # Keep the queue registry current so occupancy scans and the run loop
+        # always see every Person queue that exists.
+        _register_queue(queue_id, store)
     targets = _normalize_stereo_targets(player.get("targets") or player.get("target"))
     player["targets"] = targets
     player["target"] = targets[0] if targets else ""
     player["updated_at"] = time.time()
-    _save_json(store, PLAYER_KEY, player)
+    _save_json(store, _player_key(queue_id), player)
 
 
 def _persist_shared_player_volume(
@@ -3632,11 +3953,15 @@ def _continuation_candidate_tracks(
     client: Any = None,
     *,
     limit: int = MAX_CONTINUATION_CANDIDATES,
+    person_id: Any = None,
 ) -> tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
     """Rank real catalog tracks with the active song and queue as the strongest signal."""
     store = client or globals().get("redis_client")
+    queue_person = _queue_id_for_person(
+        person_id if person_id is not None else player.get("queue_id")
+    )
     provider_id = _provider_id(player.get("provider"), _provider_id(_settings(store).get("provider")))
-    catalog = _catalog(store, provider_id)
+    catalog = _catalog(store, provider_id, queue_person)
     tracks = [dict(row) for row in catalog.get("tracks") or [] if isinstance(row, dict)]
     if not tracks:
         return [], {}, []
@@ -3668,7 +3993,7 @@ def _continuation_candidate_tracks(
 
     history = [
         row
-        for row in _listening_history(store)[-120:]
+        for row in _listening_history(store, queue_person)[-120:]
         if _provider_id(row.get("provider")) == provider_id
     ]
     history_artist_counts: Dict[str, int] = {}
@@ -3746,11 +4071,15 @@ def _append_continuation_tracks(
     station_name: str = "",
     source: str = "ai",
     allow_repeats: bool = False,
+    person_id: Any = None,
     client: Any = None,
 ) -> int:
     store = client or globals().get("redis_client")
+    queue_id = _queue_id_for_person(
+        person_id if person_id is not None else ""
+    )
     with _state_lock:
-        player = _player(store)
+        player = _player(store, queue_id)
         if (
             _text(player.get("status")).lower() != "playing"
             or _provider_id(player.get("provider")) not in CATALOG_PROVIDER_IDS
@@ -3807,7 +4136,7 @@ def _append_continuation_tracks(
                 "radio_last_refill_count": len(incoming),
             }
         )
-        _save_player(player, store)
+        _save_player(player, store, queue_id)
         return len(incoming)
 
 
@@ -3818,15 +4147,17 @@ def _fallback_continuation_tracks(
     count: int = CONTINUATION_BATCH_TRACKS,
 ) -> List[Dict[str, Any]]:
     store = client or globals().get("redis_client")
+    queue_person = _queue_id_for_person(player.get("queue_id"))
     _candidates, _candidate_map, ordered = _continuation_candidate_tracks(
         player,
         store,
         limit=MAX_CONTINUATION_CANDIDATES,
+        person_id=queue_person,
     )
     if ordered:
         return [dict(track) for track in ordered[: max(1, count)]]
     provider_id = _provider_id(player.get("provider"))
-    catalog = _catalog(store, provider_id)
+    catalog = _catalog(store, provider_id, queue_person)
     tracks = [dict(row) for row in catalog.get("tracks") or [] if isinstance(row, dict)]
     return tracks[: max(1, count)]
 
@@ -3862,7 +4193,9 @@ def _select_continuation_tracks(
             "album": _text(event.get("album")),
             "genres": list(event.get("genres") or [])[:6],
         }
-        for event in reversed(_listening_history(store)[-30:])
+        for event in reversed(
+            _listening_history(store, _queue_id_for_person(player.get("queue_id")))[-30:]
+        )
     ]
     result = _music_llm_json(
         loop,
@@ -3931,6 +4264,7 @@ def _generate_continuation_impl(
         selections,
         station_name=station_name,
         source="ai",
+        person_id=player.get("queue_id"),
         client=client,
     )
 
@@ -3974,6 +4308,7 @@ def _generate_continuation(
             station_name="Tater Continuous Radio",
             source="smart_fallback",
             allow_repeats=True,
+            person_id=player.get("queue_id"),
             client=store,
         )
         _save_hash(
@@ -3989,13 +4324,13 @@ def _generate_continuation(
         return added
     finally:
         with _state_lock:
-            latest = _player(store)
+            latest = _player(store, _queue_id_for_person(player.get("queue_id")))
             if (
                 _radio_session_token(latest) == session_token
                 and latest.get("continuation_pending")
             ):
                 latest["continuation_pending"] = False
-                _save_player(latest, store)
+                _save_player(latest, store, latest.get("queue_id"))
         finished_at = time.time()
         runtime = _runtime(store)
         _save_hash(
@@ -4025,11 +4360,18 @@ def _generate_continuation(
 def _schedule_continuation_refresh(
     player: Optional[Dict[str, Any]] = None,
     client: Any = None,
+    person_id: Any = None,
 ) -> bool:
-    global _continuation_thread
     store = client or globals().get("redis_client")
     with _state_lock:
-        current_player = dict(player) if isinstance(player, dict) else _player(store)
+        queue_id = _queue_id_for_person(
+            person_id
+            if person_id is not None
+            else (player.get("queue_id") if isinstance(player, dict) else "")
+        )
+        current_player = (
+            dict(player) if isinstance(player, dict) else _player(store, queue_id)
+        )
         queue = [dict(row) for row in current_player.get("queue") or [] if isinstance(row, dict)]
         if (
             _text(current_player.get("status")).lower() != "playing"
@@ -4047,24 +4389,26 @@ def _schedule_continuation_refresh(
         )
         if len(queue) >= maximum and index == 0:
             return False
-        if _continuation_thread is not None and _continuation_thread.is_alive():
+        worker_thread = _continuation_threads.get(queue_id)
+        if worker_thread is not None and worker_thread.is_alive():
             return False
         session_token = _radio_session_token(current_player) or uuid.uuid4().hex
         current_player["queue_session_id"] = session_token
         current_player["continuous_radio"] = True
         current_player["continuation_pending"] = True
-        _save_player(current_player, store)
+        _save_player(current_player, store, queue_id)
         snapshot = json.loads(json.dumps(current_player))
 
         def worker() -> None:
             _generate_continuation(snapshot, session_token, store)
 
-        _continuation_thread = threading.Thread(
+        worker_thread = threading.Thread(
             target=worker,
-            name="music-continuous-radio",
+            name=f"music-continuous-radio:{queue_id or 'shared'}",
             daemon=True,
         )
-        _continuation_thread.start()
+        _continuation_threads[queue_id] = worker_thread
+        worker_thread.start()
         return True
 
 
@@ -4080,6 +4424,7 @@ def _append_end_of_queue_fallback(player: Dict[str, Any], client: Any = None) ->
         station_name=_text(player.get("radio_name")) or "Tater Continuous Radio",
         source="end_of_queue_fallback",
         allow_repeats=True,
+        person_id=player.get("queue_id"),
         client=store,
     )
 
@@ -4388,6 +4733,7 @@ def _resolve_targets(
     origin: Optional[Dict[str, Any]] = None,
     client: Any = None,
     provider_id: Any = "",
+    person_id: Any = "",
 ) -> List[str]:
     store = client or globals().get("redis_client")
     requested_values = _list(requested)
@@ -4460,6 +4806,15 @@ def _resolve_targets(
         return _normalize_stereo_targets(
             [selector if selector.startswith("voice_core:") else f"voice_core:{selector}"]
         )
+    # A Person's bound rooms ("the Kitchen plays my music") win over the
+    # household default destinations when nothing more specific was said.
+    bound_targets = [
+        _target_from_query(value, options)
+        for value in _bound_targets_for_person(person_id, store)
+    ]
+    resolved_bound = [target for target in bound_targets if target]
+    if resolved_bound:
+        return _normalize_stereo_targets(resolved_bound)
     cfg = _settings(store)
     defaults = _list(cfg.get("default_targets") or cfg.get("default_target"))
     resolved_defaults = [_target_from_query(value, options) for value in defaults]
@@ -4927,11 +5282,13 @@ def _start_player_index(
     *,
     start_position_seconds: float = 0.0,
     record_history: bool = True,
+    person_id: Any = "",
     client: Any = None,
 ) -> Dict[str, Any]:
     store = client or globals().get("redis_client")
+    queue_id = _queue_id_for_person(person_id)
     with _state_lock:
-        player = _player(store)
+        player = _player(store, queue_id)
         queue = player.get("queue") if isinstance(player.get("queue"), list) else []
         if not queue:
             raise ValueError("The music queue is empty.")
@@ -5054,7 +5411,7 @@ def _start_player_index(
                 ],
             }
         )
-        _save_player(player, store)
+        _save_player(player, store, queue_id)
         if record_history:
             _record_listening_history(
                 track,
@@ -5070,15 +5427,21 @@ def _route_player_targets(
     *,
     restart_playing: bool = True,
     force_restart: bool = False,
+    person_id: Any = "",
     client: Any = None,
 ) -> Dict[str, Any]:
-    """Move the one global player session without replacing its queue or state."""
+    """Move a queue's session to new destinations without replacing its queue.
+
+    This is the follow-me handoff primitive: the current track and position are
+    preserved while playback hands off to the new rooms.
+    """
     store = client or globals().get("redis_client")
+    queue_id = _queue_id_for_person(person_id)
     next_targets = _normalize_stereo_targets(targets)
     if not next_targets:
         raise ValueError("Choose one or more valid music destinations.")
     with _state_lock:
-        player = _player(store)
+        player = _player(store, queue_id)
         old_targets = _list(player.get("targets") or player.get("target"))
         targets_changed = old_targets != next_targets
         was_playing = _text(player.get("status")).lower() == "playing"
@@ -5107,7 +5470,7 @@ def _route_player_targets(
             )
         if warnings:
             player["warnings"] = warnings
-        _save_player(player, store)
+        _save_player(player, store, queue_id)
 
         queue = player.get("queue") if isinstance(player.get("queue"), list) else []
         if restart_required and restart_playing and queue:
@@ -5115,14 +5478,21 @@ def _route_player_targets(
                 _as_int(player.get("index"), 0, 0, max(0, len(queue) - 1)),
                 start_position_seconds=position,
                 record_history=False,
+                person_id=queue_id,
                 client=store,
             )
         return player
 
 
-def _seek_player(position_seconds: float, *, client: Any = None) -> Dict[str, Any]:
+def _seek_player(
+    position_seconds: float,
+    *,
+    person_id: Any = "",
+    client: Any = None,
+) -> Dict[str, Any]:
     store = client or globals().get("redis_client")
-    player = _player(store)
+    queue_id = _queue_id_for_person(person_id)
+    player = _player(store, queue_id)
     queue = player.get("queue") if isinstance(player.get("queue"), list) else []
     if not queue:
         raise ValueError("The music queue is empty.")
@@ -5137,6 +5507,7 @@ def _seek_player(position_seconds: float, *, client: Any = None) -> Dict[str, An
             _as_int(player.get("index"), 0, 0, max(0, len(queue) - 1)),
             start_position_seconds=position,
             record_history=False,
+            person_id=queue_id,
             client=store,
         )
 
@@ -5150,7 +5521,7 @@ def _seek_player(position_seconds: float, *, client: Any = None) -> Dict[str, An
             "seek_position_pending": True,
         }
     )
-    _save_player(player, store)
+    _save_player(player, store, queue_id)
     return player
 
 
@@ -5167,6 +5538,7 @@ def _create_and_start_queue(
         raise ValueError("No matching music was found.")
     store = client or globals().get("redis_client")
     cfg = _settings(store)
+    queue_id = _queue_id_for_person(person_id)
     selected_person_id = _text(person_id) or _text(cfg.get("prompt_person_id"))
     maximum = _as_int(cfg.get("maximum_queue_tracks"), 200, 1, 1000)
     original_queue = [dict(track) for track in tracks[:maximum]]
@@ -5174,7 +5546,9 @@ def _create_and_start_queue(
     if shuffle and len(queue) > 1:
         random.SystemRandom().shuffle(queue)
     with _state_lock:
-        previous = _player(store)
+        if queue_id:
+            _register_queue(queue_id, store)
+        previous = _player(store, queue_id)
         old_targets = _list(previous.get("targets") or previous.get("target"))
         if previous.get("status") == "playing" and old_targets:
             _stop_target(
@@ -5204,14 +5578,15 @@ def _create_and_start_queue(
             "duration_seconds": 0.0,
             "last_error": "",
         }
-        _save_player(player, store)
-    return _start_player_index(0, client=store)
+        _save_player(player, store, queue_id)
+    return _start_player_index(0, person_id=queue_id, client=store)
 
 
-def _advance_player(direction: int, *, client: Any = None) -> Dict[str, Any]:
+def _advance_player(direction: int, *, person_id: Any = "", client: Any = None) -> Dict[str, Any]:
     store = client or globals().get("redis_client")
+    queue_id = _queue_id_for_person(person_id)
     with _state_lock:
-        player = _player(store)
+        player = _player(store, queue_id)
         queue = player.get("queue") if isinstance(player.get("queue"), list) else []
         if not queue:
             raise ValueError("The music queue is empty.")
@@ -5227,7 +5602,7 @@ def _advance_player(direction: int, *, client: Any = None) -> Dict[str, Any]:
             else:
                 if _provider_id(player.get("provider")) in CATALOG_PROVIDER_IDS:
                     _append_end_of_queue_fallback(player, store)
-                    player = _player(store)
+                    player = _player(store, queue_id)
                     queue = player.get("queue") if isinstance(player.get("queue"), list) else []
                     index = _as_int(player.get("index"), 0, 0, max(0, len(queue) - 1))
                     next_index = index + 1
@@ -5246,17 +5621,23 @@ def _advance_player(direction: int, *, client: Any = None) -> Dict[str, Any]:
                             ),
                         }
                     )
-                    _save_player(player, store)
+                    _save_player(player, store, queue_id)
                     return player
         if next_index < 0:
             next_index = len(queue) - 1 if repeat == "all" else 0
-    return _start_player_index(next_index, client=store)
+    return _start_player_index(next_index, person_id=queue_id, client=store)
 
 
-def _set_player_shuffle(enabled: bool, *, client: Any = None) -> Dict[str, Any]:
+def _set_player_shuffle(
+    enabled: bool,
+    *,
+    person_id: Any = "",
+    client: Any = None,
+) -> Dict[str, Any]:
     store = client or globals().get("redis_client")
+    queue_id = _queue_id_for_person(person_id)
     with _state_lock:
-        player = _player(store)
+        player = _player(store, queue_id)
         queue = [dict(track) for track in list(player.get("queue") or []) if isinstance(track, dict)]
         if not queue:
             player["shuffle"] = bool(enabled)
@@ -5296,15 +5677,16 @@ def _set_player_shuffle(enabled: bool, *, client: Any = None) -> Dict[str, Any]:
                 remaining.append(dict(track))
         player["queue"] = [*queue[: index + 1], *remaining]
         player["shuffle"] = bool(enabled)
-        _save_player(player, store)
+        _save_player(player, store, queue_id)
         return player
 
 
-def _pause_player(*, client: Any = None) -> Dict[str, Any]:
+def _pause_player(*, person_id: Any = "", client: Any = None) -> Dict[str, Any]:
     """Stop active transports while preserving the current track position."""
     store = client or globals().get("redis_client")
+    queue_id = _queue_id_for_person(person_id)
     with _state_lock:
-        player = _player(store)
+        player = _player(store, queue_id)
         if _text(player.get("status")).lower() != "playing":
             return player
         position = _player_position_seconds(player)
@@ -5329,14 +5711,15 @@ def _pause_player(*, client: Any = None) -> Dict[str, Any]:
         )
         if warnings:
             player["warnings"] = warnings
-        _save_player(player, store)
+        _save_player(player, store, queue_id)
         return player
 
 
-def _resume_player(*, client: Any = None) -> Dict[str, Any]:
+def _resume_player(*, person_id: Any = "", client: Any = None) -> Dict[str, Any]:
     """Resume a paused queue from its persisted position, or start it normally."""
     store = client or globals().get("redis_client")
-    player = _player(store)
+    queue_id = _queue_id_for_person(person_id)
+    player = _player(store, queue_id)
     queue = player.get("queue") if isinstance(player.get("queue"), list) else []
     if not queue:
         raise ValueError("The music queue is empty.")
@@ -5354,14 +5737,16 @@ def _resume_player(*, client: Any = None) -> Dict[str, Any]:
             else 0.0
         ),
         record_history=not resume_from_saved_position,
+        person_id=queue_id,
         client=store,
     )
 
 
-def _stop_player(*, client: Any = None) -> Dict[str, Any]:
+def _stop_player(*, person_id: Any = "", client: Any = None) -> Dict[str, Any]:
     store = client or globals().get("redis_client")
+    queue_id = _queue_id_for_person(person_id)
     with _state_lock:
-        player = _player(store)
+        player = _player(store, queue_id)
         targets = _list(player.get("targets") or player.get("target"))
         warnings = (
             _stop_target(
@@ -5381,13 +5766,14 @@ def _stop_player(*, client: Any = None) -> Dict[str, Any]:
         )
         if warnings:
             player["warnings"] = warnings
-        _save_player(player, store)
+        _save_player(player, store, queue_id)
         return player
 
 
-def _advance_finished_player(client: Any = None) -> None:
+def _advance_finished_player(client: Any = None, person_id: Any = "") -> None:
     store = client or globals().get("redis_client")
-    player = _reconcile_native_playback(_player(store), store)
+    queue_id = _queue_id_for_person(person_id)
+    player = _reconcile_native_playback(_player(store, queue_id), store, queue_id)
     if _text(player.get("status")).lower() != "playing":
         return
     duration = _as_float(player.get("duration_seconds"))
@@ -5395,16 +5781,24 @@ def _advance_finished_player(client: Any = None) -> None:
         return
     try:
         if _text(player.get("repeat")).lower() == "one":
-            _start_player_index(_as_int(player.get("index"), 0, 0, 100000), client=store)
+            _start_player_index(
+                _as_int(player.get("index"), 0, 0, 100000),
+                person_id=queue_id,
+                client=store,
+            )
         else:
-            _advance_player(1, client=store)
+            _advance_player(1, person_id=queue_id, client=store)
     except Exception as exc:
-        player = _player(store)
+        player = _player(store, queue_id)
         player.update({"status": "error", "last_error": _text(exc)[:500]})
-        _save_player(player, store)
+        _save_player(player, store, queue_id)
 
 
-def _reconcile_native_playback(player: Dict[str, Any], client: Any = None) -> Dict[str, Any]:
+def _reconcile_native_playback(
+    player: Dict[str, Any],
+    client: Any = None,
+    person_id: Any = "",
+) -> Dict[str, Any]:
     if _text(player.get("status")).lower() != "playing":
         return player
     playback_result = (
@@ -5470,7 +5864,11 @@ def _reconcile_native_playback(player: Dict[str, Any], client: Any = None) -> Di
         player["status"] = "error"
         player["last_error"] = warning
         player["started_at"] = 0.0
-    _save_player(player, client)
+    _save_player(
+        player,
+        client,
+        person_id if person_id else player.get("queue_id"),
+    )
     return player
 
 
@@ -5487,9 +5885,27 @@ def _validate_catalog_provider_targets(targets: Any) -> None:
         )
 
 
-def _play_request(args: Dict[str, Any], origin: Optional[Dict[str, Any]], client: Any) -> Dict[str, Any]:
+def _queue_owner_label(queue_id: Any, client: Any = None) -> str:
+    """Human name for whoever owns a queue slot."""
+    wanted = _text(queue_id)
+    if not wanted:
+        return "the household music"
+    return (
+        _people_person_name(wanted, client)
+        or wanted
+    ) + "'s music"
+
+
+def _play_request(
+    args: Dict[str, Any],
+    origin: Optional[Dict[str, Any]],
+    client: Any,
+    *,
+    force: bool = False,
+) -> Dict[str, Any]:
     cfg = _settings(client)
-    person_id = _context_person_id(origin) or _text(cfg.get("prompt_person_id"))
+    speaking_person_id = _context_person_id(origin)
+    person_id = speaking_person_id or _text(cfg.get("prompt_person_id"))
     selected_provider = _person_source_id(person_id, client)
     catalog = _catalog(client, selected_provider, person_id)
     if not isinstance(catalog.get("tracks"), list) or not catalog.get("tracks"):
@@ -5524,6 +5940,7 @@ def _play_request(args: Dict[str, Any], origin: Optional[Dict[str, Any]], client
         origin=origin,
         client=client,
         provider_id=selected_provider,
+        person_id=speaking_person_id,
     )
     if not targets:
         raise ValueError("Choose one or more satellites, stereo pairs, or media players for this music.")
@@ -5539,12 +5956,25 @@ def _play_request(args: Dict[str, Any], origin: Optional[Dict[str, Any]], client
     if requested_volume in (None, ""):
         requested_volume = cfg.get("default_volume_percent")
     volume = _as_int(requested_volume, 75, 0, 100)
+
+    # Queue identity follows the speaking Person; personless requests share the
+    # household queue (with history attributed to the configured prompt Person).
+    queue_id = _queue_id_for_person(speaking_person_id)
+    conflicts = _queue_conflicts(client, queue_id, targets)
+    if (conflicts["foreign_targets"] or conflicts["own_playing_elsewhere"]) and not force:
+        mode = _queue_conflict_mode(queue_id, client)
+        if mode == "ask":
+            return _queue_conflict_prompt(args, origin, client, queue_id, targets, conflicts)
+        if conflicts["foreign_targets"]:
+            # auto_move: free the requested rooms from any other queue without
+            # asking; that queue keeps its position on any rooms it has left.
+            _release_targets_to(client, targets, except_queue_id=queue_id)
     player = _create_and_start_queue(
         matches,
         targets=targets,
         shuffle=shuffle,
         volume_percent=volume,
-        person_id=_context_person_id(origin) or _text(cfg.get("prompt_person_id")),
+        person_id=person_id,
         client=client,
     )
     return {
@@ -5562,6 +5992,54 @@ def _play_request(args: Dict[str, Any], origin: Optional[Dict[str, Any]], client
             f"The queue has {len(player.get('queue') or [])} track"
             f"{'' if len(player.get('queue') or []) == 1 else 's'}, and continuous radio will keep it playing."
         ),
+    }
+
+
+def _queue_conflict_prompt(
+    args: Dict[str, Any],
+    origin: Optional[Dict[str, Any]],
+    client: Any,
+    queue_id: Any,
+    targets: List[str],
+    conflicts: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Ask before touching another Person's stream (or relocating their own)."""
+    store = client or globals().get("redis_client")
+    if conflicts.get("foreign_targets"):
+        pending_type = "takeover"
+        owners = sorted(
+            {_queue_owner_label(qid, store) for qid in conflicts["foreign_queues"]}
+        )
+        question = (
+            f"{' and '.join(owners)} still playing on {_target_summary(targets)}. Take over?"
+        )
+    else:
+        pending_type = "relocate"
+        own_targets = _list(conflicts.get("own_queue", {}).get("targets"))
+        question = (
+            f"Your music is still playing on {_target_summary(own_targets)}. "
+            f"Say yes to move it to {_target_summary(targets)} instead, or ask me to start the new music."
+        )
+    person_for_pending = _text(queue_id)
+    _save_pending_confirmation(
+        store,
+        person_for_pending,
+        {
+            "type": pending_type,
+            "args": args if isinstance(args, dict) else {},
+            "origin": dict(origin) if isinstance(origin, dict) else {},
+            "targets": list(targets),
+            "queue_id": person_for_pending,
+        },
+    )
+    return {
+        "ok": False,
+        "needs_confirmation": True,
+        "pending": pending_type,
+        "question": question,
+        "summary_for_user": question,
+        "say_hint": question,
+        "confirm_tool": "custom_music_confirm",
     }
 
 
@@ -5596,18 +6074,43 @@ def get_hydra_kernel_tools(*, platform: str = "", **_kwargs) -> List[Dict[str, A
             "id": "custom_music_control",
             "description": (
                 "Control the Custom Music queue: next, previous, stop, replay, shuffle, repeat, "
-                "or set one or more playback destinations."
+                "set one or more playback destinations, or bind rooms to a Person. Each Person has "
+                "their own queue, and transport actions act on the music playing in the speaking "
+                "room first, then that Person's own queue."
             ),
             "usage": (
                 '{"function":"custom_music_control","arguments":'
-                '{"action":"next|previous|stop|replay|shuffle|repeat|set_targets",'
-                '"targets":["Kitchen","Living Room"],"enabled":true,"mode":"off|all|one"}}'
+                '{"action":"next|previous|stop|replay|pause|resume|shuffle|repeat|move|set_targets|'
+                'bind_room|unbind_room",'
+                '"targets":["Kitchen","Living Room"],"enabled":true,"mode":"off|all|one",'
+                '"person":"person_id"}}'
             ),
         },
         {
             "id": "custom_music_now_playing",
             "description": "Read the current Custom Music track, queue, target, and playback state.",
             "usage": '{"function":"custom_music_now_playing","arguments":{}}',
+        },
+        {
+            "id": "custom_music_move",
+            "description": (
+                "Follow-me handoff: move the user's currently playing music to another room or "
+                "speaker, keeping the same track and position. Only use when music is already "
+                "playing; start a new queue with custom_music_play instead."
+            ),
+            "usage": (
+                '{"function":"custom_music_move","arguments":{"rooms":["Kitchen"],"targets":[]}}'
+            ),
+        },
+        {
+            "id": "custom_music_confirm",
+            "description": (
+                "Confirm or cancel a music action Tater asked about, such as taking over a room "
+                "another Person is listening in, or moving your music from another room. Call with "
+                "choice yes|no after the user answers; choice start_new starts the requested new "
+                "music instead of moving the current stream."
+            ),
+            "usage": '{"function":"custom_music_confirm","arguments":{"choice":"yes|no|start_new"}}',
         },
         {
             "id": "custom_music_browse",
@@ -5618,6 +6121,41 @@ def get_hydra_kernel_tools(*, platform: str = "", **_kwargs) -> List[Dict[str, A
             ),
         },
     ]
+
+
+def _queue_playing_near(origin: Optional[Dict[str, Any]], client: Any = None) -> str:
+    """Queue id playing on the speaker's current room or satellite, else ""."""
+    store = client or globals().get("redis_client")
+    context = origin if isinstance(origin, dict) else {}
+    candidates = set()
+    selector = _origin_value(
+        context,
+        "satellite_selector",
+        "voice_core_selector",
+        "device_selector",
+    )
+    if selector:
+        candidates.add(selector if selector.startswith("voice_core:") else f"voice_core:{selector}")
+    for room_name in _list(
+        _origin_value(context, "room_name", "area_name", "room_id", "area_id")
+    ):
+        preferred = _preferred_room_target([room_name], store)
+        if preferred:
+            candidates.add(preferred)
+    if not candidates:
+        return ""
+    for target, queue_id in _occupied_targets(store).items():
+        if target in candidates:
+            return queue_id
+    return ""
+
+
+def _control_queue_id(origin: Optional[Dict[str, Any]], client: Any = None) -> str:
+    """Transport actions hit the music playing nearby first, then the Person's own."""
+    room_queue_id = _queue_playing_near(origin, client)
+    if room_queue_id:
+        return room_queue_id
+    return _context_person_id(origin)
 
 
 async def run_hydra_kernel_tool(
@@ -5668,28 +6206,122 @@ async def run_hydra_kernel_tool(
             }
         except Exception as exc:
             return {"ok": False, "error": {"code": "custom_music_search_failed", "message": _text(exc)}}
+    if tool_id == "custom_music_move":
+        try:
+            move_queue_id = _context_person_id(origin)
+            existing = _player(store, move_queue_id)
+            if not (existing.get("queue") or []):
+                raise ValueError("There is no music playing to move. Ask for some music first.")
+            targets = _resolve_targets(
+                values.get("targets") or values.get("target"),
+                room=values.get("rooms") or values.get("room"),
+                origin=origin,
+                client=store,
+                person_id=active_person_id,
+            )
+            if not targets:
+                raise ValueError("Choose one or more valid music destinations.")
+            _validate_catalog_provider_targets(targets)
+            player = await asyncio.to_thread(
+                _route_player_targets,
+                targets,
+                person_id=move_queue_id,
+                client=store,
+            )
+            return {
+                "ok": True,
+                "targets": targets,
+                "status": _text(player.get("status")),
+                "now_playing": _public_track(player.get("current") or {}),
+                "summary_for_user": (
+                    f"Moved the music to {_target_summary(targets)} at the same spot in the track."
+                ),
+            }
+        except Exception as exc:
+            return {"ok": False, "error": {"code": "custom_music_move_failed", "message": _text(exc)}}
+    if tool_id == "custom_music_confirm":
+        try:
+            pending = _load_pending_confirmation(store, active_person_id)
+            if not pending:
+                return {
+                    "ok": False,
+                    "error": {"code": "custom_music_confirm_empty", "message": "No music action is waiting for confirmation."},
+                    "say_hint": "Mention that there is no music request waiting for an answer.",
+                }
+            choice = _text(values.get("choice") or values.get("confirm")).casefold() or "yes"
+            if choice in {"no", "cancel", "stop", "leave"}:
+                _clear_pending_confirmation(store, active_person_id)
+                return {
+                    "ok": True,
+                    "summary_for_user": "Okay, I left the music as it was.",
+                }
+            pending_type = _text(pending.get("type"))
+            if choice in {"start_new", "new", "fresh"} and pending_type == "relocate":
+                _clear_pending_confirmation(store, active_person_id)
+                return await asyncio.to_thread(
+                    _play_request,
+                    pending.get("args") or {},
+                    pending.get("origin") or origin,
+                    store,
+                    force=True,
+                )
+            if choice not in {"yes", "ok", "confirm", "takeover", "move"}:
+                return {
+                    "ok": False,
+                    "error": {"code": "custom_music_confirm_choice", "message": "Confirm with yes, no, or start_new."},
+                    "say_hint": "Ask whether to go ahead, cancel, or start the new music instead.",
+                }
+            _clear_pending_confirmation(store, active_person_id)
+            if pending_type == "relocate":
+                player = await asyncio.to_thread(
+                    _route_player_targets,
+                    pending.get("targets") or [],
+                    person_id=pending.get("queue_id") or "",
+                    client=store,
+                )
+                return {
+                    "ok": True,
+                    "targets": _list(player.get("targets")),
+                    "status": _text(player.get("status")),
+                    "now_playing": _public_track(player.get("current") or {}),
+                    "summary_for_user": (
+                        f"Moved the music to {_target_summary(pending.get('targets') or [])} "
+                        "at the same spot in the track."
+                    ),
+                }
+            return await asyncio.to_thread(
+                _play_request,
+                pending.get("args") or {},
+                pending.get("origin") or origin,
+                store,
+                force=True,
+            )
+        except Exception as exc:
+            return {"ok": False, "error": {"code": "custom_music_confirm_failed", "message": _text(exc)}}
     if tool_id == "custom_music_control":
         action = _text(values.get("action")).lower()
         try:
+            control_queue_id = _control_queue_id(origin, store)
             if action == "next":
-                player = await asyncio.to_thread(_advance_player, 1, client=store)
+                player = await asyncio.to_thread(_advance_player, 1, person_id=control_queue_id, client=store)
             elif action == "previous":
-                player = await asyncio.to_thread(_advance_player, -1, client=store)
+                player = await asyncio.to_thread(_advance_player, -1, person_id=control_queue_id, client=store)
             elif action == "stop":
-                player = await asyncio.to_thread(_stop_player, client=store)
+                player = await asyncio.to_thread(_stop_player, person_id=control_queue_id, client=store)
             elif action == "replay":
-                current = _player(store)
+                current = _player(store, control_queue_id)
                 player = await asyncio.to_thread(
                     _start_player_index,
                     _as_int(current.get("index"), 0, 0, 100000),
+                    person_id=control_queue_id,
                     client=store,
                 )
             elif action in {"play", "resume"}:
-                player = await asyncio.to_thread(_resume_player, client=store)
+                player = await asyncio.to_thread(_resume_player, person_id=control_queue_id, client=store)
             elif action == "pause":
-                player = await asyncio.to_thread(_pause_player, client=store)
+                player = await asyncio.to_thread(_pause_player, person_id=control_queue_id, client=store)
             elif action == "shuffle":
-                player = _player(store)
+                player = _player(store, control_queue_id)
                 queue = player.get("queue") if isinstance(player.get("queue"), list) else []
                 current = player.get("current") if isinstance(player.get("current"), dict) else {}
                 remaining = [row for row in queue if _text(row.get("id")) != _text(current.get("id"))]
@@ -5698,16 +6330,49 @@ async def run_hydra_kernel_tool(
                 player["queue"] = ([current] if current else []) + remaining
                 player["index"] = 0 if current else -1
                 player["shuffle"] = _as_bool(values.get("enabled"), True)
-                _save_player(player, store)
+                _save_player(player, store, control_queue_id)
             elif action == "repeat":
                 mode = _text(values.get("mode") or "off").lower()
                 if mode not in {"off", "all", "one"}:
                     raise ValueError("Repeat mode must be off, all, or one.")
-                player = _player(store)
+                player = _player(store, control_queue_id)
                 player["repeat"] = mode
-                _save_player(player, store)
-            elif action in {"set_target", "set_targets"}:
-                player = _player(store)
+                _save_player(player, store, control_queue_id)
+            elif action in {"bind_room", "unbind_room"}:
+                targets = _resolve_targets(
+                    values.get("targets") or values.get("target"),
+                    room=values.get("rooms") or values.get("room"),
+                    origin=origin,
+                    client=store,
+                    person_id=active_person_id,
+                )
+                if not targets:
+                    raise ValueError("Choose one or more valid rooms to bind.")
+                bind_person = _text(values.get("person")) or active_person_id
+                if action == "bind_room" and not bind_person:
+                    raise ValueError("Say which Person this room should follow.")
+                changed = await asyncio.to_thread(
+                    _set_room_bindings,
+                    targets,
+                    bind_person if action == "bind_room" else "",
+                    store,
+                )
+                if not changed:
+                    raise ValueError("No matching rooms were found to bind.")
+                if action == "bind_room":
+                    summary = (
+                        f"{', '.join(changed)} will play "
+                        f"{_queue_owner_label(bind_person, store)} from now on."
+                    )
+                else:
+                    summary = f"Room binding removed for {', '.join(changed)}."
+                return {
+                    "ok": True,
+                    "summary_for_user": summary,
+                }
+            elif action in {"set_target", "set_targets", "move"}:
+                move_queue_id = _context_person_id(origin)
+                player = _player(store, move_queue_id)
                 player_provider = _provider_id(player.get("provider"))
                 targets = _resolve_targets(
                     values.get("targets") or values.get("target"),
@@ -5715,6 +6380,7 @@ async def run_hydra_kernel_tool(
                     origin=origin,
                     client=store,
                     provider_id=player_provider,
+                    person_id=active_person_id,
                 )
                 if not targets:
                     raise ValueError("Choose one or more valid music destinations.")
@@ -5722,11 +6388,13 @@ async def run_hydra_kernel_tool(
                 player = await asyncio.to_thread(
                     _route_player_targets,
                     targets,
+                    person_id=move_queue_id,
                     client=store,
                 )
             else:
                 raise ValueError(
-                    "Music control action must be next, previous, stop, replay, shuffle, repeat, or set_targets."
+                    "Music control action must be next, previous, stop, replay, shuffle, repeat, "
+                    "set_targets, bind_room, or unbind_room."
                 )
             targets = _list(player.get("targets") or player.get("target"))
             return {
@@ -5746,10 +6414,11 @@ async def run_hydra_kernel_tool(
         except Exception as exc:
             return {"ok": False, "error": {"code": "custom_music_control_failed", "message": _text(exc)}}
     if tool_id == "custom_music_now_playing":
-        player = _player(store)
+        player = _player(store, _control_queue_id(origin, store))
         targets = _list(player.get("targets") or player.get("target"))
         return {
             "ok": True,
+            "queue_id": _text(player.get("queue_id")),
             "status": _text(player.get("status")),
             "target": targets[0] if targets else "",
             "targets": targets,
@@ -6731,7 +7400,9 @@ def run_client_music_action(
                 "now_playing": _public_track(player.get("current") or {}),
             }
         else:
-            result = _play_request(values, {}, store)
+            # Client playback is deliberate: take over busy rooms without the
+            # TTS confirmation used for voice requests.
+            result = _play_request(values, {}, store, force=True)
         return {
             **result,
             "state": get_client_music_state(client=store),
@@ -7154,6 +7825,15 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
         name = _people_person_name(person_id, store) or person_id
         source = _person_link_source(link)
         values = link.get(source) if isinstance(link.get(source), dict) else {}
+        person_queue = _player(store, person_id)
+        person_queue_status = _text(person_queue.get("status")).lower()
+        person_queue_targets = _list(person_queue.get("targets") or person_queue.get("target"))
+        queue_state = ""
+        if person_queue_status in {"playing", "paused"} and person_queue_targets:
+            queue_state = (
+                f" · Now {person_queue_status}: {_track_label(person_queue.get('current') or {})} "
+                f"on {_target_summary(person_queue_targets)}"
+            )
         items.append(
             {
                 "id": f"person:{person_id}",
@@ -7161,7 +7841,8 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                 "title": name,
                 "subtitle": (
                     f"Plays from {PROVIDER_LABELS[source]}" if source else "Uses the global music source"
-                ),
+                )
+                + queue_state,
                 "detail": _text(values.get("server_url")) or _text(values.get("root_path")),
                 "hero_badges": [
                     {
@@ -7186,6 +7867,21 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                             {"value": "emby", "label": "Emby (own user/library)"},
                             {"value": "network_share", "label": "Network share (own folder)"},
                         ],
+                    },
+                    {
+                        "key": "person_link_queue_conflict_mode",
+                        "label": "Playback Conflicts",
+                        "type": "select",
+                        "value": _text(link.get("queue_conflict_mode"))
+                        or _text(cfg.get("queue_conflict_mode") or DEFAULT_QUEUE_CONFLICT_MODE),
+                        "options": [
+                            {"value": "ask", "label": "Ask before taking over"},
+                            {"value": "auto_move", "label": "Auto-move / take over"},
+                        ],
+                        "description": (
+                            "When their music is playing elsewhere, or someone else's music is on "
+                            "the rooms they ask for: ask first, or move/take over automatically."
+                        ),
                     },
                     {
                         "key": "person_link_emby_server_url",
@@ -7279,6 +7975,20 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                             {"value": "emby", "label": "Emby (own user/library)"},
                             {"value": "network_share", "label": "Network share (own folder)"},
                         ],
+                    },
+                    {
+                        "key": "person_link_queue_conflict_mode",
+                        "label": "Playback Conflicts",
+                        "type": "select",
+                        "value": _text(cfg.get("queue_conflict_mode") or DEFAULT_QUEUE_CONFLICT_MODE),
+                        "options": [
+                            {"value": "ask", "label": "Ask before taking over"},
+                            {"value": "auto_move", "label": "Auto-move / take over"},
+                        ],
+                        "description": (
+                            "When their music is playing elsewhere, or someone else's music is on "
+                            "the rooms they ask for: ask first, or move/take over automatically."
+                        ),
                     },
                     {
                         "key": "person_link_emby_server_url",
@@ -7827,6 +8537,9 @@ def _save_person_link_action(values: Dict[str, Any], store: Any) -> Dict[str, An
         existing.get(source) if isinstance(existing.get(source), dict) else {}
     ) if source else {}
     link: Dict[str, Any] = {"music_source": source}
+    conflict_mode = _text(values.get("person_link_queue_conflict_mode")).casefold()
+    if conflict_mode in QUEUE_CONFLICT_MODES:
+        link["queue_conflict_mode"] = conflict_mode
     if source:
         if source == "emby":
             password = _text(values.get("person_link_emby_password")) or _text(
@@ -8138,6 +8851,7 @@ def handle_htmlui_tab_action(
             "prompt_context_enabled",
             "prompt_person_id",
             "prompt_profile_interval_hours",
+            "queue_conflict_mode",
         }
         updates = {key: values.get(key) for key in allowed if key in values}
         if "default_targets" in updates:
@@ -8179,6 +8893,11 @@ def handle_htmlui_tab_action(
                 updates["prompt_person_id"], store
             ):
                 raise ValueError("Choose an existing Person for Music Prompt Context.")
+        if "queue_conflict_mode" in updates:
+            mode = _text(updates.get("queue_conflict_mode")).casefold()
+            if mode and mode not in QUEUE_CONFLICT_MODES:
+                raise ValueError("Playback Conflicts must be ask or auto_move.")
+            updates["queue_conflict_mode"] = mode or DEFAULT_QUEUE_CONFLICT_MODE
         person_changed = (
             "prompt_person_id" in updates
             and _text(updates.get("prompt_person_id")) != _text(current_settings.get("prompt_person_id"))
@@ -8306,6 +9025,9 @@ def handle_htmlui_tab_action(
             },
             {},
             store,
+            # The dashboard acts deliberately: take over busy rooms without
+            # the TTS confirmation used for voice requests.
+            force=True,
         )
         return {"ok": True, "message": _text(result.get("summary_for_user"))}
 
@@ -8580,6 +9302,7 @@ def handle_htmlui_tab_action(
             },
             {},
             store,
+            force=True,
         )
         return {"ok": True, "message": _text(player_result.get("summary_for_user"))}
 
@@ -8761,7 +9484,10 @@ def get_core_system_tasks(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
     )
     continuation_running = bool(
         _continuation_lock.locked()
-        or (_continuation_thread is not None and _continuation_thread.is_alive())
+        or any(
+            thread is not None and thread.is_alive()
+            for thread in _continuation_threads.values()
+        )
     )
     profile_running = bool(
         _profile_lock.locked()
@@ -9313,8 +10039,22 @@ def run(stop_event: Optional[object] = None) -> None:
                             _people_person_name(pid) or pid,
                             exc,
                         )
-                _advance_finished_player()
-                _schedule_continuation_refresh()
+                # Every queue slot (shared + each Person's) is advanced and
+                # kept topped up independently, so two People can listen to
+                # their own music in different rooms at the same time.
+                for queue_id in _active_queue_ids(store):
+                    try:
+                        _advance_finished_player(store, person_id=queue_id)
+                        _schedule_continuation_refresh(
+                            person_id=queue_id,
+                            client=store,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[Music] queue %s maintenance failed: %s",
+                            queue_id or "shared",
+                            exc,
+                        )
                 recommendation_interval = (
                     _as_int(cfg.get("recommendation_interval_hours"), 12, 1, 168) * 3600
                 )

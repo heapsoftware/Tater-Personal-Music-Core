@@ -64,6 +64,32 @@ recommendations, and prompt-ready music profile, scoped under
 `custom_music_core:*:<person_id>` keys. Everyone else follows the global source.
 Voice requests resolve the speaking Person automatically.
 
+### Per-person queues (v1.1)
+
+Every Person also gets their **own playback queue** — the shared household queue
+only serves requests where no Person is identified (dashboards, client music,
+and the stock-like global path):
+
+- **Independent queues and timelines.** Each Person's queue keeps its own
+  current track, position, shuffle/repeat, and continuous-radio state, so two
+  People can listen to different music in different rooms at the same time.
+- **Follow-me handoff.** "Move my music to the kitchen" (`custom_music_move`)
+  hands the stream off to the new room at the same spot in the track. Room
+  transport commands ("next", "pause", "stop") act on whatever is playing in
+  the speaking room first, then on that Person's own queue.
+- **Room bindings.** Bind a room to a Person ("the Kitchen plays my music") via
+  the `custom_music_control` tool (`bind_room` / `unbind_room`); bound rooms
+  become that Person's default destination.
+- **Conflict behavior.** When the rooms someone asks for are already playing
+  someone else's music — or their own music is playing elsewhere — each Person
+  chooses on their link card (with a global default in settings):
+  - **Ask before taking over** (default): Tater asks over TTS and waits for a
+    yes/no (or "start the new music instead"); the pending request expires
+    after 10 minutes.
+  - **Auto-move / take over**: the requested rooms are freed automatically and
+    the other queue keeps playing, paused at its position, on any rooms it has
+    left.
+
 ## Settings worth knowing
 
 | Setting | Default | Notes |
@@ -72,14 +98,19 @@ Voice requests resolve the speaking Person automatically.
 | Stream Host | auto | Override only if the auto-detected LAN address is wrong (e.g. multiple NICs). |
 | Catalog Sync Interval | `900` s | Also drives per-person catalog refreshes. |
 
-## Limitations (v1)
+## Limitations (v1.1)
 
 - Little Spud client music is not switched over — the Tater host currently links
-  client music to the stock `music_core` only.
+  client music to the stock `music_core` only, and this core's client music
+  surface (`run_client_music_action`, `get_client_music_stream_source`) follows
+  the shared household queue, not a Person queue.
 - Network-share playback serves original files; there is no on-the-fly transcode
   for mixed sync groups (Emby username sign-in does transcode to WAV when needed).
-- One global player queue (matching the stock core); per-person queues are a
-  possible future step.
+- Volume and per-target calibrations are shared per destination; two queues
+  playing different rooms at once keep their own volume, but the same room's
+  calibration is shared.
+- The dashboard player bar still shows the shared household queue; per-Person
+  queue state is visible on each Person's card in the People section.
 
 ## Development
 

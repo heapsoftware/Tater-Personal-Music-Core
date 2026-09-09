@@ -5,11 +5,11 @@
       "id": "custom_music",
       "name": "Custom Music Core",
       "module_key": "custom_music_core",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "min_tater_version": "99.5",
       "description": "Per-person music for Tater: link each Person to their own Emby user or network-share folder, browse and play their library with voice control, and build AI-named recommendations from each Person's listening history across clock-synchronized satellites, native Sonos groups, stereo pairs, and media players.",
       "settings_category": "Custom Music Core Settings",
-      "required_settings_count": 18,
+      "required_settings_count": 19,
       "autostart_key": "custom_music_core_running",
       "tags": [
         "music",
@@ -25,7 +25,7 @@
         "album-art"
       ],
       "entry": "cores/custom_music_core.py",
-      "sha256": "a9d4554dede367a6c4fba19d33e37e30934c61cbddfaa5594a6eee9341a6d3a5"
+      "sha256": "d2d3c62e96817e51a5a4c3907356959ad41ea74ccbc5818420d19fe69d91a59c"
     }
   ]
 }

@@ -5,12 +5,14 @@ FakeRedis, load the core file directly via importlib, and exercise it without a
 running Tater.
 """
 
+import asyncio
 import importlib.util
 import json
 import os
 import struct
 import sys
 import tempfile
+import time
 import types
 import threading
 import unittest
@@ -38,8 +40,11 @@ class FakeRedis:
     def hgetall(self, key):
         return dict(self.hashes.get(key) or {})
 
-    def hset(self, key, mapping=None, **_kwargs):
-        self.hashes.setdefault(key, {}).update(mapping or {})
+    def hset(self, key, field=None, value=None, mapping=None, **_kwargs):
+        row = self.hashes.setdefault(key, {})
+        if field is not None:
+            row[field] = value
+        row.update(mapping or {})
 
     def hdel(self, key, *fields):
         row = self.hashes.setdefault(key, {})
@@ -121,6 +126,8 @@ class CustomMusicCoreTests(unittest.TestCase):
                 "custom_music_search",
                 "custom_music_control",
                 "custom_music_now_playing",
+                "custom_music_move",
+                "custom_music_confirm",
                 "custom_music_browse",
             ],
         )
@@ -929,6 +936,406 @@ class PerPersonLinkageTests(unittest.TestCase):
         self.assertIn("api_key=LEEKEY", url)
         art_url, _headers = self.core._emby_upstream_request("emby_art:person_lee", "song1")
         self.assertTrue(art_url.startswith("http://emby.local:8096/Items/song1/Images/Primary?"))
+
+
+def _track_row(number, title=None, duration=180.0):
+    return {
+        "id": f"track:{number}",
+        "provider": "emby",
+        "title": title or f"Song {number}",
+        "artist": "Bob Marley",
+        "album_artist": "Bob Marley",
+        "album": "Exodus",
+        "duration_seconds": duration,
+    }
+
+
+class MultiQueueTests(unittest.TestCase):
+    """Per-person queues, room bindings, conflict handling, and follow-me."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.core = load_custom_music_core()
+
+    def setUp(self):
+        self.redis = FakeRedis()
+        self.core.redis_client = self.redis
+        self.core._shutdown_stream_server()
+        self.played = []
+        self.stopped = []
+        self._originals = {}
+
+    def tearDown(self):
+        for name, value in self._originals.items():
+            setattr(self.core, name, value)
+        self.core._shutdown_stream_server()
+
+    def stub_playback(self):
+        self._originals["_play_track"] = self.core._play_track
+
+        def fake_play_track(track, targets, *, volume_percent, start_position_seconds=0.0, **_kwargs):
+            self.played.append(
+                {
+                    "track_id": track.get("id"),
+                    "targets": list(targets),
+                    "start_position": float(start_position_seconds or 0.0),
+                    "volume": volume_percent,
+                }
+            )
+            return {"ok": True, "sent_count": len(targets), "voice_core_sessions": []}
+
+        self.core._play_track = fake_play_track
+        self._originals["_stop_target"] = self.core._stop_target
+
+        def fake_stop_target(targets, *, expected_voice_core_sessions=None):
+            self.stopped.append(list(targets))
+            return []
+
+        self.core._stop_target = fake_stop_target
+
+    def make_queue(self, person_id, targets, *, index=0, position=0.0, duration=180.0, status="playing"):
+        tracks = [_track_row(1, "Jamming", duration), _track_row(2, "Exodus", duration)]
+        return self.core._create_and_start_queue(
+            tracks,
+            targets=targets,
+            shuffle=False,
+            volume_percent=60,
+            person_id=person_id,
+            client=self.redis,
+        )
+
+    def seed_playing_queue(self, person_id, targets, *, position=30.0, elapsed=10.0, duration=180.0):
+        player = {
+            "status": "playing",
+            "provider": "emby",
+            "queue": [_track_row(1, "Jamming", duration), _track_row(2, "Exodus", duration)],
+            "queue_original": [_track_row(1, "Jamming", duration), _track_row(2, "Exodus", duration)],
+            "index": 0,
+            "current": _track_row(1, "Jamming", duration),
+            "targets": targets,
+            "person_id": person_id,
+            "shuffle": False,
+            "repeat": "off",
+            "volume_percent": 60,
+            "mixed_sync_adjustment_ms": 0,
+            "created_at": time.time(),
+            "queue_session_id": f"session-{person_id or 'shared'}",
+            "continuous_radio": True,
+            "continuation_pending": False,
+            "radio_name": "Tater Continuous Radio",
+            "started_at": time.time() - elapsed if position else 0.0,
+            "position_offset_seconds": position,
+            "duration_seconds": duration,
+            "last_error": "",
+        }
+        self.core._save_player(player, self.redis, person_id)
+        return player
+
+    # ---- per-person queue state ----
+
+    def test_player_keys_and_registry(self):
+        core = self.core
+        self.assertEqual(core._player_key(""), core.PLAYER_KEY)
+        self.assertEqual(core._player_key("p1"), "custom_music_core:player:p1")
+        self.stub_playback()
+        self.make_queue("person_a", ["voice_core:native:kitchen"])
+        registry = core._queue_registry(self.redis)
+        self.assertIn("person_a", registry)
+        self.assertEqual(
+            core._player(self.redis, "person_a")["person_id"], "person_a"
+        )
+        # The shared queue slot is untouched by a Person queue.
+        self.assertEqual(core._player(self.redis)["status"], "idle")
+
+    def test_two_people_keep_separate_queues_and_timelines(self):
+        self.stub_playback()
+        alice = self.make_queue("person_a", ["voice_core:native:kitchen"])
+        bob = self.make_queue("person_b", ["voice_core:native:office"])
+        self.assertEqual(alice["queue_id"], "person_a")
+        self.assertEqual(bob["queue_id"], "person_b")
+        self.assertEqual(alice["targets"], ["voice_core:native:kitchen"])
+        self.assertEqual(bob["targets"], ["voice_core:native:office"])
+        # Advancing one queue does not touch the other.
+        self.core._advance_player(1, person_id="person_a", client=self.redis)
+        self.assertEqual(self.core._player(self.redis, "person_a")["index"], 1)
+        self.assertEqual(self.core._player(self.redis, "person_b")["index"], 0)
+        self.assertEqual(self.core._player(self.redis)["status"], "idle")
+
+    def test_run_loop_advances_each_queue_independently(self):
+        self.stub_playback()
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"], position=0.0, elapsed=0.0)
+        bob = self.seed_playing_queue("person_b", ["voice_core:native:office"])
+        # Bob's track finished; Alice's just started.
+        bob["started_at"] = time.time() - 500.0
+        self.core._save_player(bob, self.redis, "person_b")
+        self.core._advance_finished_player(self.redis, person_id="person_b")
+        self.assertEqual(self.core._player(self.redis, "person_b")["index"], 1)
+        self.assertEqual(self.core._player(self.redis, "person_a")["index"], 0)
+
+    # ---- room bindings ----
+
+    def test_room_bindings_default_targets(self):
+        core = self.core
+        changed = core._set_room_bindings(["voice_core:native:kitchen"], "person_a", self.redis)
+        self.assertEqual(changed, ["voice_core:native:kitchen"])
+        self.assertEqual(core._bound_targets_for_person("person_a", self.redis), ["voice_core:native:kitchen"])
+        self.assertEqual(core._bound_targets_for_person("person_b", self.redis), [])
+        self.assertEqual(core._room_bindings(self.redis)["voice_core:native:kitchen"], "person_a")
+        core._set_room_bindings(["voice_core:native:kitchen"], "", self.redis)
+        self.assertEqual(core._bound_targets_for_person("person_a", self.redis), [])
+
+    def test_resolve_targets_prefers_person_bindings(self):
+        self._originals["_target_options"] = self.core._target_options
+
+        def fake_target_options(*_args, **_kwargs):
+            return [
+                {"value": "voice_core:native:kitchen", "label": "Kitchen"},
+                {"value": "voice_core:native:office", "label": "Office"},
+            ]
+
+        self.core._target_options = fake_target_options
+        self.core._set_room_bindings(["voice_core:native:kitchen"], "person_a", self.redis)
+        targets = self.core._resolve_targets(person_id="person_a", client=self.redis)
+        self.assertEqual(targets, ["voice_core:native:kitchen"])
+        # Without a binding (or for a different person) nothing is invented.
+        self.assertEqual(self.core._resolve_targets(person_id="person_b", client=self.redis), [])
+
+    # ---- conflict handling ----
+
+    def test_conflict_mode_resolution(self):
+        core = self.core
+        self.assertEqual(core._queue_conflict_mode("", self.redis), "ask")
+        self.core._save_hash(self.redis, core.SETTINGS_KEY, {"queue_conflict_mode": "auto_move"})
+        self.assertEqual(core._queue_conflict_mode("person_a", self.redis), "auto_move")
+        self.redis.hset(
+            core.PERSON_LINKS_KEY,
+            mapping={"person_a": json.dumps({"music_source": "", "queue_conflict_mode": "ask"})},
+        )
+        self.assertEqual(core._queue_conflict_mode("person_a", self.redis), "ask")
+
+    def stub_play_request(self, targets):
+        """Make _play_request resolvable offline with one canned match."""
+        self._originals["_resolve_targets"] = self.core._resolve_targets
+        self._originals["_search_tracks"] = self.core._search_tracks
+        self._originals["_catalog"] = self.core._catalog
+        self._originals["_sync_catalog"] = self.core._sync_catalog
+        track = _track_row(9, "Requested Song")
+        self.core._resolve_targets = (
+            lambda requested="", room="", origin=None, client=None, provider_id="", person_id="": list(targets)
+        )
+        self.core._search_tracks = lambda **_kwargs: [track]
+        payload = {"provider": "emby", "tracks": [track], "artists": [], "albums": [], "genres": []}
+        self.core._catalog = lambda client=None, provider_id="", person_id="": payload
+        self.core._sync_catalog = lambda client=None, provider_id="", person_id="": payload
+        return track
+
+    def origin_for(self, person_id, selector="kitchen"):
+        return {
+            "people_resolution": {"master_user_id": person_id},
+            "satellite_selector": selector,
+        }
+
+    def test_ask_mode_asks_before_relocating_own_queue(self):
+        core = self.core
+        self.stub_playback()
+        self.stub_play_request(["voice_core:native:office"])
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"])
+        result = core._play_request(
+            {"query": "reggae", "targets": ["voice_core:native:office"]},
+            self.origin_for("person_a"),
+            self.redis,
+        )
+        self.assertTrue(result.get("needs_confirmation"))
+        self.assertEqual(result.get("pending"), "relocate")
+        self.assertIn("still playing", result.get("question", ""))
+        pending = core._load_pending_confirmation(self.redis, "person_a")
+        self.assertEqual(pending["type"], "relocate")
+        self.assertEqual(pending["targets"], ["voice_core:native:office"])
+        # Nothing was played or stopped by the question itself.
+        self.assertEqual(self.played, [])
+        self.assertEqual(self.stopped, [])
+
+    def test_confirm_move_preserves_position_and_track(self):
+        core = self.core
+        self.stub_playback()
+        self.stub_play_request(["voice_core:native:office"])
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"], position=30.0, elapsed=10.0)
+        result = core._play_request(
+            {"query": "reggae", "targets": ["voice_core:native:office"]},
+            self.origin_for("person_a"),
+            self.redis,
+        )
+        self.assertTrue(result.get("needs_confirmation"))
+        confirmed = asyncio.run(
+            core.run_hydra_kernel_tool(
+                tool_id="custom_music_confirm",
+                args={"choice": "yes"},
+                origin=self.origin_for("person_a"),
+                redis_client=self.redis,
+            )
+        )
+        self.assertTrue(confirmed.get("ok"), confirmed)
+        moved = core._player(self.redis, "person_a")
+        self.assertEqual(moved["targets"], ["voice_core:native:office"])
+        self.assertEqual(moved["index"], 0)
+        self.assertEqual(moved["current"]["id"], "track:1")
+        self.assertAlmostEqual(self.played[-1]["start_position"], 40.0, delta=1.0)
+        self.assertEqual(core._load_pending_confirmation(self.redis, "person_a"), {})
+
+    def test_confirm_start_new_replaces_own_queue(self):
+        core = self.core
+        self.stub_playback()
+        self.stub_play_request(["voice_core:native:office"])
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"])
+        core._play_request(
+            {"query": "reggae", "targets": ["voice_core:native:office"]},
+            self.origin_for("person_a"),
+            self.redis,
+        )
+        confirmed = asyncio.run(
+            core.run_hydra_kernel_tool(
+                tool_id="custom_music_confirm",
+                args={"choice": "start_new"},
+                origin=self.origin_for("person_a"),
+                redis_client=self.redis,
+            )
+        )
+        self.assertTrue(confirmed.get("ok"), confirmed)
+        # The old rooms were stopped and the new request is playing.
+        self.assertIn(["voice_core:native:kitchen"], self.stopped)
+        self.assertEqual(self.played[-1]["targets"], ["voice_core:native:office"])
+
+    def test_ask_mode_asks_before_taking_over_another_queue(self):
+        core = self.core
+        self.stub_playback()
+        self.stub_play_request(["voice_core:native:office"])
+        self.seed_playing_queue("person_b", ["voice_core:native:office"])
+        result = core._play_request(
+            {"query": "reggae", "targets": ["voice_core:native:office"]},
+            self.origin_for("person_a"),
+            self.redis,
+        )
+        self.assertTrue(result.get("needs_confirmation"))
+        self.assertEqual(result.get("pending"), "takeover")
+        self.assertIn("Take over", result.get("question", ""))
+        # Bob's stream was untouched by the question.
+        self.assertEqual(self.core._player(self.redis, "person_b")["status"], "playing")
+
+    def test_auto_move_takes_over_rooms_without_asking(self):
+        core = self.core
+        self.stub_playback()
+        self.stub_play_request(["voice_core:native:office"])
+        self.core._save_hash(self.redis, core.SETTINGS_KEY, {"queue_conflict_mode": "auto_move"})
+        self.seed_playing_queue("person_b", ["voice_core:native:office", "voice_core:native:den"], position=30.0)
+        result = core._play_request(
+            {"query": "reggae", "targets": ["voice_core:native:office"]},
+            self.origin_for("person_a"),
+            self.redis,
+        )
+        self.assertTrue(result.get("ok"), result)
+        # Bob's queue lost the office but kept the den, paused at its position.
+        bob = core._player(self.redis, "person_b")
+        self.assertEqual(bob["status"], "paused")
+        self.assertEqual(bob["targets"], ["voice_core:native:den"])
+        self.assertEqual(len(self.played), 1)
+        self.assertEqual(self.played[0]["targets"], ["voice_core:native:office"])
+
+    def test_control_actions_follow_the_room_queue(self):
+        core = self.core
+        self.stub_playback()
+        self.seed_playing_queue("person_b", ["voice_core:native:kitchen"])
+        self.seed_playing_queue("person_a", ["voice_core:native:office"])
+        self._originals["_preferred_room_target"] = core._preferred_room_target
+        core._preferred_room_target = lambda names, client=None: "voice_core:native:kitchen"
+        try:
+            result = asyncio.run(
+                core.run_hydra_kernel_tool(
+                    tool_id="custom_music_control",
+                    args={"action": "pause"},
+                    origin=self.origin_for("person_a", selector="native:kitchen"),
+                    redis_client=self.redis,
+                )
+            )
+            self.assertTrue(result.get("ok"), result)
+            # Bob's queue (the room's music) paused; Alice's kept playing.
+            self.assertEqual(core._player(self.redis, "person_b")["status"], "paused")
+            self.assertEqual(core._player(self.redis, "person_a")["status"], "playing")
+        finally:
+            core._preferred_room_target = self._originals["_preferred_room_target"]
+
+    def test_move_tool_hands_off_with_position(self):
+        core = self.core
+        self.stub_playback()
+        self._originals["_resolve_targets"] = core._resolve_targets
+        core._resolve_targets = (
+            lambda requested="", room="", origin=None, client=None, provider_id="", person_id="": [
+                "voice_core:native:office"
+            ]
+        )
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"], position=30.0, elapsed=10.0)
+        result = asyncio.run(
+            core.run_hydra_kernel_tool(
+                tool_id="custom_music_move",
+                args={"rooms": ["Office"]},
+                origin=self.origin_for("person_a"),
+                redis_client=self.redis,
+            )
+        )
+        self.assertTrue(result.get("ok"), result)
+        self.assertAlmostEqual(self.played[-1]["start_position"], 40.0, delta=1.0)
+        moved = core._player(self.redis, "person_a")
+        self.assertEqual(moved["targets"], ["voice_core:native:office"])
+        self.assertEqual(moved["status"], "playing")
+
+    def test_move_tool_requires_own_queue(self):
+        core = self.core
+        self.stub_playback()
+        self._originals["_resolve_targets"] = core._resolve_targets
+        core._resolve_targets = (
+            lambda requested="", room="", origin=None, client=None, provider_id="", person_id="": [
+                "voice_core:native:office"
+            ]
+        )
+        result = asyncio.run(
+            core.run_hydra_kernel_tool(
+                tool_id="custom_music_move",
+                args={"rooms": ["Office"]},
+                origin=self.origin_for("person_a"),
+                redis_client=self.redis,
+            )
+        )
+        self.assertFalse(result.get("ok"))
+        self.assertIn("no music playing", json.dumps(result))
+
+    def test_pending_confirmations_expire(self):
+        core = self.core
+        payload = {"type": "relocate", "targets": ["a"]}
+        core._save_pending_confirmation(self.redis, "person_a", payload)
+        self.assertTrue(core._load_pending_confirmation(self.redis, "person_a"))
+        stale = dict(payload)
+        stale["expires_at"] = time.time() - 1.0
+        core._save_json(self.redis, core._pending_confirmation_key("person_a"), stale)
+        self.assertEqual(core._load_pending_confirmation(self.redis, "person_a"), {})
+
+    def test_occupied_targets_and_release(self):
+        core = self.core
+        self.stub_playback()
+        self.seed_playing_queue("person_b", ["voice_core:native:office", "voice_core:native:den"])
+        occupied = core._occupied_targets(self.redis)
+        self.assertEqual(occupied["voice_core:native:office"], "person_b")
+        released = core._release_targets_to(
+            self.redis, ["voice_core:native:office"], except_queue_id="person_a"
+        )
+        self.assertEqual(released, ["voice_core:native:office"])
+        bob = core._player(self.redis, "person_b")
+        # Bob keeps his other room, paused with the position intact.
+        self.assertEqual(bob["status"], "paused")
+        self.assertEqual(bob["targets"], ["voice_core:native:den"])
+        self.assertAlmostEqual(bob["position_offset_seconds"], 40.0, delta=1.0)
+        # A queue with no rooms left is stopped entirely.
+        self.seed_playing_queue("person_c", ["voice_core:native:den"])
+        core._release_targets_to(self.redis, ["voice_core:native:den"], except_queue_id="person_a")
+        self.assertEqual(core._player(self.redis, "person_c")["status"], "stopped")
 
 
 class UpstreamCoexistenceTests(unittest.TestCase):
