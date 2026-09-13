@@ -62,7 +62,8 @@ Vorbis/Opus, MP4/M4A, WAV — no extra packages needed), reads embedded or
 
 ## Per-person links
 
-**Personal Music** tab → **People** → **Link a Person**. Each Person can get:
+**Personal Music** tab → **People** → **Add Person Link** (the form opens on
+that card; **Edit** on a linked Person's card reopens it). Each Person can get:
 
 - their own Emby user/library on a shared server, or
 - their own subfolder on a mounted share (e.g. `/mnt/music/<person>`).
@@ -122,9 +123,10 @@ one linked Person: their own library to browse and search, **their own playback
 queue** on the Playlist tab (with its own transport controls), and **their own
 AI-named mixes** on the Recommendations tab.
 
-- Reach it from each Person's card (**View Their Music** in People) or from the
-  **View Music As** card on the Browse Library and Recommendations tabs; only
-  linked People are offered, plus "Back to Household".
+- Reach it from the **View Music As** card on the Browse Library,
+  Recommendations, and People tabs, or from **View Their Music** inside a
+  Person's link editor (press **Edit** on their card); only linked People are
+  offered, plus "Back to Household".
 - While viewing, playing from the dashboard goes to **that Person's queue** (and
   records their listening history), and the stats row shows who you're viewing.
 - Voice is unaffected — requests always follow the speaking Person.
