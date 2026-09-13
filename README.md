@@ -1,4 +1,4 @@
-# Custom Music Core for Tater
+# Personal Music Core for Tater
 
 A standalone, unofficial [Tater](https://github.com/TaterTotterson/Tater) core that
 gives every Person their own music: link each Person to their own **Emby** user or
@@ -18,15 +18,15 @@ away from the original (verified by tests).
    every core change).
 2. In Tater's **Core Shop**, add this repo's raw manifest URL as an additional
    shop repo (Core Shop → repos / `POST /api/shop/cores/repos`), e.g.
-   `https://raw.githubusercontent.com/heapsoftware/Tater-Custom-Music-Core/main/core_manifest.json`.
-3. Install **Custom Music Core** from the shop and enable it.
+   `https://raw.githubusercontent.com/heapsoftware/Tater-Personal-Music-Core/main/core_manifest.json`.
+3. Install **Personal Music Core** from the shop and enable it.
 
-Alternatively, copy `cores/custom_music_core.py` into your Tater `cores/` directory
+Alternatively, copy `cores/personal_music_core.py` into your Tater `cores/` directory
 yourself.
 
 ## Music sources
 
-Open Tater → **Custom Music** tab → **Sources**.
+Open Tater → **Personal Music** tab → **Sources**.
 
 ### Emby
 
@@ -54,14 +54,14 @@ Vorbis/Opus, MP4/M4A, WAV — no extra packages needed), reads embedded or
 
 ## Per-person links
 
-**Custom Music** tab → **People** → **Link a Person**. Each Person can get:
+**Personal Music** tab → **People** → **Link a Person**. Each Person can get:
 
 - their own Emby user/library on a shared server, or
 - their own subfolder on a mounted share (e.g. `/mnt/music/<person>`).
 
 A linked Person gets their own catalog, listening history, AI-named
 recommendations, and prompt-ready music profile, scoped under
-`custom_music_core:*:<person_id>` keys. Everyone else follows the global source.
+`personal_music_core:*:<person_id>` keys. Everyone else follows the global source.
 Voice requests resolve the speaking Person automatically.
 
 ### Per-person queues (v1.1)
@@ -73,12 +73,12 @@ and the stock-like global path):
 - **Independent queues and timelines.** Each Person's queue keeps its own
   current track, position, shuffle/repeat, and continuous-radio state, so two
   People can listen to different music in different rooms at the same time.
-- **Follow-me handoff.** "Move my music to the kitchen" (`custom_music_move`)
+- **Follow-me handoff.** "Move my music to the kitchen" (`personal_music_move`)
   hands the stream off to the new room at the same spot in the track. Room
   transport commands ("next", "pause", "stop") act on whatever is playing in
   the speaking room first, then on that Person's own queue.
 - **Room bindings.** Bind a room to a Person ("the Kitchen plays my music") via
-  the `custom_music_control` tool (`bind_room` / `unbind_room`); bound rooms
+  the `personal_music_control` tool (`bind_room` / `unbind_room`); bound rooms
   become that Person's default destination.
 - **Conflict behavior.** When the rooms someone asks for are already playing
   someone else's music — or their own music is playing elsewhere — each Person
@@ -175,7 +175,7 @@ points at `https://github.com/TaterTotterson/Tater_Shop.git`:
 
 ```sh
 git fetch upstream
-git diff upstream/main:cores/music_core.py cores/custom_music_core.py
+git diff upstream/main:cores/music_core.py cores/personal_music_core.py
 ```
 
 Port relevant hunks by hand (do not merge — upstream contains shop files this

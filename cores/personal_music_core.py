@@ -53,7 +53,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "1.2.0"
+__version__ = "2.0.0"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby user or network-share folder, browse and play "
@@ -76,11 +76,11 @@ TAGS = [
     "follow-me",
 ]
 
-logger = logging.getLogger("custom_music_core")
+logger = logging.getLogger("personal_music_core")
 logger.setLevel(logging.INFO)
 
 CORE_SETTINGS = {
-    "category": "Custom Music Core Settings",
+    "category": "Personal Music Core Settings",
     "hydra_tools_require_running": True,
     "required": {
         "stream_bind_port": {
@@ -105,7 +105,7 @@ CORE_SETTINGS = {
             "label": "Catalog Sync Interval (sec)",
             "type": "number",
             "default": 900,
-            "description": "How often Custom Music Core refreshes artists, albums, genres, and tracks.",
+            "description": "How often Personal Music Core refreshes artists, albums, genres, and tracks.",
         },
         "default_targets": {
             "label": "Default Speakers",
@@ -174,7 +174,7 @@ CORE_SETTINGS = {
             "label": "Recommendation Refresh (hours)",
             "type": "number",
             "default": 12,
-            "description": "How often Custom Music Core refreshes music recommendations in the background.",
+            "description": "How often Personal Music Core refreshes music recommendations in the background.",
         },
         "recommendation_playlist_count": {
             "label": "Recommendation Playlists",
@@ -198,7 +198,7 @@ CORE_SETTINGS = {
             "label": "Music Profile Refresh (hours)",
             "type": "number",
             "default": 12,
-            "description": "How often Custom Music Core refreshes the selected Person's prompt-ready listening profile.",
+            "description": "How often Personal Music Core refreshes the selected Person's prompt-ready listening profile.",
         },
         "queue_conflict_mode": {
             "label": "Playback Conflicts",
@@ -231,7 +231,7 @@ CORE_SETTINGS = {
             "type": "number",
             "default": 15,
             "description": (
-                "How often Custom Music Core checks the linked People's Home Assistant person "
+                "How often Personal Music Core checks the linked People's Home Assistant person "
                 "entities for a new room."
             ),
         },
@@ -280,36 +280,36 @@ CORE_SETTINGS = {
 }
 
 CORE_WEBUI_TAB = {
-    "label": "Custom Music",
+    "label": "Personal Music",
     "order": 37,
     "requires_running": True,
 }
 
-# Data keys use the "custom_music_core:" prefix so Tater's core data cleanup
+# Data keys use the "personal_music_core:" prefix so Tater's core data cleanup
 # (core_store.clear_core_redis_data) sweeps them for any installed core without
 # needing an entry in the host's audited ownership table. Settings and the
 # autostart marker use the conventional "<module_key>_settings/_running" forms.
-SETTINGS_KEY = "custom_music_core_settings"
-RUNTIME_KEY = "custom_music_core:runtime"
-PERSON_LINKS_KEY = "custom_music_core:person_links"
-CATALOG_KEY = "custom_music_core:catalog:v1"
-PLAYER_KEY = "custom_music_core:player"
-# Per-person queues live at "custom_music_core:player:<person_id>" while the
-# shared household queue stays at "custom_music_core:player" ("" queue id), so
+SETTINGS_KEY = "personal_music_core_settings"
+RUNTIME_KEY = "personal_music_core:runtime"
+PERSON_LINKS_KEY = "personal_music_core:person_links"
+CATALOG_KEY = "personal_music_core:catalog:v1"
+PLAYER_KEY = "personal_music_core:player"
+# Per-person queues live at "personal_music_core:player:<person_id>" while the
+# shared household queue stays at "personal_music_core:player" ("" queue id), so
 # existing installs keep their global player state untouched.
-QUEUE_REGISTRY_KEY = "custom_music_core:queues"
-ROOM_BINDINGS_KEY = "custom_music_core:room_bindings"
-PENDING_CONFIRM_KEY_PREFIX = "custom_music_core:pending:"
+QUEUE_REGISTRY_KEY = "personal_music_core:queues"
+ROOM_BINDINGS_KEY = "personal_music_core:room_bindings"
+PENDING_CONFIRM_KEY_PREFIX = "personal_music_core:pending:"
 PENDING_CONFIRM_TTL_SECONDS = 600.0
 QUEUE_CONFLICT_MODES = ("ask", "auto_move")
 DEFAULT_QUEUE_CONFLICT_MODE = "ask"
 # Follow-Me presence: each linked Person can carry a Home Assistant person
 # entity (e.g. one a BLE tracker updates as they move between rooms). When the
 # entity reports a new room, that Person's queue hands off to it. Per-Person
-# tracking state lives at "custom_music_core:follow_me:<person_id>"; the HA
+# tracking state lives at "personal_music_core:follow_me:<person_id>"; the HA
 # base URL and token are reused from Tater's built-in Home Assistant
 # integration (host-owned key "homeassistant_settings" — read only).
-FOLLOW_ME_KEY = "custom_music_core:follow_me"
+FOLLOW_ME_KEY = "personal_music_core:follow_me"
 HA_SETTINGS_KEY = "homeassistant_settings"
 HA_DEFAULT_BASE_URL = "http://homeassistant.local:8123"
 FOLLOW_ME_TAKEOVER_MODES = ("auto", "ask")
@@ -321,11 +321,11 @@ FOLLOW_ME_DEFAULT_MOVE_DELAY_SECONDS = 20.0
 # (connect, read) timeout for one HA REST poll; keeps a dead HA from stalling
 # the background loop.
 HA_STATE_TIMEOUT_SECONDS = (3.0, 8.0)
-HISTORY_KEY = "custom_music_core:history:v1"
-RECOMMENDATIONS_KEY = "custom_music_core:recommendations:v1"
-PROMPT_PROFILE_KEY = "custom_music_core:profile:v1"
-ACTIVITY_KEY = "custom_music_core:activity_feed"
-EMBY_AUTH_CACHE_KEY = "custom_music_core:emby:auth"
+HISTORY_KEY = "personal_music_core:history:v1"
+RECOMMENDATIONS_KEY = "personal_music_core:recommendations:v1"
+PROMPT_PROFILE_KEY = "personal_music_core:profile:v1"
+ACTIVITY_KEY = "personal_music_core:activity_feed"
+EMBY_AUTH_CACHE_KEY = "personal_music_core:emby:auth"
 MAX_ACTIVITY_EVENTS = 200
 REQUEST_TIMEOUT_SECONDS = 30
 ARTWORK_CONNECT_TIMEOUT_SECONDS = 2.0
@@ -364,8 +364,8 @@ SHARE_FOLDER_ARTWORK_NAMES = (
     "front.png",
 )
 # Redis hash mapping artwork id -> {"path": ..., "version": ...} for share files.
-SHARE_ART_INDEX_KEY = "custom_music_core:share:art"
-SHARE_ART_CACHE_DIRNAME = "custom_music_artwork"
+SHARE_ART_INDEX_KEY = "personal_music_core:share:art"
+SHARE_ART_CACHE_DIRNAME = "personal_music_artwork"
 SHARE_MIME_TYPES = {
     ".mp3": "audio/mpeg",
     ".flac": "audio/flac",
@@ -1290,13 +1290,13 @@ class EmbyMusicProvider:
     @property
     def device_id(self) -> str:
         digest = hashlib.sha256(
-            f"custom_music_core\x00{self.server_url}\x00{self.username}".encode("utf-8")
+            f"personal_music_core\x00{self.server_url}\x00{self.username}".encode("utf-8")
         ).hexdigest()[:32]
-        return f"tater-custom-music-{digest[:16]}"
+        return f"personal-music-{digest[:16]}"
 
     def _emby_authorization_header(self, token: str = "") -> str:
         parts = [
-            'MediaBrowser Client="Tater Custom Music Core"',
+            'MediaBrowser Client="Personal Music Core"',
             'Device="Tater"',
             f'DeviceId="{self.device_id}"',
             f'Version="{__version__}"',
@@ -3642,7 +3642,7 @@ def _publish_music_activity(track: Dict[str, Any], *, client: Any = None) -> Non
             return
     rows.append(
         {
-            "source": "custom_music_core",
+            "source": "personal_music_core",
             "media_id": track_id or title,
             "media_type": "music",
             "title": title,
@@ -3929,10 +3929,10 @@ def _generate_music_prompt_profile_impl(
     cfg = _settings(store)
     person_id = _text(person_id) or _text(cfg.get("prompt_person_id"))
     if not person_id:
-        raise ValueError("Choose a Person in Custom Music Core Settings before building music prompt context.")
+        raise ValueError("Choose a Person in Personal Music Core Settings before building music prompt context.")
     person_name = _people_person_name(person_id, store)
     if not person_name:
-        raise ValueError("The selected Custom Music Core Person no longer exists.")
+        raise ValueError("The selected Personal Music Core Person no longer exists.")
     provider_id = _person_source_id(person_id, store)
     history = _profile_history(store, person_id=person_id, provider_id=provider_id)
     if not history:
@@ -4020,7 +4020,7 @@ def _generate_music_prompt_profile(
 ) -> Dict[str, Any]:
     global _profile_started_at
     if not _profile_lock.acquire(blocking=False):
-        raise RuntimeError("The Custom Music Core prompt profile is already being refreshed.")
+        raise RuntimeError("The Personal Music Core prompt profile is already being refreshed.")
     store = client or globals().get("redis_client")
     _profile_started_at = time.time()
     owns_loop = loop is None
@@ -4144,7 +4144,7 @@ def _follow_me_pending_note(person_id: Any, client: Any = None) -> str:
     return (
         f"Follow-me is waiting for {name}'s answer: their music can move to "
         f"{_target_summary(targets)} (the room they walked into, currently playing "
-        f"someone else's music). If they confirm, call custom_music_confirm with "
+        f"someone else's music). If they confirm, call personal_music_confirm with "
         f"choice 'yes'; if they decline, call it with choice 'no'."
     )
 
@@ -6435,7 +6435,7 @@ def _validate_catalog_provider_targets(targets: Any) -> None:
     ]
     if roon_targets:
         raise ValueError(
-            "Roon zones cannot receive Custom Music Core streams. Choose satellites, stereo pairs, "
+            "Roon zones cannot receive Personal Music Core streams. Choose satellites, stereo pairs, "
             "or another supported media player."
         )
 
@@ -6594,17 +6594,17 @@ def _queue_conflict_prompt(
         "question": question,
         "summary_for_user": question,
         "say_hint": question,
-        "confirm_tool": "custom_music_confirm",
+        "confirm_tool": "personal_music_confirm",
     }
 
 
 def get_hydra_kernel_tools(*, platform: str = "", **_kwargs) -> List[Dict[str, Any]]:
     # Tool ids are globally namespaced across cores and first-declared wins, so
-    # every id here carries the custom_music_ prefix and never collides with the
+    # every id here carries the personal_music_ prefix and never collides with the
     # upstream Music Core's music_* tools when both cores run side by side.
     return [
         {
-            "id": "custom_music_play",
+            "id": "personal_music_play",
             "description": (
                 "Use when the user asks to play music from their personal Emby or network-share library by "
                 "song, artist, album, genre, or description. Put user-named rooms in rooms, specific "
@@ -6612,29 +6612,29 @@ def get_hydra_kernel_tools(*, platform: str = "", **_kwargs) -> List[Dict[str, A
                 "speaking room."
             ),
             "usage": (
-                '{"function":"custom_music_play","arguments":{"query":"reggae music","genre":"reggae",'
+                '{"function":"personal_music_play","arguments":{"query":"reggae music","genre":"reggae",'
                 '"artist":"","album":"","title":"","targets":[],'
                 '"rooms":["Family Room"],"shuffle":true,"volume_percent":75}}'
             ),
         },
         {
-            "id": "custom_music_search",
-            "description": "Search the personal Custom Music library without starting playback.",
+            "id": "personal_music_search",
+            "description": "Search the personal Personal Music library without starting playback.",
             "usage": (
-                '{"function":"custom_music_search","arguments":{"query":"","genre":"","artist":"","album":"","title":"",'
+                '{"function":"personal_music_search","arguments":{"query":"","genre":"","artist":"","album":"","title":"",'
                 '"limit":10}}'
             ),
         },
         {
-            "id": "custom_music_control",
+            "id": "personal_music_control",
             "description": (
-                "Control the Custom Music queue: next, previous, stop, replay, shuffle, repeat, "
+                "Control the Personal Music queue: next, previous, stop, replay, shuffle, repeat, "
                 "set one or more playback destinations, or bind rooms to a Person. Each Person has "
                 "their own queue, and transport actions act on the music playing in the speaking "
                 "room first, then that Person's own queue."
             ),
             "usage": (
-                '{"function":"custom_music_control","arguments":'
+                '{"function":"personal_music_control","arguments":'
                 '{"action":"next|previous|stop|replay|pause|resume|shuffle|repeat|move|set_targets|'
                 'bind_room|unbind_room",'
                 '"targets":["Kitchen","Living Room"],"enabled":true,"mode":"off|all|one",'
@@ -6642,36 +6642,36 @@ def get_hydra_kernel_tools(*, platform: str = "", **_kwargs) -> List[Dict[str, A
             ),
         },
         {
-            "id": "custom_music_now_playing",
-            "description": "Read the current Custom Music track, queue, target, and playback state.",
-            "usage": '{"function":"custom_music_now_playing","arguments":{}}',
+            "id": "personal_music_now_playing",
+            "description": "Read the current Personal Music track, queue, target, and playback state.",
+            "usage": '{"function":"personal_music_now_playing","arguments":{}}',
         },
         {
-            "id": "custom_music_move",
+            "id": "personal_music_move",
             "description": (
                 "Follow-me handoff: move the user's currently playing music to another room or "
                 "speaker, keeping the same track and position. Only use when music is already "
-                "playing; start a new queue with custom_music_play instead."
+                "playing; start a new queue with personal_music_play instead."
             ),
             "usage": (
-                '{"function":"custom_music_move","arguments":{"rooms":["Kitchen"],"targets":[]}}'
+                '{"function":"personal_music_move","arguments":{"rooms":["Kitchen"],"targets":[]}}'
             ),
         },
         {
-            "id": "custom_music_confirm",
+            "id": "personal_music_confirm",
             "description": (
                 "Confirm or cancel a music action Tater asked about, such as taking over a room "
                 "another Person is listening in, or moving your music from another room. Call with "
                 "choice yes|no after the user answers; choice start_new starts the requested new "
                 "music instead of moving the current stream."
             ),
-            "usage": '{"function":"custom_music_confirm","arguments":{"choice":"yes|no|start_new"}}',
+            "usage": '{"function":"personal_music_confirm","arguments":{"choice":"yes|no|start_new"}}',
         },
         {
-            "id": "custom_music_browse",
+            "id": "personal_music_browse",
             "description": "Browse artists, albums, genres, or tracks from the linked Emby or network-share library.",
             "usage": (
-                '{"function":"custom_music_browse","arguments":{"category":"artists|albums|genres|tracks",'
+                '{"function":"personal_music_browse","arguments":{"category":"artists|albums|genres|tracks",'
                 '"limit":50}}'
             ),
         },
@@ -6726,16 +6726,16 @@ async def run_hydra_kernel_tool(
     # Catalog/history/recommendation scope follows the speaking Person so a
     # linked Person browses and plays their own source by default.
     active_person_id = _context_person_id(origin)
-    if tool_id == "custom_music_play":
+    if tool_id == "personal_music_play":
         try:
             return await asyncio.to_thread(_play_request, values, origin, store)
         except Exception as exc:
             return {
                 "ok": False,
-                "error": {"code": "custom_music_play_failed", "message": _text(exc)},
+                "error": {"code": "personal_music_play_failed", "message": _text(exc)},
                 "say_hint": "Explain the music playback problem and ask for any missing song or destination detail.",
             }
-    if tool_id == "custom_music_search":
+    if tool_id == "personal_music_search":
         try:
             selected_provider = _person_source_id(active_person_id, store)
             if not (_catalog(store, selected_provider, active_person_id).get("tracks") or []):
@@ -6760,8 +6760,8 @@ async def run_hydra_kernel_tool(
                 "summary_for_user": f"Found {len(public)} matching track{'' if len(public) == 1 else 's'}.",
             }
         except Exception as exc:
-            return {"ok": False, "error": {"code": "custom_music_search_failed", "message": _text(exc)}}
-    if tool_id == "custom_music_move":
+            return {"ok": False, "error": {"code": "personal_music_search_failed", "message": _text(exc)}}
+    if tool_id == "personal_music_move":
         try:
             move_queue_id = _context_person_id(origin)
             existing = _player(store, move_queue_id)
@@ -6793,14 +6793,14 @@ async def run_hydra_kernel_tool(
                 ),
             }
         except Exception as exc:
-            return {"ok": False, "error": {"code": "custom_music_move_failed", "message": _text(exc)}}
-    if tool_id == "custom_music_confirm":
+            return {"ok": False, "error": {"code": "personal_music_move_failed", "message": _text(exc)}}
+    if tool_id == "personal_music_confirm":
         try:
             pending = _load_pending_confirmation(store, active_person_id)
             if not pending:
                 return {
                     "ok": False,
-                    "error": {"code": "custom_music_confirm_empty", "message": "No music action is waiting for confirmation."},
+                    "error": {"code": "personal_music_confirm_empty", "message": "No music action is waiting for confirmation."},
                     "say_hint": "Mention that there is no music request waiting for an answer.",
                 }
             choice = _text(values.get("choice") or values.get("confirm")).casefold() or "yes"
@@ -6823,7 +6823,7 @@ async def run_hydra_kernel_tool(
             if choice not in {"yes", "ok", "confirm", "takeover", "move"}:
                 return {
                     "ok": False,
-                    "error": {"code": "custom_music_confirm_choice", "message": "Confirm with yes, no, or start_new."},
+                    "error": {"code": "personal_music_confirm_choice", "message": "Confirm with yes, no, or start_new."},
                     "say_hint": "Ask whether to go ahead, cancel, or start the new music instead.",
                 }
             _clear_pending_confirmation(store, active_person_id)
@@ -6873,8 +6873,8 @@ async def run_hydra_kernel_tool(
                 force=True,
             )
         except Exception as exc:
-            return {"ok": False, "error": {"code": "custom_music_confirm_failed", "message": _text(exc)}}
-    if tool_id == "custom_music_control":
+            return {"ok": False, "error": {"code": "personal_music_confirm_failed", "message": _text(exc)}}
+    if tool_id == "personal_music_control":
         action = _text(values.get("action")).lower()
         try:
             control_queue_id = _control_queue_id(origin, store)
@@ -6988,8 +6988,8 @@ async def run_hydra_kernel_tool(
                 ),
             }
         except Exception as exc:
-            return {"ok": False, "error": {"code": "custom_music_control_failed", "message": _text(exc)}}
-    if tool_id == "custom_music_now_playing":
+            return {"ok": False, "error": {"code": "personal_music_control_failed", "message": _text(exc)}}
+    if tool_id == "personal_music_now_playing":
         player = _player(store, _control_queue_id(origin, store))
         targets = _list(player.get("targets") or player.get("target"))
         return {
@@ -7010,10 +7010,10 @@ async def run_hydra_kernel_tool(
                 f"{_track_label(player.get('current') or {})} is {_text(player.get('status'))} "
                 f"on {_target_summary(targets)}."
                 if player.get("current")
-                else "Custom Music Core is idle."
+                else "Personal Music Core is idle."
             ),
         }
-    if tool_id == "custom_music_browse":
+    if tool_id == "personal_music_browse":
         selected_provider = _person_source_id(active_person_id, store)
         catalog = _catalog(store, selected_provider, active_person_id)
         if not (catalog.get("tracks") or []):
@@ -7033,7 +7033,7 @@ async def run_hydra_kernel_tool(
             return {
                 "ok": False,
                 "error": {
-                    "code": "custom_music_browse_category",
+                    "code": "personal_music_browse_category",
                     "message": "Choose artists, albums, genres, or tracks.",
                 },
             }
@@ -7043,7 +7043,7 @@ async def run_hydra_kernel_tool(
             "category": category,
             "items": items,
             "count": len(items),
-            "summary_for_user": f"The Custom Music library has {len(items)} {category} in this result.",
+            "summary_for_user": f"The Personal Music library has {len(items)} {category} in this result.",
         }
     return None
 
@@ -7089,7 +7089,7 @@ def _artwork_proxy_url(track: Dict[str, Any]) -> str:
     )
     if version and version != "0":
         query["v"] = version[:128]
-    return f"/api/cores/custom_music_core/webhook/artwork?{urlencode(query)}"
+    return f"/api/cores/personal_music_core/webhook/artwork?{urlencode(query)}"
 
 
 def _artwork_display_url(track: Dict[str, Any]) -> str:
@@ -8242,7 +8242,7 @@ def _provider_cards(
                         "action": "music_provider_disconnect",
                         "label": "Disconnect",
                         "tone": "danger",
-                        "confirm": f"Disconnect Custom Music Core from {label}?",
+                        "confirm": f"Disconnect Personal Music Core from {label}?",
                     },
                 ]
             )
@@ -9115,7 +9115,7 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
         "empty_message": "Connect a music source (Emby or a mounted network share) to load your library.",
         "ui": {
             "kind": "settings_manager",
-            "title": "Custom Music Core",
+            "title": "Personal Music Core",
             "appearance": "music_library",
             "live_updates": True,
             "poll_interval_ms": 3000,
@@ -9633,7 +9633,7 @@ def handle_htmlui_tab_action(
             _schedule_music_prompt_profile_refresh(store)
         if any(key.startswith("airplay_receiver_") for key in updates):
             _configure_external_audio(next_settings, _player(store))
-        return {"ok": True, "message": "Custom Music Core settings saved."}
+        return {"ok": True, "message": "Personal Music Core settings saved."}
 
     if action_name == "music_airplay_stop":
         module = _external_audio_module()
@@ -10013,7 +10013,7 @@ def handle_htmlui_tab_action(
         )
         return {"ok": True, "message": _text(player_result.get("summary_for_user"))}
 
-    raise ValueError(f"Unknown Custom Music Core action: {action_name}")
+    raise ValueError(f"Unknown Personal Music Core action: {action_name}")
 
 
 def _fetch_track_artwork(track: Dict[str, Any], client: Any = None) -> Dict[str, Any]:
@@ -10116,7 +10116,7 @@ def handle_core_webhook(
     **_kwargs,
 ) -> Any:
     if _text(webhook).lower() != "artwork":
-        raise KeyError(f"Unsupported Custom Music Core webhook: {webhook}")
+        raise KeyError(f"Unsupported Personal Music Core webhook: {webhook}")
     params = query if isinstance(query, dict) else {}
     provider_id = _provider_id(
         params.get("provider"),
@@ -10220,7 +10220,7 @@ def get_core_system_tasks(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
     last_follow_me = _as_float(runtime.get("last_follow_me_at"))
     follow_me_ha_ready = bool(_text(_ha_config(store).get("token")))
     return {
-        "label": "Custom Music Core",
+        "label": "Personal Music Core",
         "order": 36,
         "tasks": [
             {
@@ -10299,9 +10299,9 @@ def get_core_system_tasks(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
                 "unavailable_reason": (
                     f"Connect {PROVIDER_LABELS.get(provider_id, provider_id)} before building a music profile."
                     if not connected
-                    else "Turn on Music Prompt Context in Custom Music Core Settings."
+                    else "Turn on Music Prompt Context in Personal Music Core Settings."
                     if not prompt_context_enabled
-                    else "Choose an existing Person in Custom Music Core Settings."
+                    else "Choose an existing Person in Personal Music Core Settings."
                     if not prompt_person_id or not prompt_person_name
                     else f"Play some music for {prompt_person_name} first."
                 ),
@@ -10394,7 +10394,7 @@ def run_core_system_task(*, task_id: str, redis_client=None, **_kwargs) -> Dict[
         }
     if task == "follow_me":
         return _follow_me_tick(store)
-    raise KeyError(f"Unknown Custom Music Core task: {task_id}")
+    raise KeyError(f"Unknown Personal Music Core task: {task_id}")
 
 
 def _emby_upstream_request(
@@ -10692,7 +10692,7 @@ def _ensure_stream_server() -> Dict[str, Any]:
             }
         thread = threading.Thread(
             target=server.serve_forever,
-            name="custom-music-stream-server",
+            name="personal-music-stream-server",
             daemon=True,
         )
         thread.start()
