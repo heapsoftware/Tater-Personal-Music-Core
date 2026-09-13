@@ -44,6 +44,20 @@ overrides the global source for that Person only.
   playback target fetches.
 - **Server API key**: streams directly from Emby; set the Emby User ID when the
   server has more than one user.
+- **Library Name** (optional): the Emby *library* to sync — the name of a
+  home-screen tile, which the Emby admin defines under Dashboard → Libraries
+  (it is never a folder path; folder names on disk do not create libraries).
+  Leave it blank to auto-pick the first library whose content type is Music
+  that the account can see; set it when the account can see several libraries
+  or when the library is mixed content (Emby does not tag those as music).
+- **Library Folder** (optional): scope the sync to one subfolder of the
+  library — by name (`Music`) or by full server path
+  (`/home/filestorageusb/Files/<user>/Media/Music`). Use this when one
+  mixed-content library holds a Person's music, TV, and movies and only the
+  music should be indexed. Blank means the whole library is synced.
+- **Test Emby Connection** (on Person link cards) signs in and verifies the
+  Library Name and Library Folder resolve — a mismatch is reported there with
+  the failing name, before anything is saved or synced.
 
 ### Network share (SMB/CIFS or NFS)
 
