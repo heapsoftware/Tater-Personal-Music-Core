@@ -354,6 +354,36 @@ class CustomMusicCoreTests(unittest.TestCase):
         finally:
             provider.request = original_request
 
+    def test_emby_album_art_fallback(self):
+        # Cover art usually hangs off the Album item in Emby; when the song has
+        # no Primary image of its own, artwork fetching uses the album item.
+        core = self.core
+        track = core._normalize_track(
+            {"Id": "9941", "Name": "Song", "AlbumId": "album9", "Artists": ["Zoe"], "Album": "Exodus"}
+        )
+        self.assertEqual(track["album_id"], "album9")
+        self.assertTrue(track["has_artwork"])
+        provider = core.EmbyMusicProvider(
+            server_url="http://emby.local:8096", auth_mode="api_key", api_key="KEY"
+        )
+        # No Primary tag on the song → the album's art is requested.
+        self.assertIn(
+            "/Items/album9/Images/Primary?", provider.artwork_url(track)
+        )
+        # A song with its own Primary image keeps using the song item.
+        tagged = dict(track, artwork_version="tag7")
+        self.assertIn(
+            "/Items/9941/Images/Primary?", provider.artwork_url(tagged)
+        )
+        # user_token mode reaches the same album through the stream proxy.
+        token_provider = core.EmbyMusicProvider(
+            server_url="http://emby.local:8096",
+            auth_mode="user_token",
+            username="zoe",
+            password="pw",
+        )
+        self.assertIn("/emby_art/album9", token_provider.artwork_url(track))
+
     def test_person_link_persists_emby_library_folder(self):
         core = self.core
         people = types.SimpleNamespace(

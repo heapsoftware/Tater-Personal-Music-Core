@@ -53,7 +53,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "2.4.2"
+__version__ = "2.4.3"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby user or network-share folder, browse and play "
@@ -1340,7 +1340,11 @@ def _normalize_server_url(value: Any) -> str:
 def _normalize_cached_artwork(track: Dict[str, Any]) -> None:
     """Recompute provider artwork flags on a catalog track loaded from Redis."""
     track["provider"] = _provider_id(track.get("provider"))
-    if _text(track.get("artwork_path")) or _text(track.get("artwork_item_id")):
+    if (
+        _text(track.get("artwork_path"))
+        or _text(track.get("artwork_item_id"))
+        or _text(track.get("album_id"))
+    ):
         track["has_artwork"] = True
     else:
         track["has_artwork"] = False
@@ -1663,6 +1667,12 @@ class EmbyMusicProvider:
         item_id = _text(track.get("artwork_item_id")) or _text(track.get("provider_track_id")) or _text(track.get("id"))
         if not item_id:
             return ""
+        if not _text(track.get("artwork_version")):
+            # The song item carries no Primary image (cover art usually lives
+            # on the album item in Emby) — request the album's art instead.
+            album_id = _text(track.get("album_id"))
+            if album_id:
+                item_id = album_id
         if self.auth_mode == "api_key":
             values = {
                 "api_key": self.api_key,
@@ -2588,6 +2598,10 @@ def _normalize_track(row: Dict[str, Any]) -> Dict[str, Any]:
     source_index = _as_int(row.get("sourceIndex") or row.get("source_index"), 0, 0, 10000)
     path = _text(row.get("Path") or row.get("path") or row.get("partKey") or row.get("part_key"))
     artwork_path = _text(row.get("artwork_path"))
+    # Cover art for music usually hangs off the Album item, not the song; keep
+    # the album id so artwork fetching can fall back to it when the song item
+    # carries no Primary image.
+    album_id = _text(row.get("AlbumId") or row.get("albumId") or row.get("album_id"))
     artwork_item_id = _text(row.get("artwork_item_id") or track_id)
     image_tags = row.get("ImageTags") if isinstance(row.get("ImageTags"), dict) else {}
     artwork_version = _text(row.get("artwork_version")) or _text(image_tags.get("Primary"))
@@ -2645,10 +2659,13 @@ def _normalize_track(row: Dict[str, Any]) -> Dict[str, Any]:
         "media_type": _text(row.get("media_type") or row.get("content_type")).lower(),
         "size_bytes": _as_int(row.get("sizeBytes") or row.get("size_bytes"), 0, 0, 10**15),
         "modified_unix": _as_int(row.get("modifiedUnix") or row.get("modified_unix"), 0, 0, 10**12),
+        "album_id": album_id,
         "artwork_path": artwork_path,
         "artwork_item_id": artwork_item_id,
         "artwork_version": artwork_version,
-        "has_artwork": bool(artwork_path or (artwork_item_id and artwork_version)),
+        "has_artwork": bool(
+            artwork_path or (artwork_item_id and artwork_version) or album_id
+        ),
         "provider": _provider_id(row.get("provider")),
     }
 
