@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read core version
+        id: version
+        run: |
+          VERSION=$(python3 <<'PYEOF'
+          import ast, re
+          src = open('cores/personal_music_core.py', encoding='utf-8').read()
+          m = re.search(r"^__version__\s*=\s*(.+)$", src, re.M)
+          print(ast.literal_eval(m.group(1).strip()) if m else '')
+          PYEOF
+          )
+          if [ -z "$VERSION" ]; then
+            echo "Could not read __version__ from cores/personal_music_core.py"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release if new
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${{ steps.version.outputs.version }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — nothing to do."
+            exit 0
+          fi
+          gh release create "$TAG" \
+            cores/personal_music_core.py \
+            core_manifest.json \
+            --title "Personal Music Core $TAG" \
+            --generate-notes

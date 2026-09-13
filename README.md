@@ -64,7 +64,7 @@ recommendations, and prompt-ready music profile, scoped under
 `personal_music_core:*:<person_id>` keys. Everyone else follows the global source.
 Voice requests resolve the speaking Person automatically.
 
-### Per-person queues (v1.1)
+### Per-person queues
 
 Every Person also gets their **own playback queue** — the shared household queue
 only serves requests where no Person is identified (dashboards, client music,
@@ -90,7 +90,7 @@ and the stock-like global path):
     the other queue keeps playing, paused at its position, on any rooms it has
     left.
 
-### Follow-Me presence (v1.2)
+### Follow-Me presence
 
 Optionally, a linked Person's music can **follow them room to room**. Enable
 **Follow-Me Presence** in the core settings, then give the Person a
@@ -135,11 +135,11 @@ enable.
 | Stream Server Port | `8621` | Local HTTP port the core serves token-authenticated Emby streams and share files from. Must be reachable from your playback targets on the LAN. |
 | Stream Host | auto | Override only if the auto-detected LAN address is wrong (e.g. multiple NICs). |
 | Catalog Sync Interval | `900` s | Also drives per-person catalog refreshes. |
-| Follow-Me Presence | off | Master switch for following linked People's Home Assistant person entities (see [Follow-Me presence](#follow-me-presence-v12)). |
+| Follow-Me Presence | off | Master switch for following linked People's Home Assistant person entities (see [Follow-Me presence](#follow-me-presence)). |
 | Follow-Me Poll Interval | `15` s | How often HA is polled for each tracked Person (5–3600 s). |
 | Follow-Me Move Delay | `20` s | How long a new zone must hold before the music moves (prevents hallway flicker). |
 
-## Limitations (v1.2)
+## Limitations
 
 - Little Spud client music is not switched over — the Tater host currently links
   client music to the stock `music_core` only, and this core's client music
