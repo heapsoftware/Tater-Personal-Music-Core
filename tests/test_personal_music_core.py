@@ -17,6 +17,7 @@ import types
 import threading
 import unittest
 import urllib.request
+from urllib.parse import parse_qs, urlparse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -298,6 +299,98 @@ class CustomMusicCoreTests(unittest.TestCase):
             self.assertEqual(len(self.core._listening_history(person_id="person_abc")), 1)
         finally:
             self.core._provider = original_provider
+
+    def test_emby_library_folder_scopes_the_catalog(self):
+        # A mixed-content library ("John Media": music + TV + movies) scoped to
+        # its Music subfolder by name; the song pages query the folder id.
+        core = self.core
+        provider = core.EmbyMusicProvider(
+            server_url="http://emby.local:8096",
+            auth_mode="api_key",
+            api_key="KEY",
+            user_id="u-1",
+            library_name="John Media",
+            library_folder="Music",
+        )
+        calls = []
+
+        def fake_request(_method, path, params=None, client=None, **_kwargs):
+            calls.append(dict(params or {}))
+            if path.endswith("/Views"):
+                return {"Items": [{"Id": "view1", "Name": "John Media", "CollectionType": "folder"}]}
+            if (params or {}).get("IncludeItemTypes") == "Folder":
+                return {
+                    "Items": [
+                        {"Id": "tv", "Name": "TV", "Path": "/media/john/TV"},
+                        {"Id": "music", "Name": "Music", "Path": "/media/john/Music"},
+                    ]
+                }
+            return {"Items": [{"Id": "s1", "Name": "Song"}], "TotalRecordCount": 1}
+
+        original_request = provider.request
+        provider.request = fake_request
+        try:
+            payload = provider.catalog()
+            self.assertEqual(payload["catalog_id"], "music")
+            self.assertEqual(payload["libraries"], {"music": "John Media · Music"})
+            song_params = [entry for entry in calls if entry.get("IncludeItemTypes") == "Song"]
+            self.assertTrue(song_params)
+            for params in song_params:
+                self.assertEqual(params["ParentId"], "music")
+            # The folder can also be addressed by its full server path.
+            provider.library_folder = "/media/john/Music"
+            provider.request = fake_request
+            self.assertEqual(provider.catalog()["catalog_id"], "music")
+            # Without the setting the whole library stays in scope.
+            provider.library_folder = ""
+            payload = provider.catalog()
+            self.assertEqual(payload["catalog_id"], "view1")
+            self.assertEqual(payload["libraries"], {"view1": "John Media"})
+            # A folder that does not exist raises with the library named.
+            provider.library_folder = "Playlists"
+            with self.assertRaises(ValueError) as caught:
+                provider.catalog()
+            self.assertIn("Playlists", str(caught.exception))
+        finally:
+            provider.request = original_request
+
+    def test_person_link_persists_emby_library_folder(self):
+        core = self.core
+        people = types.SimpleNamespace(
+            load_store=lambda _client=None: {
+                "people": [{"id": "person_zoe", "display_name": "Zoe"}]
+            }
+        )
+        original_people = core._PEOPLE_API_MODULE
+        core._PEOPLE_API_MODULE = people
+        try:
+            result = core._save_person_link_action(
+                {
+                    "person_link_person_id": "person_zoe",
+                    "person_link_source": "emby",
+                    "person_link_emby_server_url": "http://emby.local:8096",
+                    "person_link_emby_username": "zoe",
+                    "person_link_emby_password": "pw",
+                    "person_link_emby_library_name": "Zoe Media",
+                    "person_link_emby_library_folder": "Music",
+                },
+                self.redis,
+            )
+            self.assertTrue(result["ok"], result)
+            link = core._person_link("person_zoe", self.redis)
+            self.assertEqual(link["emby"]["library_name"], "Zoe Media")
+            self.assertEqual(link["emby"]["library_folder"], "Music")
+            # The editor carries the folder field back to the form.
+            core._save_person_link_edit_target("person_zoe", self.redis)
+            cards = {
+                item["id"]: item
+                for item in core._person_link_items(core._settings(self.redis), self.redis)
+            }
+            fields = {field["key"]: field for field in cards["person:person_zoe"]["fields"]}
+            self.assertEqual(fields["person_link_emby_library_folder"]["value"], "Music")
+        finally:
+            core._PEOPLE_API_MODULE = original_people
+            core._clear_person_link_edit_target(self.redis)
 
     # ---- stream server proxy (end to end) ----
 
@@ -916,6 +1009,31 @@ class PerPersonLinkageTests(unittest.TestCase):
             def log_message(self, *_args):
                 pass
 
+            def _reply(self, payload, status=200):
+                raw = json.dumps(payload).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_GET(self):
+                # The test also resolves the Person's library (and folder).
+                if self.path.startswith("/Users/u-zoe/Views"):
+                    self._reply(
+                        {"Items": [{"Id": "view1", "Name": "Zoe Media", "CollectionType": "music"}]}
+                    )
+                    return
+                if self.path.startswith("/Users/u-zoe/Items"):
+                    query = parse_qs(urlparse(self.path).query)
+                    if query.get("IncludeItemTypes", [""])[0] == "Folder":
+                        self._reply({"Items": [{"Id": "music", "Name": "Music", "Path": "/media/zoe/Music"}]})
+                    else:
+                        self._reply({"Items": [], "TotalRecordCount": 0})
+                    return
+                self.send_response(404)
+                self.end_headers()
+
             def do_POST(self):
                 if self.path != "/Users/AuthenticateByName":
                     self.send_response(404)
@@ -1047,6 +1165,12 @@ class PerPersonLinkageTests(unittest.TestCase):
 
             def authenticate(self, *_args, **_kwargs):
                 return "tok", "u-zoe"
+
+            def music_view(self, client=None):
+                return {"Id": "view1", "Name": "Music"}
+
+            def music_folder(self, view, client=None):
+                return view
 
         self.core.EmbyMusicProvider = StubEmby
         try:

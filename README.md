@@ -83,9 +83,17 @@ For **Emby (own user/library)**, fill in the Person's card in **People**:
   recommendations only draw from libraries their account is allowed to access.
   (An **API key** can be used instead, but an API key sees the server's whole
   library, so per-person accounts are the recommended route.)
+- **Emby Library Name** (optional): the Emby *library* (home-screen tile) to
+  sync — a name Emby's admin chose, not a folder path. Needed when the account
+  can see several libraries, or when the library is mixed content (Emby only
+  auto-picks libraries whose content type is Music).
+- **Emby Library Folder** (optional): sync only one subfolder of the library —
+  by name (`Music`) or full server path. Handy for mixed-content libraries
+  (music + TV + movies in one library) where only the music should be indexed.
 - **Test Emby Connection** checks the URL and credentials against Emby without
-  saving anything; **Save Person Link** stores the link and immediately loads
-  that Person's catalog (if the credentials fail, the save message says so).
+  saving anything (it also verifies the Library Name and Library Folder
+  resolve); **Save Person Link** stores the link and immediately loads that
+  Person's catalog (any failure shows on the card's sync line).
 - The **password field stays blank on the saved card** — re-enter it only when
   changing it; a blank field keeps the saved password.
 
