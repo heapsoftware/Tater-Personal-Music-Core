@@ -40,7 +40,7 @@ import wave
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse
 from xml.etree import ElementTree
 
@@ -54,7 +54,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.2.0"
+__version__ = "3.3.0"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby user or network-share folder (or both), browse "
@@ -266,6 +266,23 @@ CORE_SETTINGS = {
                 "their music moves, so brief BLE flaps between rooms don't bounce the music."
             ),
         },
+        "resume_room_mode": {
+            "label": "Resume in Another Room",
+            "type": "select",
+            "default": "stay",
+            "options": [
+                {"value": "stay", "label": "Stay where it was"},
+                {"value": "follow", "label": "Follow me to this room"},
+                {"value": "ask", "label": "Ask me each time"},
+            ],
+            "description": (
+                "When someone says \"resume my music\" from a different room than the one "
+                "their paused music is in: Stay where it was resumes it in the original room; "
+                "Follow me to this room moves it to the room they're speaking in (unless "
+                "another queue is already playing there, in which case it stays put); Ask me "
+                "each time asks over TTS. Each Person can override this on their link card."
+            ),
+        },
         "transfer_resume_delay_seconds": {
             "label": "Transfer Resume Delay (sec)",
             "type": "number",
@@ -470,6 +487,10 @@ FOLLOW_ME_TAKEOVER_MODES = ("auto", "ask")
 DEFAULT_FOLLOW_ME_TAKEOVER_MODE = "auto"
 FOLLOW_ME_AWAY_ACTIONS = ("keep_pause", "pause", "keep")
 DEFAULT_FOLLOW_ME_AWAY_ACTION = "keep_pause"
+# Voice resume behavior when the paused queue sits somewhere other than the
+# room the speaker is asking from ("resume my music" said from another room).
+RESUME_ROOM_MODES = ("stay", "follow", "ask")
+DEFAULT_RESUME_ROOM_MODE = "stay"
 FOLLOW_ME_DEFAULT_POLL_SECONDS = 15
 FOLLOW_ME_DEFAULT_MOVE_DELAY_SECONDS = 20.0
 # (connect, read) timeout for one HA REST poll; keeps a dead HA from stalling
@@ -896,6 +917,7 @@ PERSON_LINK_TEST_FIELD_KEYS = (
     "person_link_transfer_resume_delay_seconds",
     "person_link_follow_me_move_resume_delay_seconds",
     "person_link_follow_me_resume_delay_seconds",
+    "person_link_resume_room_mode",
     "person_link_emby_server_url",
     "person_link_emby_username",
     "person_link_emby_password",
@@ -4226,6 +4248,15 @@ def _follow_me_resume_delay(person_id: Any, client: Any = None) -> float:
     return _person_resume_delay(
         "follow_me_resume_delay_seconds", "follow_me_resume_delay_seconds", person_id, client
     )
+
+
+def _person_resume_room_mode(person_id: Any, client: Any = None) -> str:
+    """What "resume my music" does from a room other than the queue's room."""
+    store = client or globals().get("redis_client")
+    mode = _text(_person_link(person_id, store).get("resume_room_mode")).casefold()
+    if mode not in RESUME_ROOM_MODES:
+        mode = _text(_settings(store).get("resume_room_mode")).casefold()
+    return mode if mode in RESUME_ROOM_MODES else DEFAULT_RESUME_ROOM_MODE
 
 
 def _ha_config(client: Any = None) -> Dict[str, str]:
@@ -8879,9 +8910,10 @@ def get_hydra_kernel_tools(*, platform: str = "", **_kwargs) -> List[Dict[str, A
                 "Confirm or cancel a music action Tater asked about, such as taking over a room "
                 "another Person is listening in, or moving your music from another room. Call with "
                 "choice yes|no after the user answers; choice start_new starts the requested new "
-                "music instead of moving the current stream."
+                "music instead of moving the current stream. For a resume-room question (music "
+                "paused elsewhere, asked where to resume), pass choice here or there."
             ),
-            "usage": '{"function":"personal_music_confirm","arguments":{"choice":"yes|no|start_new"}}',
+            "usage": '{"function":"personal_music_confirm","arguments":{"choice":"yes|no|start_new|here|there"}}',
         },
         {
             "id": "personal_music_browse",
@@ -8894,8 +8926,8 @@ def get_hydra_kernel_tools(*, platform: str = "", **_kwargs) -> List[Dict[str, A
     ]
 
 
-def _queue_playing_near(origin: Optional[Dict[str, Any]], client: Any = None) -> str:
-    """Queue id playing on the speaker's current room or satellite, else ""."""
+def _origin_room_targets(origin: Optional[Dict[str, Any]], client: Any = None) -> List[str]:
+    """Destinations for the room/satellite the request came from, else []."""
     store = client or globals().get("redis_client")
     context = origin if isinstance(origin, dict) else {}
     candidates = set()
@@ -8913,6 +8945,13 @@ def _queue_playing_near(origin: Optional[Dict[str, Any]], client: Any = None) ->
         preferred = _preferred_room_target([room_name], store)
         if preferred:
             candidates.add(preferred)
+    return _normalize_stereo_targets(sorted(candidates))
+
+
+def _queue_playing_near(origin: Optional[Dict[str, Any]], client: Any = None) -> str:
+    """Queue id playing on the speaker's current room or satellite, else ""."""
+    store = client or globals().get("redis_client")
+    candidates = set(_origin_room_targets(origin, store))
     if not candidates:
         return ""
     for target, queue_id in _occupied_targets(store).items():
@@ -8927,6 +8966,109 @@ def _control_queue_id(origin: Optional[Dict[str, Any]], client: Any = None) -> s
     if room_queue_id:
         return room_queue_id
     return _context_person_id(origin)
+
+
+def _resume_queue_id(origin: Optional[Dict[str, Any]], control_queue_id: str, client: Any = None) -> str:
+    """Which queue "resume my music" acts on.
+
+    Stay mode keeps the nearby-first rule. Follow/ask modes read the possessive
+    literally: the speaker's own paused queue wins over someone else's queue in
+    the room, so the busy-room rule can keep their music where it was instead
+    of restarting the other Person's queue.
+    """
+    store = client or globals().get("redis_client")
+    own_queue_id = _context_person_id(origin)
+    if not own_queue_id or own_queue_id == control_queue_id:
+        return control_queue_id
+    own = _player(store, own_queue_id)
+    if _text(own.get("status")).lower() != "paused" or not (own.get("queue") or []):
+        return control_queue_id
+    if _person_resume_room_mode(own_queue_id, store) == "stay":
+        return control_queue_id
+    return own_queue_id
+
+
+def _resume_player_for_room(
+    origin: Optional[Dict[str, Any]],
+    queue_id: str,
+    client: Any = None,
+    *,
+    mode_override: str = "",
+    room_targets: Optional[List[str]] = None,
+) -> Tuple[Dict[str, Any], str]:
+    """Resume a paused queue, honoring the Person's resume-room mode.
+
+    Returns (player, note) where `note` explains a follow/abandon outcome and
+    is appended to the voice summary. A paused queue in the speaker's own room,
+    or with no resolvable speaking room, resumes in place.
+    """
+    store = client or globals().get("redis_client")
+    player = _player(store, queue_id)
+    queue = player.get("queue") if isinstance(player.get("queue"), list) else []
+    if not queue:
+        raise ValueError("The music queue is empty.")
+    mode = mode_override if mode_override in RESUME_ROOM_MODES else _person_resume_room_mode(
+        queue_id, store
+    )
+    own_targets = _normalize_stereo_targets(_list(player.get("targets") or player.get("target")))
+    if mode == "stay" or _text(player.get("status")).lower() != "paused":
+        return _resume_player(person_id=queue_id, client=store), ""
+    wanted = _normalize_stereo_targets(
+        room_targets
+        if room_targets is not None
+        else _origin_room_targets(origin, store)
+    )
+    if not wanted or set(wanted) & set(own_targets):
+        return _resume_player(person_id=queue_id, client=store), ""
+    # Nearby room wins: someone else's queue (even just paused) keeps the room,
+    # so a follow move is abandoned and the music resumes where it was.
+    conflicts = _queue_conflicts(store, queue_id, wanted)
+    if conflicts["foreign_targets"]:
+        foreign_label = _queue_owner_label(
+            next(iter(conflicts["foreign_queues"]), queue_id), store
+        )
+        note = (
+            f" {_target_summary(wanted)} was still playing {foreign_label}'s music, so "
+            f"yours resumed on {_target_summary(own_targets)}."
+        )
+        return _resume_player(person_id=queue_id, client=store), note
+    if mode == "ask":
+        _save_pending_confirmation(
+            store,
+            queue_id,
+            {
+                "type": "resume_room",
+                "args": {},
+                "origin": {},
+                "targets": list(wanted),
+                "queue_id": queue_id,
+            },
+        )
+        _speak_follow_me_prompt(
+            wanted,
+            f"Your music is paused on {_target_summary(own_targets)}. Say 'resume it "
+            "here' to play it in this room, or 'resume it there' to leave it on "
+            f"{_target_summary(own_targets)}.",
+        )
+        return player, ""
+    # follow: hand the paused queue to the speaking room (the Transfer Resume
+    # Delay decides when the music actually starts there).
+    resume_delay = _transfer_resume_delay(queue_id, store)
+    player = _route_player_targets(
+        wanted,
+        restart_playing=False,
+        person_id=queue_id,
+        client=store,
+    )
+    if resume_delay > 0:
+        player["resume_delay_until"] = time.time() + resume_delay
+        player["resume_delay_position"] = _player_position_seconds(player)
+        _save_player(player, store, queue_id)
+        return player, f" It resumes there in {max(1, round(resume_delay))} seconds."
+    return (
+        _resume_player(person_id=queue_id, client=store),
+        " Resumed at the same spot in the room you asked from.",
+    )
 
 
 async def run_hydra_kernel_tool(
@@ -9029,13 +9171,57 @@ async def run_hydra_kernel_tool(
                     "say_hint": "Mention that there is no music request waiting for an answer.",
                 }
             choice = _text(values.get("choice") or values.get("confirm")).casefold() or "yes"
+            pending_type = _text(pending.get("type"))
+            if pending_type == "resume_room":
+                _clear_pending_confirmation(store, active_person_id)
+                queue_id = _text(pending.get("queue_id")) or active_person_id
+                if choice in {
+                    "no",
+                    "there",
+                    "keep",
+                    "leave",
+                    "old",
+                    "cancel",
+                    "stop",
+                    "where it was",
+                    "where they were",
+                }:
+                    player = await asyncio.to_thread(_resume_player, person_id=queue_id, client=store)
+                    return {
+                        "ok": True,
+                        "status": _text(player.get("status")),
+                        "now_playing": _public_track(player.get("current") or {}),
+                        "summary_for_user": (
+                            f"Resumed your music on {_target_summary(_list(player.get('targets') or player.get('target')))}."
+                        ),
+                    }
+                # "here" (the default): resume in the room they asked from. The
+                # busy-room rule still applies at confirm time — if someone
+                # started playing there in the meantime, it stays where it was.
+                player, note = await asyncio.to_thread(
+                    _resume_player_for_room,
+                    origin,
+                    queue_id,
+                    store,
+                    mode_override="follow",
+                    room_targets=_list(pending.get("targets")),
+                )
+                targets = _list(player.get("targets") or player.get("target"))
+                return {
+                    "ok": True,
+                    "status": _text(player.get("status")),
+                    "now_playing": _public_track(player.get("current") or {}),
+                    "summary_for_user": (
+                        f"Music is {_text(player.get('status')) or 'idle'} on "
+                        f"{_target_summary(targets)}.{note}"
+                    ),
+                }
             if choice in {"no", "cancel", "stop", "leave"}:
                 _clear_pending_confirmation(store, active_person_id)
                 return {
                     "ok": True,
                     "summary_for_user": "Okay, I left the music as it was.",
                 }
-            pending_type = _text(pending.get("type"))
             if choice in {"start_new", "new", "fresh"} and pending_type == "relocate":
                 _clear_pending_confirmation(store, active_person_id)
                 return await asyncio.to_thread(
@@ -9105,6 +9291,7 @@ async def run_hydra_kernel_tool(
             return {"ok": False, "error": {"code": "personal_music_confirm_failed", "message": _text(exc)}}
     if tool_id == "personal_music_control":
         action = _text(values.get("action")).lower()
+        resume_note = ""
         try:
             control_queue_id = _control_queue_id(origin, store)
             if action == "next":
@@ -9122,7 +9309,10 @@ async def run_hydra_kernel_tool(
                     client=store,
                 )
             elif action in {"play", "resume"}:
-                player = await asyncio.to_thread(_resume_player, person_id=control_queue_id, client=store)
+                resume_queue_id = _resume_queue_id(origin, control_queue_id, store)
+                player, resume_note = await asyncio.to_thread(
+                    _resume_player_for_room, origin, resume_queue_id, store
+                )
             elif action == "pause":
                 player = await asyncio.to_thread(_pause_player, person_id=control_queue_id, client=store)
             elif action == "shuffle":
@@ -9333,6 +9523,7 @@ async def run_hydra_kernel_tool(
                 "radio_name": _text(player.get("radio_name")),
                 "summary_for_user": (
                     f"Music is {_text(player.get('status')) or 'idle'} on {_target_summary(targets)}."
+                    f"{resume_note}"
                 ),
             }
         except Exception as exc:
@@ -11265,6 +11456,24 @@ def _person_link_personalization_fields(
                 "setting; 0 resumes immediately."
             ),
         },
+        {
+            "key": "person_link_resume_room_mode",
+            "label": "Resume in Another Room",
+            "type": "select",
+            "value": _text(link.get("resume_room_mode"))
+            or _text(cfg.get("resume_room_mode") or DEFAULT_RESUME_ROOM_MODE),
+            "options": [
+                {"value": "stay", "label": "Stay where it was"},
+                {"value": "follow", "label": "Follow me to this room"},
+                {"value": "ask", "label": "Ask me each time"},
+            ],
+            "description": (
+                "When they say \"resume my music\" from a room other than the one their paused "
+                "music is in: Stay where it was resumes it in the original room; Follow me to "
+                "this room moves it to the room they're speaking in (unless another queue is "
+                "already playing there — then it stays put); Ask me each time asks over TTS."
+            ),
+        },
     ]
 
 
@@ -12319,6 +12528,11 @@ def _save_person_link_action(values: Dict[str, Any], store: Any) -> Dict[str, An
         follow_away = _text(existing.get("follow_me_away_action")).casefold()
     if follow_away in FOLLOW_ME_AWAY_ACTIONS:
         link["follow_me_away_action"] = follow_away
+    resume_room = _text(values.get("person_link_resume_room_mode")).casefold()
+    if resume_room not in RESUME_ROOM_MODES:
+        resume_room = _text(existing.get("resume_room_mode")).casefold()
+    if resume_room in RESUME_ROOM_MODES:
+        link["resume_room_mode"] = resume_room
     if source:
         if source == "emby":
             password = _text(values.get("person_link_emby_password")) or _text(

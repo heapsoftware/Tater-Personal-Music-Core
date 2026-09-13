@@ -238,6 +238,20 @@ and the stock-like global path):
 - **Room bindings.** Bind a room to a Person ("the Kitchen plays my music") via
   the `personal_music_control` tool (`bind_room` / `unbind_room`); bound rooms
   become that Person's default destination.
+- **Resume in Another Room.** When someone says "resume my music" from a room
+  other than the one their paused music is in, each Person picks what happens
+  (global default in settings, per-Person override on the link card):
+  - **Stay where it was** (default): the music resumes in the room it was
+    paused in, at the exact spot.
+  - **Follow me to this room**: the queue moves to the room they're speaking
+    in and resumes there at the same spot — unless another queue is already
+    playing (or paused) in that room, in which case the move is abandoned and
+    the music stays where it was. The Transfer Resume Delay applies to the
+    gaining room, same as any transfer.
+  - **Ask me each time**: the room they're in is asked over TTS ("resume it
+    here, or resume it there?") and their answer decides; if the room they're
+    in is busy, there is nothing to ask and the music just resumes where it
+    was.
 - **Conflict behavior.** When the rooms someone asks for are already playing
   someone else's music — or their own music is playing elsewhere — each Person
   chooses on their link card (with a global default in settings):
@@ -328,6 +342,7 @@ enable.
 | Playlist Order | `Shuffle each play` | Fixed ordering for AI mixes and picked playlists (track number, title, artist, album; asc/desc) instead of shuffling every play. |
 | Folder Playlists | blank | `Name=Folder` pairs that turn library folders into always-current playlists (see [Playlists](#playlists)). |
 | Smart Shuffle | off | History-aware shuffle with on-the-fly multi-source mixing; per-Person override on the link card. |
+| Resume in Another Room | `Stay where it was` | What "resume my music" does from a room other than the paused queue's room: stay, follow to the speaking room, or ask over TTS (per-Person override on the link card). |
 | Follow-Me Presence | off | Master switch for following linked People's Home Assistant person entities (see [Follow-Me presence](#follow-me-presence)). |
 | Follow-Me Poll Interval | `15` s | How often HA is polled for each tracked Person (5–3600 s). |
 | Follow-Me Move Delay | `20` s | How long a new zone must hold before the music moves (prevents hallway flicker). |
