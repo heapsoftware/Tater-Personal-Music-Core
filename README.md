@@ -28,6 +28,14 @@ yourself.
 
 Open Tater → **Personal Music** tab → **Sources**.
 
+**Sources is the single, global music source for the household** — one Emby
+login (or API key), or one mounted share folder. This is the library that
+People *without* their own link hear, and what the dashboard player bar and
+client music use. It is **not** how each Person gets their own library: giving
+a Person their own Emby user or share folder is done per-Person in the
+**People** section (see [Per-person links](#per-person-links)), which
+overrides the global source for that Person only.
+
 ### Emby
 
 - **Username & password** (recommended): the core signs in per user, honors each
@@ -63,6 +71,22 @@ A linked Person gets their own catalog, listening history, AI-named
 recommendations, and prompt-ready music profile, scoped under
 `personal_music_core:*:<person_id>` keys. Everyone else follows the global source.
 Voice requests resolve the speaking Person automatically.
+
+For **Emby (own user/library)**, fill in the Person's card in **People**:
+
+- **Emby Server URL** is pre-filled with the global server from Sources — leave
+  it as-is when the Person's account is on the same Emby server (the common
+  case); change it only if their account lives on a different server.
+- **Emby Username / Password**: that Person's own Emby account. Emby decides
+  which libraries that account can see, so their browsing, search, and
+  recommendations only draw from libraries their account is allowed to access.
+  (An **API key** can be used instead, but an API key sees the server's whole
+  library, so per-person accounts are the recommended route.)
+- **Test Emby Connection** checks the URL and credentials against Emby without
+  saving anything; **Save Person Link** stores the link and immediately loads
+  that Person's catalog (if the credentials fail, the save message says so).
+- The **password field stays blank on the saved card** — re-enter it only when
+  changing it; a blank field keeps the saved password.
 
 ### Per-person queues
 

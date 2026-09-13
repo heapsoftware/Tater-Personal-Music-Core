@@ -911,6 +911,95 @@ class PerPersonLinkageTests(unittest.TestCase):
             self.core._PEOPLE_API_MODULE = original_people
 
 
+    def test_person_link_emby_test_action(self):
+        class FakeEmby(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def do_POST(self):
+                if self.path != "/Users/AuthenticateByName":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                length = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(length) or b"{}")
+                if body.get("Username") == "zoe" and body.get("Pw") == "right-pw":
+                    payload = {"AccessToken": "tok", "User": {"Id": "u-zoe"}}
+                    self.send_response(200)
+                else:
+                    payload = {}
+                    self.send_response(401)
+                raw = json.dumps(payload).encode("utf-8")
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        upstream = HTTPServer(("127.0.0.1", 0), FakeEmby)
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        server_url = f"http://127.0.0.1:{upstream.server_address[1]}"
+        original_people = self.core._PEOPLE_API_MODULE
+        self.core._PEOPLE_API_MODULE = types.SimpleNamespace(
+            load_store=lambda _client=None: {
+                "people": [{"id": "person_zoe", "display_name": "Zoe"}]
+            }
+        )
+        try:
+            # A missing server URL fails fast.
+            with self.assertRaises(ValueError):
+                self.core._test_person_link_emby_action(
+                    {"person_link_person_id": "person_zoe"}, self.redis
+                )
+            # Bad credentials are reported, not saved.
+            with self.assertRaises(ValueError) as ctx:
+                self.core._test_person_link_emby_action(
+                    {
+                        "person_link_person_id": "person_zoe",
+                        "person_link_emby_server_url": server_url,
+                        "person_link_emby_username": "zoe",
+                        "person_link_emby_password": "wrong",
+                    },
+                    self.redis,
+                )
+            self.assertIn("rejected", str(ctx.exception))
+            # Good credentials pass, and no link was saved by the test.
+            result = self.core._test_person_link_emby_action(
+                {
+                    "person_link_person_id": "person_zoe",
+                    "person_link_emby_server_url": server_url,
+                    "person_link_emby_username": "zoe",
+                    "person_link_emby_password": "right-pw",
+                },
+                self.redis,
+            )
+            self.assertTrue(result["ok"])
+            self.assertIn("signed in", result["message"])
+            self.assertEqual(self.core._linked_person_ids(self.redis), [])
+        finally:
+            upstream.shutdown()
+            self.core._PEOPLE_API_MODULE = original_people
+
+    def test_person_link_cards_offer_emby_test_button(self):
+        people = types.SimpleNamespace(
+            load_store=lambda _client=None: {
+                "people": [
+                    {"id": "person_zoe", "display_name": "Zoe"},
+                    {"id": "person_ama", "display_name": "Ama"},
+                ]
+            }
+        )
+        original_people = self.core._PEOPLE_API_MODULE
+        self.core._PEOPLE_API_MODULE = people
+        try:
+            self.link_person()
+            data = self.core.get_htmlui_tab_data(redis_client=self.redis)
+            cards = {item.get("id"): item for item in data["ui"]["item_forms"]}
+            for card_id in ("person:person_zoe", "person:new"):
+                actions = [a.get("action") for a in cards[card_id].get("actions") or []]
+                self.assertIn("music_person_link_test", actions)
+        finally:
+            self.core._PEOPLE_API_MODULE = original_people
+
     def test_person_scoped_emby_proxy_routes(self):
         self.redis.hset(
             self.core.PERSON_LINKS_KEY,
