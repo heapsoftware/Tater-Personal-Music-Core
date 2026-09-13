@@ -53,7 +53,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "2.2.0"
+__version__ = "2.2.1"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby user or network-share folder, browse and play "
@@ -292,6 +292,11 @@ CORE_WEBUI_TAB = {
 SETTINGS_KEY = "personal_music_core_settings"
 RUNTIME_KEY = "personal_music_core:runtime"
 PERSON_LINKS_KEY = "personal_music_core:person_links"
+# Last "Test Emby Connection" outcome plus the form values that were tested.
+# The music tab UI only toasts action errors and refetches the tab after a
+# successful action, which also resets unsaved form edits — so the core keeps
+# the tested values and result here and prefills the link cards with them.
+PERSON_LINK_TEST_KEY = "personal_music_core:person_link_test"
 CATALOG_KEY = "personal_music_core:catalog:v1"
 PLAYER_KEY = "personal_music_core:player"
 # Per-person queues live at "personal_music_core:player:<person_id>" while the
@@ -713,6 +718,84 @@ def _delete_person_link(person_id: Any, client: Any = None) -> None:
         return
     try:
         store.hdel(PERSON_LINKS_KEY, wanted)
+    except Exception:
+        pass
+
+
+# Form fields the Emby link test remembers between the test click and the tab
+# refetch that follows it (see PERSON_LINK_TEST_KEY).
+PERSON_LINK_TEST_FIELD_KEYS = (
+    "person_link_person_id",
+    "person_link_source",
+    "person_link_queue_conflict_mode",
+    "person_link_follow_me_entity",
+    "person_link_follow_me_room_overrides",
+    "person_link_follow_me_takeover_mode",
+    "person_link_follow_me_away_action",
+    "person_link_emby_server_url",
+    "person_link_emby_username",
+    "person_link_emby_password",
+    "person_link_emby_api_key",
+    "person_link_emby_user_id",
+    "person_link_emby_library_name",
+    "person_link_share_root_path",
+)
+
+
+def _person_link_test_state(client: Any = None) -> Dict[str, Any]:
+    store = client or globals().get("redis_client")
+    if store is None:
+        return {}
+    try:
+        raw = _decode_hash(store.hgetall(PERSON_LINK_TEST_KEY) or {})
+    except Exception:
+        return {}
+    if not raw:
+        return {}
+    try:
+        values = json.loads(raw.get("values") or "{}")
+    except Exception:
+        values = {}
+    return {
+        "person_id": raw.get("person_id", ""),
+        "status": raw.get("status", ""),
+        "message": raw.get("message", ""),
+        "values": values if isinstance(values, dict) else {},
+    }
+
+
+def _save_person_link_test_state(
+    person_id: str,
+    values: Dict[str, Any],
+    status: str,
+    message: str,
+    client: Any = None,
+) -> None:
+    store = client or globals().get("redis_client")
+    if store is None:
+        return
+    _save_hash(
+        store,
+        PERSON_LINK_TEST_KEY,
+        {
+            "person_id": person_id,
+            "status": status,
+            "message": message,
+            "tested_at": time.time(),
+            "values": json.dumps(values, sort_keys=True),
+        },
+    )
+
+
+def _clear_person_link_test_state(person_id: Any, client: Any = None) -> None:
+    store = client or globals().get("redis_client")
+    wanted = _text(person_id)
+    if store is None or not wanted:
+        return
+    if _person_link_test_state(store).get("person_id") != wanted:
+        return
+    try:
+        store.delete(PERSON_LINK_TEST_KEY)
     except Exception:
         pass
 
@@ -8500,6 +8583,34 @@ def _follow_me_card_status(
     return f"Follow-me: {status}"
 
 
+def _apply_person_link_test_state(
+    card: Dict[str, Any],
+    state: Dict[str, Any],
+    *,
+    prefill_password: bool,
+) -> None:
+    """Restore the last-tested form values and show the test outcome on a card.
+
+    The tab UI refetches after every action, which would otherwise wipe both
+    the test result and anything the user typed but has not saved yet.
+    """
+    values = state.get("values") if isinstance(state.get("values"), dict) else {}
+    for field in card.get("fields") or []:
+        key = _text(field.get("key"))
+        if key not in values:
+            continue
+        # Existing links keep the blank-password-means-keep-saved convention.
+        if key == "person_link_emby_password" and not prefill_password:
+            continue
+        field["value"] = values[key]
+    message = _text(state.get("message"))
+    if message:
+        passed = _text(state.get("status")) == "ok"
+        card.setdefault("summary_rows", []).append(
+            {"label": f"Last Emby test: {'passed' if passed else 'failed'}", "value": message}
+        )
+
+
 def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
     """Per-Person source links shown in the core tab's People section."""
     items: List[Dict[str, Any]] = []
@@ -8743,6 +8854,21 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                 ],
             }
         )
+    # Prefill the card the last test was run against with the tested values and
+    # its outcome, so the result stays visible after the tab's post-action
+    # refetch (which also resets unsaved form edits).
+    state = _person_link_test_state(store)
+    if state.get("person_id"):
+        unlinked_ids = {option.get("value") for option in unlinked}
+        for card in items:
+            card_id = _text(card.get("id"))
+            if card_id == "person:new":
+                # The new-link card only exists for still-unlinked people.
+                if state["person_id"] not in unlinked_ids:
+                    continue
+                _apply_person_link_test_state(card, state, prefill_password=True)
+            elif card_id == f"person:{state['person_id']}":
+                _apply_person_link_test_state(card, state, prefill_password=False)
     return items
 
 
@@ -9302,6 +9428,8 @@ def _save_person_link_action(values: Dict[str, Any], store: Any) -> Dict[str, An
                 "root_path": _text(values.get("person_link_share_root_path")),
             }
     _save_person_link(person_id, link, store)
+    # The link now holds the real values; drop the test draft and its result.
+    _clear_person_link_test_state(person_id, store)
     sync_note = ""
     if source:
         try:
@@ -9320,6 +9448,14 @@ def _test_person_link_emby_action(values: Dict[str, Any], store: Any) -> Dict[st
     existing = _person_link(person_id, store).get("emby") if person_id else {}
     if not isinstance(existing, dict):
         existing = {}
+    # The tab UI refetches after every action, which resets unsaved form edits
+    # and drops this action's success message — so record what was typed and
+    # how the test went; the link cards prefill from it (see _person_link_items).
+    draft = {key: _text(values.get(key)) for key in PERSON_LINK_TEST_FIELD_KEYS}
+
+    def _record(status: str, message: str) -> None:
+        _save_person_link_test_state(person_id, draft, status, message, store)
+
     server_url = _normalize_server_url(values.get("person_link_emby_server_url"))
     username = _text(values.get("person_link_emby_username"))
     password = _text(values.get("person_link_emby_password")) or _text(existing.get("password"))
@@ -9327,6 +9463,7 @@ def _test_person_link_emby_action(values: Dict[str, Any], store: Any) -> Dict[st
     user_id = _text(values.get("person_link_emby_user_id"))
     library_name = _text(values.get("person_link_emby_library_name"))
     if not server_url:
+        _record("error", "Enter the Emby server URL to test.")
         raise ValueError("Enter the Emby server URL to test.")
     auth_mode = "api_key" if api_key and not username else "user_token"
     provider = EmbyMusicProvider(
@@ -9339,6 +9476,7 @@ def _test_person_link_emby_action(values: Dict[str, Any], store: Any) -> Dict[st
         library_name=library_name,
     )
     if not provider.connected:
+        _record("error", "Enter an Emby username and password, or an API key, to test.")
         raise ValueError("Enter an Emby username and password, or an API key, to test.")
     try:
         if auth_mode == "api_key":
@@ -9348,10 +9486,14 @@ def _test_person_link_emby_action(values: Dict[str, Any], store: Any) -> Dict[st
             provider.authenticate(force=True, client=store)
             detail = f"{username} signed in to {server_url}"
     except PermissionError as exc:
+        _record("error", f"Emby rejected the credentials for {label}: {_text(exc)}")
         raise ValueError(f"Emby rejected the credentials for {label}: {_text(exc)}") from exc
     except Exception as exc:
+        _record("error", f"Could not reach Emby for {label}: {_text(exc)}")
         raise ValueError(f"Could not reach Emby for {label}: {_text(exc)}") from exc
-    return {"ok": True, "message": f"{label}'s Emby connection works — {detail}."}
+    message = f"{label}'s Emby connection works — {detail}."
+    _record("ok", message)
+    return {"ok": True, "message": message}
 
 
 def _connect_provider(
@@ -9701,6 +9843,7 @@ def handle_htmlui_tab_action(
             person_id = _text(body.get("id")).replace("person:", "")
         name = _people_person_name(person_id, store) or person_id
         _delete_person_link(person_id, store)
+        _clear_person_link_test_state(person_id, store)
         if _text(_settings(store).get("webui_view_as_person")) == person_id:
             _save_hash(store, SETTINGS_KEY, {"webui_view_as_person": ""})
         for clear_key in (
