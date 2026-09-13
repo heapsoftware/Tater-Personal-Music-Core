@@ -74,6 +74,35 @@ The core scans the folder with a stdlib tag reader (ID3v2 MP3, FLAC/Vorbis, Ogg
 Vorbis/Opus, MP4/M4A, WAV — no extra packages needed), reads embedded or
 `cover.jpg`/`folder.jpg` artwork, and streams files with full Range support.
 
+When a track has no **AlbumArtist** ID3 tag, the core falls back to a
+Kodi-style `album.nfo` in the album's folder (the `<albumartist>` element, then
+`<artist>`) before using the track artist — so compilations and "Various
+Artists" albums group correctly.
+
+### Playlists
+
+Three kinds of playlist can play by name (voice: *"play my Christmas Music
+playlist"*) and feed the **Tracks from a playlist** Endless Playback mode:
+
+- **AI-named mixes** — the dynamic playlists on the Recommendations tab.
+- **User-created playlists** — playlists you built in Emby, and `.m3u`/`.m3u8`
+  files anywhere on the share (entries resolve relative to the playlist file's
+  folder or the share root; remote URLs are skipped). Names are matched
+  case-insensitively; a person's own source is searched.
+- **Folder Playlists** — a core setting that turns library folders into
+  always-current playlists: `Christmas Music=Christmas, Road Trip=Tunes/Road`
+  builds a "Christmas Music" playlist from every track under the Christmas
+  folder (subfolders included). The playlist is rebuilt from the library on
+  every sync and every play, so songs added to the folder join automatically.
+
+With no playlist picked, the newest AI mix is used (or the first user-created
+playlist when there are no mixes yet).
+
+The **Playlist Order** setting decides how these playlists play: shuffled
+(each play, the default) or in a fixed order — by track number, title, artist,
+or album, ascending or descending — so the playlist sounds the same every
+time.
+
 ## Per-person links
 
 **Personal Music** tab → **People** → **Add Person Link** (the form opens on
@@ -105,8 +134,10 @@ Playback**):
   fills the gaps with varied random picks. No streaming provider needed.
 - **Similar to what you played** — relies purely on streaming providers; until
   one is connected it falls back to the library mix so the music never stops.
-- **Tracks from a playlist** — continuously loops one chosen playlist (an AI-named
-  mix from the Recommendations tab; pick it globally or per Person).
+- **Tracks from a playlist** — continuously loops one chosen playlist: an AI-named
+  mix from the Recommendations tab, a playlist you created in Emby, an `.m3u`
+  file on the share, or a [Folder Playlists](#playlists) entry (pick it globally
+  or per Person).
 
 Streaming providers (Spotify, Apple Music, …) are not built in yet, but the
 core carries the provider scaffolding for them: the provider-backed modes call a
@@ -132,12 +163,32 @@ an hour"*). The countdown tracks the active player; when it hits zero the timer
 Smart Shuffle pools, and any in-flight radio refill, so nothing keeps streaming
 while you doze off.
 
+### Group volume, mute all / unmute all
+
+The Music Player card's **Volume** slider sets **every selected speaker to the
+same absolute level** — a group at 12/10/7/15 dragged to 10 ends up at
+10/10/10/10, and the level is remembered per speaker for the next track. The
+card also carries **🔇 All / 🔊 All** buttons: one action mutes every member of
+the current group, the other unmutes them and restores the pre-mute volume.
+The same works by voice (`personal_music_control`):
+
+- *"Set all speakers to 70 percent"* → the `volume` action sets every
+  destination in the group to 70.
+- *"Mute all speakers" / "Unmute all speakers"* → the `mute_all` / `unmute_all`
+  actions; muting remembers the previous volume so unmuting puts the group back
+  where it was. Mute is applied as volume 0, which every supported target type
+  honors.
+
+A **MUTED** badge appears on the player card while the group is muted.
+
 ### Room-to-room transfer
 
 *"Transfer my music to the Master Bedroom"* (`personal_music_move`, or the
 control tool's `move`/`set_targets` action, or the Music Player card's
 **Play On / Set Player** destinations): the whole populated queue and the exact
 spot in the song move with you.
+
+### Filling in an Emby link on a Person's card
 
 For **Emby (own user/library)**, fill in the Person's card in **People**:
 
@@ -251,7 +302,9 @@ enable.
 | Stream Host | auto | Override only if the auto-detected LAN address is wrong (e.g. multiple NICs). |
 | Catalog Sync Interval | `900` s | Also drives per-person catalog refreshes (each linked source gets its own). |
 | Endless Playback | `Basic Auto (LLM)` | How queues keep playing after their final track (see [Endless Playback](#endless-playback)); per-Person override on the link card. |
-| Endless Playback Playlist | blank | Playlist looped by the "Tracks from a playlist" mode. |
+| Endless Playback Playlist | blank | Playlist looped by the "Tracks from a playlist" mode (AI mix, Emby playlist, share `.m3u`, or Folder Playlists entry). |
+| Playlist Order | `Shuffle each play` | Fixed ordering for AI mixes and picked playlists (track number, title, artist, album; asc/desc) instead of shuffling every play. |
+| Folder Playlists | blank | `Name=Folder` pairs that turn library folders into always-current playlists (see [Playlists](#playlists)). |
 | Smart Shuffle | off | History-aware shuffle with on-the-fly multi-source mixing; per-Person override on the link card. |
 | Follow-Me Presence | off | Master switch for following linked People's Home Assistant person entities (see [Follow-Me presence](#follow-me-presence)). |
 | Follow-Me Poll Interval | `15` s | How often HA is polled for each tracked Person (5–3600 s). |

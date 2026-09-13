@@ -5,11 +5,11 @@
       "id": "personal_music",
       "name": "Personal Music Core",
       "module_key": "personal_music_core",
-      "version": "3.0.0",
+      "version": "3.1.0",
       "min_tater_version": "99.5",
       "description": "Per-person music for Tater: link each Person to their own Emby user or network-share folder (or both), browse and play their library with voice control, and build AI-named recommendations from each Person's listening history across clock-synchronized satellites, native Sonos groups, stereo pairs, and media players — with selectable Endless Playback modes (AI radio, offline Infinite Mix, or looping a chosen playlist), Smart Shuffle that mixes several queued sources on the fly, per-Person sleep timers, and optional Follow-Me presence that moves a Person's music to the room their Home Assistant person entity reports.",
       "settings_category": "Personal Music Core Settings",
-      "required_settings_count": 27,
+      "required_settings_count": 29,
       "autostart_key": "personal_music_core_running",
       "tags": [
         "music",
@@ -26,7 +26,7 @@
         "follow-me"
       ],
       "entry": "cores/personal_music_core.py",
-      "sha256": "9e12e943883ff7843cd2ebb69d818a08d06edcded399314cf2116932cffc404d"
+      "sha256": "98623ba4091fb8009734fbd7996db1c4e4a1b3dfaf1a06de94257adb22bc1ce2"
     }
   ]
 }
