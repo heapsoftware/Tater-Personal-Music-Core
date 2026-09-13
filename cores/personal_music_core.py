@@ -53,7 +53,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby user or network-share folder, browse and play "
@@ -750,6 +750,7 @@ PERSON_LINK_TEST_FIELD_KEYS = (
     "person_link_emby_api_key",
     "person_link_emby_user_id",
     "person_link_emby_library_name",
+    "person_link_emby_library_folder",
     "person_link_share_root_path",
 )
 
@@ -900,6 +901,7 @@ def _person_link_provider(
             api_key=_text(values.get("api_key")),
             user_id=_text(values.get("user_id")),
             library_name=_text(values.get("library_name")),
+            library_folder=_text(values.get("library_folder")),
             stream_scope=_text(person_id),
         )
     return NetworkShareMusicProvider(root_path=_text(values.get("root_path")))
@@ -1383,6 +1385,10 @@ class EmbyMusicProvider:
     api_key: str = ""
     user_id: str = ""
     library_name: str = ""
+    # Subfolder of the library to sync (name like "Music", or an absolute
+    # path). Lets one mixed-content library (music + TV + movies) serve as a
+    # Person's source while only its music folder is indexed.
+    library_folder: str = ""
     # Person id when this provider instance serves a linked Person's own Emby
     # account; proxied stream routes carry the scope so the proxy attaches the
     # right person's credentials server-side.
@@ -1403,6 +1409,7 @@ class EmbyMusicProvider:
             api_key=_text(settings.get("emby_api_key")),
             user_id=_text(settings.get("emby_user_id")),
             library_name=_text(settings.get("emby_library_name")),
+            library_folder=_text(settings.get("emby_library_folder")),
         )
 
     @property
@@ -1585,6 +1592,50 @@ class EmbyMusicProvider:
             )
         raise ValueError("This Emby user cannot see any libraries.")
 
+    def music_folder(
+        self, view: Dict[str, Any], client: Any = None
+    ) -> Dict[str, Any]:
+        """Resolve the configured subfolder inside `view` (the view itself when unset).
+
+        Accepts a folder name ("Music") or an absolute server path
+        ("/mnt/media/zoe/Music"); Emby reports each item's filesystem path, so
+        both resolve. Raises when nothing matches so settings mistakes surface
+        at test/save time instead of syncing an empty catalog.
+        """
+        wanted = _text(self.library_folder)
+        if not wanted:
+            return view
+        user_id = self.resolve_user_id(client)
+        page = self.request(
+            "GET",
+            f"Users/{quote(str(user_id), safe='')}/Items",
+            params={
+                "ParentId": _text(view.get("Id")),
+                "Recursive": "true",
+                "IncludeItemTypes": "Folder",
+                "Fields": "Path",
+                "Limit": 1000,
+            },
+            client=client,
+        ) or {}
+        rows = page.get("Items") if isinstance(page, dict) else page
+        candidates = [row for row in (rows or []) if isinstance(row, dict)]
+        wanted_path = wanted.rstrip("/").casefold()
+        for row in candidates:
+            if wanted.startswith("/") and _text(row.get("Path")).rstrip("/").casefold() == wanted_path:
+                return row
+            if _text(row.get("Name")).casefold() == wanted.casefold():
+                return row
+        suffix = "/" + wanted.strip("/")
+        if not wanted.startswith("/"):
+            for row in candidates:
+                if _text(row.get("Path")).rstrip("/").casefold().endswith(suffix.casefold()):
+                    return row
+        raise ValueError(
+            f"No folder matching '{wanted}' exists inside the "
+            f"{_text(view.get('Name')) or 'music'} library visible to this Emby user."
+        )
+
     def stream_url(self, track: Dict[str, Any], *, audio_sync: bool = False) -> str:
         item_id = _text(track.get("provider_track_id")) or _text(track.get("id"))
         if not item_id:
@@ -1630,6 +1681,15 @@ class EmbyMusicProvider:
         view = self.music_view()
         view_id = _text(view.get("Id"))
         view_name = _text(view.get("Name")) or "Music"
+        folder = self.music_folder(view)
+        folder_id = _text(folder.get("Id")) or view_id
+        # When no subfolder is configured the resolved folder IS the view; only
+        # label the scope when a real subfolder was matched.
+        folder_name = (
+            _text(folder.get("Name"))
+            if folder_id != view_id and _text(folder.get("Name"))
+            else ""
+        )
         user_id = self.resolve_user_id()
         tracks: List[Dict[str, Any]] = []
         start_index = 0
@@ -1638,7 +1698,7 @@ class EmbyMusicProvider:
                 "GET",
                 f"Users/{quote(str(user_id), safe='')}/Items",
                 params={
-                    "ParentId": view_id,
+                    "ParentId": folder_id,
                     "Recursive": "true",
                     "IncludeItemTypes": "Song",
                     "Fields": "Genres,MediaSources",
@@ -1660,10 +1720,12 @@ class EmbyMusicProvider:
             if not rows or (total and start_index >= total) or start_index >= MAX_CATALOG_TRACKS:
                 break
         return {
-            "catalog_id": view_id,
+            "catalog_id": folder_id,
             "tracks": tracks[:MAX_CATALOG_TRACKS],
             "total": len(tracks),
-            "libraries": {view_id: view_name},
+            "libraries": {
+                folder_id: f"{view_name} · {folder_name}" if folder_name else view_name,
+            },
         }
 
 # --------------------------------------------------------------------------
@@ -8398,6 +8460,16 @@ def _provider_fields(cfg: Dict[str, Any], provider_id: str) -> List[Dict[str, An
             "value": _text(cfg.get("emby_library_name")),
             "description": "Only needed when this Emby user can see several music libraries.",
         },
+        {
+            "key": "emby_library_folder",
+            "label": "Emby Library Folder (optional)",
+            "type": "text",
+            "value": _text(cfg.get("emby_library_folder")),
+            "description": (
+                "Subfolder of the library to sync (name or full server path). Leave blank to sync "
+                "the whole library; useful for mixed-content libraries."
+            ),
+        },
     ]
 
 
@@ -8928,6 +9000,18 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                         "value": _text(values.get("library_name")),
                     },
                     {
+                        "key": "person_link_emby_library_folder",
+                        "label": "Emby Library Folder (optional)",
+                        "type": "text",
+                        "value": _text(values.get("library_folder")),
+                        "placeholder": "Music",
+                        "description": (
+                            "Subfolder of the library to sync — its name (e.g. Music) or full server "
+                            "path. Leave blank to sync the whole library; useful when one mixed-content "
+                            "library holds their music, TV, and movies."
+                        ),
+                    },
+                    {
                         "key": "person_link_share_root_path",
                         "label": "Mounted Share Folder",
                         "type": "text",
@@ -9055,6 +9139,17 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                         "label": "Emby Library Name (optional)",
                         "type": "text",
                         "value": "",
+                    },
+                    {
+                        "key": "person_link_emby_library_folder",
+                        "label": "Emby Library Folder (optional)",
+                        "type": "text",
+                        "value": "",
+                        "placeholder": "Music",
+                        "description": (
+                            "Subfolder of the library to sync (name or full server path). Leave blank "
+                            "to sync the whole library; useful for mixed-content libraries."
+                        ),
                     },
                     {
                         "key": "person_link_share_root_path",
@@ -9651,6 +9746,7 @@ def _save_person_link_action(values: Dict[str, Any], store: Any) -> Dict[str, An
                 "api_key": _text(values.get("person_link_emby_api_key")),
                 "user_id": _text(values.get("person_link_emby_user_id")),
                 "library_name": _text(values.get("person_link_emby_library_name")),
+                "library_folder": _text(values.get("person_link_emby_library_folder")),
             }
         else:
             link["network_share"] = {
@@ -9700,6 +9796,7 @@ def _test_person_link_emby_action(values: Dict[str, Any], store: Any) -> Dict[st
     api_key = _text(values.get("person_link_emby_api_key"))
     user_id = _text(values.get("person_link_emby_user_id"))
     library_name = _text(values.get("person_link_emby_library_name"))
+    library_folder = _text(values.get("person_link_emby_library_folder"))
     if not server_url:
         _record("error", "Enter the Emby server URL to test.")
         raise ValueError("Enter the Emby server URL to test.")
@@ -9708,10 +9805,11 @@ def _test_person_link_emby_action(values: Dict[str, Any], store: Any) -> Dict[st
         server_url=server_url,
         auth_mode=auth_mode,
         username=username,
-        password=password,
         api_key=api_key,
         user_id=user_id,
+        password=password,
         library_name=library_name,
+        library_folder=library_folder,
     )
     if not provider.connected:
         _record("error", "Enter an Emby username and password, or an API key, to test.")
@@ -9723,6 +9821,13 @@ def _test_person_link_emby_action(values: Dict[str, Any], store: Any) -> Dict[st
         else:
             provider.authenticate(force=True, client=store)
             detail = f"{username} signed in to {server_url}"
+        # Also resolve the library (and its configured subfolder) so a wrong
+        # Library Name or Library Folder surfaces in the test, not at sync.
+        view = provider.music_view(client=store)
+        folder = provider.music_folder(view, client=store)
+        folder_name = _text(folder.get("Name"))
+        if folder_name and _text(folder.get("Id")) != _text(view.get("Id")):
+            detail += f", scoped to the {folder_name} folder"
     except PermissionError as exc:
         _record("error", f"Emby rejected the credentials for {label}: {_text(exc)}")
         raise ValueError(f"Emby rejected the credentials for {label}: {_text(exc)}") from exc
@@ -9777,6 +9882,7 @@ def _connect_provider(
     api_key = _text(values.get("emby_api_key")) or _text(cfg.get("emby_api_key"))
     user_id = _text(values.get("emby_user_id") or cfg.get("emby_user_id"))
     library_name = _text(values.get("emby_library_name") or cfg.get("emby_library_name"))
+    library_folder = _text(values.get("emby_library_folder") or cfg.get("emby_library_folder"))
     provider = EmbyMusicProvider(
         server_url=server_url,
         auth_mode=auth_mode,
@@ -9785,6 +9891,7 @@ def _connect_provider(
         api_key=api_key,
         user_id=user_id,
         library_name=library_name,
+        library_folder=library_folder,
     )
     if not provider.connected:
         raise ValueError("Enter the Emby server URL plus a username and password, or an API key.")
@@ -9809,6 +9916,7 @@ def _connect_provider(
             "emby_api_key": api_key,
             "emby_user_id": resolved_user_id,
             "emby_library_name": library_name,
+            "emby_library_folder": library_folder,
             "server_url": server_url,
             "provider": provider_id,
         },
@@ -9835,6 +9943,7 @@ def _disconnect_provider(provider_id: str, client: Any) -> Dict[str, Any]:
             "emby_api_key",
             "emby_user_id",
             "emby_library_name",
+            "emby_library_folder",
             "server_url",
         )
     else:
