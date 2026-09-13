@@ -1051,7 +1051,7 @@ class PerPersonLinkageTests(unittest.TestCase):
                 row["label"]: row["value"]
                 for row in cards["person:person_zoe"].get("summary_rows") or []
             }
-            self.assertIn("passed", list(linked_rows)[0])
+            self.assertIn("passed", " ".join(linked_rows))
             linked_fields = {
                 field["key"]: field["value"]
                 for field in cards["person:person_zoe"]["fields"]
@@ -1104,6 +1104,16 @@ class PerPersonLinkageTests(unittest.TestCase):
             self.core._PEOPLE_API_MODULE = original_people
 
     def _run_view_as_switch_exit_and_validation(self):
+        # These Person links have never had their library synced; stub out the
+        # background sync scheduler so no worker thread outlives the test.
+        original_schedule = self.core._schedule_catalog_sync
+        self.core._schedule_catalog_sync = lambda *args, **kwargs: False
+        try:
+            self._run_view_as_switch_exit_and_validation_inner()
+        finally:
+            self.core._schedule_catalog_sync = original_schedule
+
+    def _run_view_as_switch_exit_and_validation_inner(self):
         self.assertEqual(self.core._webui_viewer_person_id(self.redis), "")
         # Only linked Persons can be viewed.
         with self.assertRaises(ValueError):
@@ -1250,6 +1260,135 @@ class PerPersonLinkageTests(unittest.TestCase):
             )
         finally:
             self.core._PEOPLE_API_MODULE = original_people
+
+    def test_catalog_sync_state_shows_on_person_and_search_cards(self):
+        # The tab UI drops success-path messages, so sync outcomes are recorded
+        # in CATALOG_STATS_KEY and shown as summary rows on the cards.
+        people = types.SimpleNamespace(
+            load_store=lambda _client=None: {
+                "people": [{"id": "person_zoe", "display_name": "Zoe"}]
+            }
+        )
+        original_people = self.core._PEOPLE_API_MODULE
+        self.core._PEOPLE_API_MODULE = people
+        try:
+            self.link_person()
+
+            def card_rows():
+                cards = {
+                    item["id"]: item
+                    for item in self.core._person_link_items(
+                        self.core._settings(self.redis), self.redis
+                    )
+                }
+                return {
+                    row["label"]: row["value"]
+                    for row in cards["person:person_zoe"]["summary_rows"]
+                }
+
+            rows = card_rows()
+            self.assertIn("Not synced yet", rows["Their Library"])
+            # A recorded failure names the error so a silent save-time sync
+            # failure is visible on the card.
+            self.core._record_catalog_stats(
+                self.redis,
+                "person_zoe",
+                {
+                    "status": "error",
+                    "error": "This Emby user cannot see any libraries.",
+                    "failed_at": time.time(),
+                },
+            )
+            self.assertIn(
+                "This Emby user cannot see any libraries.",
+                card_rows()["Their Library"],
+            )
+            # A successful sync shows counts plus the scan time.
+            self.core._record_catalog_stats(
+                self.redis,
+                "person_zoe",
+                {
+                    "status": "ok",
+                    "provider": "network_share",
+                    "track_count": 42,
+                    "artist_count": 7,
+                    "album_count": 9,
+                    "genre_count": 5,
+                    "synced_at": time.time(),
+                },
+            )
+            rows = card_rows()
+            self.assertIn("42 tracks", rows["Their Library"])
+            self.assertIn("7 artists", rows["Their Library"])
+            self.assertIn("scanned ", rows["Their Library"])
+            # While a background sync runs the row says so.
+            self.core._record_catalog_stats(
+                self.redis, "person_zoe", {"status": "syncing"}
+            )
+            self.assertEqual(card_rows()["Their Library"], "Syncing…")
+            # The search card reports how many tracks a search covers.
+            item = self.core._search_item(
+                {
+                    "tracks": [{} for _ in range(3)],
+                    "artists": ["A"],
+                    "albums": ["B"],
+                    "genres": ["C"],
+                }
+            )
+            self.assertEqual(
+                item["summary_rows"][0],
+                {"label": "Searchable Library", "value": "3 tracks · 1 artists · 1 albums · 1 genres"},
+            )
+            self.assertIn(
+                "0 tracks",
+                self.core._search_item({})["summary_rows"][0]["value"],
+            )
+        finally:
+            self.core._PEOPLE_API_MODULE = original_people
+
+    def test_view_as_switch_syncs_empty_person_library(self):
+        people = types.SimpleNamespace(
+            load_store=lambda _client=None: {
+                "people": [{"id": "person_zoe", "display_name": "Zoe"}]
+            }
+        )
+        original_people = self.core._PEOPLE_API_MODULE
+        original_schedule = self.core._schedule_catalog_sync
+        scheduled = []
+        self.core._PEOPLE_API_MODULE = people
+        self.core._schedule_catalog_sync = (
+            lambda person_id="", client=None: scheduled.append(person_id) or True
+        )
+        try:
+            self.link_person()
+            result = self.core.handle_htmlui_tab_action(
+                action="music_view_as_switch",
+                payload={"values": {"view_as_person_id": "person_zoe"}},
+                redis_client=self.redis,
+            )
+            self.assertTrue(result["ok"])
+            self.assertEqual(scheduled, ["person_zoe"])
+            self.assertIn("syncing now", result["message"])
+            # A Person whose library is already loaded is left alone.
+            self.core._save_json(
+                self.redis,
+                self.core._catalog_key("person_zoe"),
+                {"provider": "network_share", "tracks": [{"title": "Song"}]},
+            )
+            self.core._catalog_memory_cache.update(
+                {"store": None, "payload": {}, "loaded_at": 0.0, "person": ""}
+            )
+            result = self.core.handle_htmlui_tab_action(
+                action="music_view_as_switch",
+                payload={"values": {"view_as_person_id": "person_zoe"}},
+                redis_client=self.redis,
+            )
+            self.assertTrue(result["ok"])
+            self.assertEqual(scheduled, ["person_zoe"])
+            self.assertNotIn("syncing", result["message"])
+        finally:
+            self.core._PEOPLE_API_MODULE = original_people
+            self.core._schedule_catalog_sync = original_schedule
 
     def test_person_scoped_emby_proxy_routes(self):
         self.redis.hset(
