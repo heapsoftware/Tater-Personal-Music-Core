@@ -53,7 +53,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby user or network-share folder, browse and play "
@@ -8624,6 +8624,10 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                 "save_label": "Save Person Link",
                 "actions": [
                     {
+                        "action": "music_person_link_test",
+                        "label": "Test Emby Connection",
+                    },
+                    {
                         "action": "music_person_link_remove",
                         "label": "Remove Link",
                         "tone": "danger",
@@ -8726,6 +8730,12 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                 ],
                 "save_action": "music_person_link_save",
                 "save_label": "Link Person",
+                "actions": [
+                    {
+                        "action": "music_person_link_test",
+                        "label": "Test Emby Connection",
+                    },
+                ],
             }
         )
     return items
@@ -9279,6 +9289,48 @@ def _save_person_link_action(values: Dict[str, Any], store: Any) -> Dict[str, An
     return {"ok": True, "message": f"Saved {name}'s music link.{sync_note}"}
 
 
+def _test_person_link_emby_action(values: Dict[str, Any], store: Any) -> Dict[str, Any]:
+    """Test one Person's Emby credentials from the link form without saving them."""
+    person_id = _text(values.get("person_link_person_id"))
+    name = _people_person_name(person_id, store) if person_id else ""
+    label = name or "This person"
+    existing = _person_link(person_id, store).get("emby") if person_id else {}
+    if not isinstance(existing, dict):
+        existing = {}
+    server_url = _normalize_server_url(values.get("person_link_emby_server_url"))
+    username = _text(values.get("person_link_emby_username"))
+    password = _text(values.get("person_link_emby_password")) or _text(existing.get("password"))
+    api_key = _text(values.get("person_link_emby_api_key"))
+    user_id = _text(values.get("person_link_emby_user_id"))
+    library_name = _text(values.get("person_link_emby_library_name"))
+    if not server_url:
+        raise ValueError("Enter the Emby server URL to test.")
+    auth_mode = "api_key" if api_key and not username else "user_token"
+    provider = EmbyMusicProvider(
+        server_url=server_url,
+        auth_mode=auth_mode,
+        username=username,
+        password=password,
+        api_key=api_key,
+        user_id=user_id,
+        library_name=library_name,
+    )
+    if not provider.connected:
+        raise ValueError("Enter an Emby username and password, or an API key, to test.")
+    try:
+        if auth_mode == "api_key":
+            provider.resolve_user_id(client=store)
+            detail = f"the API key works against {server_url}"
+        else:
+            provider.authenticate(force=True, client=store)
+            detail = f"{username} signed in to {server_url}"
+    except PermissionError as exc:
+        raise ValueError(f"Emby rejected the credentials for {label}: {_text(exc)}") from exc
+    except Exception as exc:
+        raise ValueError(f"Could not reach Emby for {label}: {_text(exc)}") from exc
+    return {"ok": True, "message": f"{label}'s Emby connection works — {detail}."}
+
+
 def _connect_provider(
     provider_id: str,
     values: Dict[str, Any],
@@ -9514,6 +9566,9 @@ def handle_htmlui_tab_action(
 
     if action_name == "music_person_link_save":
         return _save_person_link_action(values, store)
+
+    if action_name == "music_person_link_test":
+        return _test_person_link_emby_action(values, store)
 
     if action_name == "music_person_link_remove":
         person_id = _text(values.get("person_link_person_id"))
