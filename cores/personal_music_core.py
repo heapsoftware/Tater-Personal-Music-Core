@@ -53,7 +53,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "2.4.1"
+__version__ = "2.4.2"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby user or network-share folder, browse and play "
@@ -8019,13 +8019,13 @@ def _client_track(
         track["person_scope"] = scoped
         return track
     catalog = _catalog(client, wanted_provider)
-    if not (catalog.get("tracks") or []):
-        catalog = _sync_catalog(client, wanted_provider)
     track = _find_track_in_catalog(catalog, wanted)
     if track is not None:
         return track
     # Artwork URLs built from a viewed Person's catalog carry no scope, so
-    # fall back to the linked Persons' catalogs and remember whose it was.
+    # search the linked Persons' catalogs next and remember whose it was.
+    # This runs before any household sync: a Person's track must resolve even
+    # when the household source is disconnected or a different provider.
     for linked_id in sorted(_person_links(client)):
         if _person_source_id(linked_id, client) != wanted_provider:
             continue
@@ -8033,6 +8033,16 @@ def _client_track(
         track = _find_track_in_catalog(person_catalog, wanted)
         if track is not None:
             track["person_scope"] = linked_id
+            return track
+    if not (catalog.get("tracks") or []):
+        # Still unknown: refresh the household catalog once (best effort — a
+        # disconnected source must not break Person-scoped artwork).
+        try:
+            catalog = _sync_catalog(client, wanted_provider)
+        except Exception:
+            catalog = {}
+        track = _find_track_in_catalog(catalog, wanted)
+        if track is not None:
             return track
     raise ValueError("That track is no longer in the active music library.")
 
@@ -10264,11 +10274,27 @@ def handle_htmlui_tab_action(
             _history_key(person_id),
             _recommendations_key(person_id),
             _profile_key(person_id),
+            # Also drop the Person's own queue, follow-me tracking state, and
+            # sync-stats entry, so re-linking them later starts clean.
+            _player_key(person_id),
+            _follow_me_state_key(person_id),
         ):
             try:
                 store.delete(clear_key)
             except Exception:
                 pass
+        # Their queue slot leaves the background loop's registry, and their
+        # catalog-stats field stops describing a card that no longer exists.
+        try:
+            registry = _queue_registry(store)
+            registry.pop(_text(person_id), None)
+            _save_json(store, QUEUE_REGISTRY_KEY, registry)
+        except Exception:
+            pass
+        try:
+            store.hdel(CATALOG_STATS_KEY, _catalog_stats_field(person_id))
+        except Exception:
+            pass
         return {"ok": True, "message": f"Removed {name}'s personal music link."}
 
     if action_name == "music_sync_now":
