@@ -188,6 +188,14 @@ control tool's `move`/`set_targets` action, or the Music Player card's
 **Play On / Set Player** destinations): the whole populated queue and the exact
 spot in the song move with you.
 
+**Gaining-room resume delay** (optional): **Transfer Resume Delay (sec)** in
+settings makes the room you moved to wait that many seconds before the music
+resumes — time to walk from the kitchen to the bedroom without missing the
+start of the song. During the wait the queue shows as paused at the exact spot;
+pressing play, pause, or stop in the meantime cancels the wait and acts
+immediately. Each Person can set their own delay on their link card (blank =
+use the global setting; 0 = resume immediately).
+
 ### Filling in an Emby link on a Person's card
 
 For **Emby (own user/library)**, fill in the Person's card in **People**:
@@ -272,6 +280,20 @@ which is the friendly name of the zone the Person is in.
   the same spot in the track — using Tater's room model (which Sat/player is
   in which room). Zone names that differ from Tater room names can be mapped
   per Person with **Zone to Room Overrides** (`The Kitchen=Kitchen, …`).
+- **Resume delays (time to walk between rooms).** Three settings put a pause
+  between the move and the music, each overridable per Person on the link card
+  (blank = use the global setting; 0 = resume immediately):
+  - **Follow-Me Move Resume Delay (sec)**: when the queue hands off to the room
+    they just walked into, that room waits this many seconds before the music
+    resumes at the same spot (on top of the Move Delay that decides *when* the
+    move happens).
+  - **Follow-Me Resume Delay (sec)**: when a follow-me pause ends because they
+    reappear in a room with speakers, the music waits this many seconds before
+    resuming there.
+  - **Transfer Resume Delay (sec)**: the same idea for manual room-to-room
+    transfers (see [Room-to-room transfer](#room-to-room-transfer)).
+  During any wait the queue sits paused at the exact spot, and play / pause /
+  stop in the meantime cancels the wait.
 - **Room takeover is user-selectable.** When the room they walk into is already
   playing someone else's music: **Auto take over** (default) frees the room
   immediately, or **Ask before taking over** asks over TTS in that room and
@@ -309,6 +331,9 @@ enable.
 | Follow-Me Presence | off | Master switch for following linked People's Home Assistant person entities (see [Follow-Me presence](#follow-me-presence)). |
 | Follow-Me Poll Interval | `15` s | How often HA is polled for each tracked Person (5–3600 s). |
 | Follow-Me Move Delay | `20` s | How long a new zone must hold before the music moves (prevents hallway flicker). |
+| Transfer Resume Delay | `0` s | Wait before music resumes in the room a transfer moved to — time to walk between rooms (per-Person override on the link card). |
+| Follow-Me Move Resume Delay | `0` s | Same wait, but for follow-me zone handoffs. |
+| Follow-Me Resume Delay | `0` s | Same wait, but for resuming after a follow-me away pause. |
 
 ## Limitations
 

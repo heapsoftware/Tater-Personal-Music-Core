@@ -54,7 +54,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.1.0"
+__version__ = "3.2.0"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby user or network-share folder (or both), browse "
@@ -264,6 +264,41 @@ CORE_SETTINGS = {
             "description": (
                 "A new room must remain the Person's detected location for this long before "
                 "their music moves, so brief BLE flaps between rooms don't bounce the music."
+            ),
+        },
+        "transfer_resume_delay_seconds": {
+            "label": "Transfer Resume Delay (sec)",
+            "type": "number",
+            "default": 0,
+            "description": (
+                "Room-to-room transfers and follow-me handoffs (\"transfer/move my music to "
+                "the Kitchen\", the control tool's move/set player actions, or changing the "
+                "Play On destinations while music is playing) pause the music and let the "
+                "gaining room wait this many seconds before it resumes at the same spot — "
+                "time to walk between rooms. 0 resumes immediately. Each Person can override "
+                "this on their link card."
+            ),
+        },
+        "follow_me_move_resume_delay_seconds": {
+            "label": "Follow-Me Move Resume Delay (sec)",
+            "type": "number",
+            "default": 0,
+            "description": (
+                "Follow-Me presence: when the music hands off to the room the Person just "
+                "walked into, the new room waits this many seconds before it resumes at the "
+                "same spot — on top of the Move Delay that decides when the move happens. "
+                "0 resumes immediately. Each Person can override this on their link card."
+            ),
+        },
+        "follow_me_resume_delay_seconds": {
+            "label": "Follow-Me Resume Delay (sec)",
+            "type": "number",
+            "default": 0,
+            "description": (
+                "Follow-Me presence: when a follow-me pause resumes automatically (the Person "
+                "reappears in a room with speakers), that room waits this many seconds before "
+                "the music resumes at the same spot. 0 resumes immediately. Each Person can "
+                "override this on their link card."
             ),
         },
         "follow_me_takeover_mode": {
@@ -858,6 +893,9 @@ PERSON_LINK_TEST_FIELD_KEYS = (
     "person_link_follow_me_room_overrides",
     "person_link_follow_me_takeover_mode",
     "person_link_follow_me_away_action",
+    "person_link_transfer_resume_delay_seconds",
+    "person_link_follow_me_move_resume_delay_seconds",
+    "person_link_follow_me_resume_delay_seconds",
     "person_link_emby_server_url",
     "person_link_emby_username",
     "person_link_emby_password",
@@ -4157,6 +4195,39 @@ def _follow_me_away_action(person_id: Any, client: Any = None) -> str:
     return DEFAULT_FOLLOW_ME_AWAY_ACTION
 
 
+def _person_resume_delay(link_key: str, cfg_key: str, person_id: Any, client: Any = None) -> float:
+    """Per-Person gaining-room resume delay, else the global setting (0-600 s)."""
+    store = client or globals().get("redis_client")
+    raw = _person_link(person_id, store).get(link_key)
+    if _text(raw) == "":
+        raw = _settings(store).get(cfg_key)
+    return min(600.0, max(0.0, _as_float(raw, 0.0)))
+
+
+def _transfer_resume_delay(person_id: Any = "", client: Any = None) -> float:
+    """Delay before a moved queue resumes in its new rooms (room-to-room transfers)."""
+    return _person_resume_delay(
+        "transfer_resume_delay_seconds", "transfer_resume_delay_seconds", person_id, client
+    )
+
+
+def _follow_me_move_resume_delay(person_id: Any, client: Any = None) -> float:
+    """Delay before the room a Person walked into resumes their music."""
+    return _person_resume_delay(
+        "follow_me_move_resume_delay_seconds",
+        "follow_me_move_resume_delay_seconds",
+        person_id,
+        client,
+    )
+
+
+def _follow_me_resume_delay(person_id: Any, client: Any = None) -> float:
+    """Delay before a room resumes music that Follow-Me had paused away."""
+    return _person_resume_delay(
+        "follow_me_resume_delay_seconds", "follow_me_resume_delay_seconds", person_id, client
+    )
+
+
 def _ha_config(client: Any = None) -> Dict[str, str]:
     """Base URL and token of Tater's built-in Home Assistant integration."""
     store = client or globals().get("redis_client")
@@ -4379,12 +4450,25 @@ def _follow_me_move(
         # auto: free the destination from other queues without asking; a queue
         # that keeps at least one room stays paused at its position.
         _release_targets_to(store, wanted, except_queue_id=queue_id)
-    _route_player_targets(wanted, person_id=queue_id, client=store)
+    _route_player_targets(
+        wanted,
+        resume_delay=_follow_me_move_resume_delay(person_id, store),
+        person_id=queue_id,
+        client=store,
+    )
     if paused_by_follow_me and _text(
         _player(store, queue_id).get("status")
     ).lower() == "paused":
-        # Walked back into a speaker room after Follow-Me paused them: resume.
-        _resume_player(person_id=queue_id, client=store)
+        # Walked back into a speaker room after Follow-Me paused them: resume
+        # (after the Person's resume delay, if one is set).
+        resume_delay = _follow_me_resume_delay(person_id, store)
+        if resume_delay > 0:
+            resumed_player = _player(store, queue_id)
+            resumed_player["resume_delay_until"] = time.time() + resume_delay
+            resumed_player["resume_delay_position"] = _player_position_seconds(resumed_player)
+            _save_player(resumed_player, store, queue_id)
+        else:
+            _resume_player(person_id=queue_id, client=store)
         state = _follow_me_state(person_id, store)
         state.pop("paused_by_follow_me", None)
         _save_follow_me_state(person_id, state, store)
@@ -7779,6 +7863,8 @@ def _start_player_index(
     queue_id = _queue_id_for_person(person_id)
     with _state_lock:
         player = _player(store, queue_id)
+        # Explicit playback supersedes any pending gaining-room resume delay.
+        _clear_delayed_resume(player)
         queue = player.get("queue") if isinstance(player.get("queue"), list) else []
         if not queue:
             raise ValueError("The music queue is empty.")
@@ -7917,19 +8003,23 @@ def _route_player_targets(
     *,
     restart_playing: bool = True,
     force_restart: bool = False,
+    resume_delay: Any = 0,
     person_id: Any = "",
     client: Any = None,
 ) -> Dict[str, Any]:
     """Move a queue's session to new destinations without replacing its queue.
 
     This is the follow-me handoff primitive: the current track and position are
-    preserved while playback hands off to the new rooms.
+    preserved while playback hands off to the new rooms. With `resume_delay`
+    above zero (a real room change only), the gaining room waits that many
+    seconds before the music resumes there — `_delayed_resume_tick` starts it.
     """
     store = client or globals().get("redis_client")
     queue_id = _queue_id_for_person(person_id)
     next_targets = _normalize_stereo_targets(targets)
     if not next_targets:
         raise ValueError("Choose one or more valid music destinations.")
+    delay = min(600.0, max(0.0, _as_float(resume_delay, 0.0)))
     with _state_lock:
         player = _player(store, queue_id)
         old_targets = _list(player.get("targets") or player.get("target"))
@@ -7950,20 +8040,31 @@ def _route_player_targets(
                 expected_voice_core_sessions=_playback_voice_core_sessions(player),
             )
         player["targets"] = next_targets
+        # A delayed resume is only a real "walk to the other room" — a forced
+        # restart on unchanged targets (sync calibration) must not stall.
+        pending_delay = delay if (restart_required and targets_changed) else 0.0
         if restart_required:
             player.update(
                 {
-                    "status": "stopped",
+                    "status": "paused" if pending_delay > 0 else "stopped",
                     "started_at": 0.0,
                     "position_offset_seconds": position,
                 }
             )
+        if pending_delay > 0:
+            player["resume_delay_until"] = time.time() + pending_delay
+            player["resume_delay_position"] = position
+        elif restart_required:
+            player.pop("resume_delay_until", None)
+            player.pop("resume_delay_position", None)
         if warnings:
             player["warnings"] = warnings
         _save_player(player, store, queue_id)
 
         queue = player.get("queue") if isinstance(player.get("queue"), list) else []
         if restart_required and restart_playing and queue:
+            if pending_delay > 0:
+                return player
             return _start_player_index(
                 _as_int(player.get("index"), 0, 0, max(0, len(queue) - 1)),
                 start_position_seconds=position,
@@ -7972,6 +8073,47 @@ def _route_player_targets(
                 client=store,
             )
         return player
+
+
+def _delayed_resume_tick(store: Any, queue_id: Any) -> None:
+    """Resume a moved queue in its gaining room once the resume delay elapsed.
+
+    Called from the run loop for every queue slot; manual play/resume/stop
+    clears the pending resume instead.
+    """
+    store = store or globals().get("redis_client")
+    if _as_float(_player(store, queue_id).get("resume_delay_until"), 0.0) <= 0:
+        return
+    with _state_lock:
+        player = _player(store, queue_id)
+        if _as_float(player.get("resume_delay_until"), 0.0) <= 0:
+            return
+        if time.time() < _as_float(player.get("resume_delay_until"), 0.0):
+            return
+        player.pop("resume_delay_until", None)
+        player.pop("resume_delay_position", None)
+        _save_player(player, store, queue_id)
+        if _text(player.get("status")).lower() == "playing":
+            # Something already started playback during the wait.
+            return
+        queue = player.get("queue") if isinstance(player.get("queue"), list) else []
+        if not queue:
+            return
+        index = _as_int(player.get("index"), 0, 0, max(0, len(queue) - 1))
+        position = max(0.0, _as_float(player.get("position_offset_seconds")))
+    _start_player_index(
+        index,
+        start_position_seconds=position,
+        record_history=False,
+        person_id=queue_id,
+        client=store,
+    )
+
+
+def _clear_delayed_resume(player: Dict[str, Any]) -> None:
+    """Drop a pending delayed resume (explicit play, pause, stop, or new queue)."""
+    if player.pop("resume_delay_until", None) is not None:
+        player.pop("resume_delay_position", None)
 
 
 def _seek_player(
@@ -8195,7 +8337,11 @@ def _pause_player(*, person_id: Any = "", client: Any = None) -> Dict[str, Any]:
     queue_id = _queue_id_for_person(person_id)
     with _state_lock:
         player = _player(store, queue_id)
+        # Pausing during a resume-delay window cancels the pending resume too —
+        # the queue is not playing, so this is the only feedback channel.
+        _clear_delayed_resume(player)
         if _text(player.get("status")).lower() != "playing":
+            _save_player(player, store, queue_id)
             return player
         position = _player_position_seconds(player)
         duration = max(0.0, _as_float(player.get("duration_seconds")))
@@ -8272,6 +8418,7 @@ def _stop_player(*, person_id: Any = "", client: Any = None) -> Dict[str, Any]:
                 "seek_position_pending": False,
             }
         )
+        _clear_delayed_resume(player)
         if warnings:
             player["warnings"] = warnings
         _save_player(player, store, queue_id)
@@ -8849,16 +8996,25 @@ async def run_hydra_kernel_tool(
             player = await asyncio.to_thread(
                 _route_player_targets,
                 targets,
+                resume_delay=_transfer_resume_delay(move_queue_id, store),
                 person_id=move_queue_id,
                 client=store,
             )
+            delay_note = ""
+            if _as_float(player.get("resume_delay_until"), 0.0) > time.time():
+                delay_note = (
+                    f" It resumes there in "
+                    f"{max(1, round(_as_float(player.get('resume_delay_until')) - time.time()))} "
+                    "seconds."
+                )
             return {
                 "ok": True,
                 "targets": targets,
                 "status": _text(player.get("status")),
                 "now_playing": _public_track(player.get("current") or {}),
                 "summary_for_user": (
-                    f"Moved the music to {_target_summary(targets)} at the same spot in the track."
+                    f"Moved the music to {_target_summary(targets)} at the same spot in the "
+                    f"track.{delay_note}"
                 ),
             }
         except Exception as exc:
@@ -8900,6 +9056,9 @@ async def run_hydra_kernel_tool(
                 player = await asyncio.to_thread(
                     _route_player_targets,
                     pending.get("targets") or [],
+                    resume_delay=_transfer_resume_delay(
+                        pending.get("queue_id") or active_person_id, store
+                    ),
                     person_id=pending.get("queue_id") or "",
                     client=store,
                 )
@@ -8921,6 +9080,7 @@ async def run_hydra_kernel_tool(
                 player = await asyncio.to_thread(
                     _route_player_targets,
                     targets,
+                    resume_delay=_transfer_resume_delay(queue_id, store),
                     person_id=queue_id,
                     client=store,
                 )
@@ -9039,6 +9199,7 @@ async def run_hydra_kernel_tool(
                 player = await asyncio.to_thread(
                     _route_player_targets,
                     targets,
+                    resume_delay=_transfer_resume_delay(move_queue_id, store),
                     person_id=move_queue_id,
                     client=store,
                 )
@@ -10748,6 +10909,39 @@ def _follow_me_link_fields(
                 "in a room with speakers."
             ),
         },
+        {
+            "key": "person_link_follow_me_move_resume_delay_seconds",
+            "label": "Their Move Resume Delay (seconds)",
+            "type": "number",
+            "value": _as_int(link.get("follow_me_move_resume_delay_seconds"), 0, 0, 600)
+            if _text(link.get("follow_me_move_resume_delay_seconds")) != ""
+            else "",
+            "min": 0,
+            "max": 600,
+            "step": 1,
+            "description": (
+                "When Follow-Me hands their music to the room they just walked into, that room "
+                "waits this many seconds before the music resumes at the same spot — time to "
+                "walk between rooms. Leave blank to use the global setting; 0 resumes "
+                "immediately."
+            ),
+        },
+        {
+            "key": "person_link_follow_me_resume_delay_seconds",
+            "label": "Their Away Resume Delay (seconds)",
+            "type": "number",
+            "value": _as_int(link.get("follow_me_resume_delay_seconds"), 0, 0, 600)
+            if _text(link.get("follow_me_resume_delay_seconds")) != ""
+            else "",
+            "min": 0,
+            "max": 600,
+            "step": 1,
+            "description": (
+                "When a follow-me pause resumes automatically because they reappear in a room "
+                "with speakers, that room waits this many seconds before the music resumes at "
+                "the same spot. Leave blank to use the global setting; 0 resumes immediately."
+            ),
+        },
     ]
 
 
@@ -11051,6 +11245,24 @@ def _person_link_personalization_fields(
                 "Smart Shuffle pushes recently played tracks to the back of their shuffled "
                 "queues and mixes several queued sources (albums, playlists, genres) on the "
                 "fly instead of building one enormous queue up front."
+            ),
+        },
+        {
+            "key": "person_link_transfer_resume_delay_seconds",
+            "label": "Their Transfer Resume Delay (seconds)",
+            "type": "number",
+            "value": _as_int(link.get("transfer_resume_delay_seconds"), 0, 0, 600)
+            if _text(link.get("transfer_resume_delay_seconds")) != ""
+            else "",
+            "min": 0,
+            "max": 600,
+            "step": 1,
+            "description": (
+                "When their music is moved to new rooms (\"transfer/move my music to the "
+                "Kitchen\", the control tool's move/set player actions, or changing the Play "
+                "On destinations while playing), the gaining room waits this many seconds "
+                "before the music resumes at the same spot. Leave blank to use the global "
+                "setting; 0 resumes immediately."
             ),
         },
     ]
@@ -12068,6 +12280,27 @@ def _save_person_link_action(values: Dict[str, Any], store: Any) -> Dict[str, An
             continue
         if parsed > 0:
             link[link_key] = parsed if parsed <= override_max else override_max
+    # Resume-delay overrides: unlike the counts above, an explicit 0 is a real
+    # choice ("resume immediately even though the global default waits"), so
+    # only blank means inherit the global setting.
+    for field_key, link_key in (
+        ("person_link_transfer_resume_delay_seconds", "transfer_resume_delay_seconds"),
+        (
+            "person_link_follow_me_move_resume_delay_seconds",
+            "follow_me_move_resume_delay_seconds",
+        ),
+        ("person_link_follow_me_resume_delay_seconds", "follow_me_resume_delay_seconds"),
+    ):
+        if field_key not in values:
+            continue
+        raw = _text(values.get(field_key))
+        if raw == "":
+            continue
+        try:
+            parsed = int(float(raw))
+        except Exception:
+            continue
+        link[link_key] = min(600, max(0, parsed))
     if "person_link_follow_me_entity" in values:
         link["follow_me_person_entity"] = _text(values.get("person_link_follow_me_entity")).strip()
     if "person_link_follow_me_room_overrides" in values:
@@ -12965,6 +13198,7 @@ def handle_htmlui_tab_action(
         player = _route_player_targets(
             targets,
             force_restart=mixed_sync_changed or player_settings_changed,
+            resume_delay=_transfer_resume_delay(viewer_person_id, store),
             person_id=viewer_person_id,
             client=store,
         )
@@ -13996,6 +14230,9 @@ def run(stop_event: Optional[object] = None) -> None:
                         # Sleep timers first: an expired timer force-stops the
                         # queue, so no maintenance (or refill) runs afterwards.
                         _sleep_timer_tick(store, queue_id)
+                        # Gaining-room resume delays: start queues that were
+                        # moved and are waiting out their resume delay.
+                        _delayed_resume_tick(store, queue_id)
                         _advance_finished_player(store, person_id=queue_id)
                         _schedule_continuation_refresh(
                             person_id=queue_id,

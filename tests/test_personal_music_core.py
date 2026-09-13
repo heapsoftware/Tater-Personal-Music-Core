@@ -3126,6 +3126,382 @@ class FollowMeTests(unittest.TestCase):
             core._PEOPLE_API_MODULE = original_people
 
 
+class ResumeDelayTests(unittest.TestCase):
+    """Gaining-room resume delays: transfers, follow-me moves, away returns."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.core = load_personal_music_core()
+
+    def setUp(self):
+        self.redis = FakeRedis()
+        self.core.redis_client = self.redis
+        self.core._shutdown_stream_server()
+        self.played = []
+        self.stopped = []
+        self._originals = {}
+
+    def tearDown(self):
+        for name, value in self._originals.items():
+            setattr(self.core, name, value)
+        self.core._shutdown_stream_server()
+
+    def stub_playback(self):
+        self._originals["_play_track"] = self.core._play_track
+
+        def fake_play_track(track, targets, *, volume_percent, start_position_seconds=0.0, **_kwargs):
+            self.played.append(
+                {
+                    "track_id": track.get("id"),
+                    "targets": list(targets),
+                    "start_position": float(start_position_seconds or 0.0),
+                    "volume": volume_percent,
+                }
+            )
+            return {"ok": True, "sent_count": len(targets), "voice_core_sessions": []}
+
+        self.core._play_track = fake_play_track
+        self._originals["_stop_target"] = self.core._stop_target
+
+        def fake_stop_target(targets, *, expected_voice_core_sessions=None):
+            self.stopped.append(list(targets))
+            return []
+
+        self.core._stop_target = fake_stop_target
+
+    def seed_playing_queue(self, person_id, targets, *, position=30.0, elapsed=10.0, duration=180.0):
+        player = {
+            "status": "playing",
+            "provider": "emby",
+            "queue": [_track_row(1, "Jamming", duration), _track_row(2, "Exodus", duration)],
+            "queue_original": [_track_row(1, "Jamming", duration), _track_row(2, "Exodus", duration)],
+            "index": 0,
+            "current": _track_row(1, "Jamming", duration),
+            "targets": targets,
+            "person_id": person_id,
+            "shuffle": False,
+            "repeat": "off",
+            "volume_percent": 60,
+            "mixed_sync_adjustment_ms": 0,
+            "created_at": time.time(),
+            "queue_session_id": f"session-{person_id or 'shared'}",
+            "continuous_radio": True,
+            "continuation_pending": False,
+            "radio_name": "Tater Continuous Radio",
+            "started_at": time.time() - elapsed if position else 0.0,
+            "position_offset_seconds": position,
+            "duration_seconds": duration,
+            "last_error": "",
+        }
+        self.core._save_player(player, self.redis, person_id)
+        return player
+
+    def link(self, person_id, **extra):
+        link = {"music_source": ""}
+        link.update(extra)
+        self.redis.hset(self.core.PERSON_LINKS_KEY, mapping={person_id: json.dumps(link)})
+
+    def origin_for(self, person_id, selector="kitchen"):
+        return {
+            "people_resolution": {"master_user_id": person_id},
+            "satellite_selector": selector,
+        }
+
+    # ---- delay resolution ----
+
+    def test_delay_resolution_global_person_clamp_and_blank(self):
+        core = self.core
+        # Defaults: no delay anywhere.
+        self.assertEqual(core._transfer_resume_delay("person_a", self.redis), 0.0)
+        self.assertEqual(core._follow_me_move_resume_delay("person_a", self.redis), 0.0)
+        self.assertEqual(core._follow_me_resume_delay("person_a", self.redis), 0.0)
+        self.redis.hset(
+            core.SETTINGS_KEY,
+            mapping={
+                "transfer_resume_delay_seconds": "45",
+                "follow_me_move_resume_delay_seconds": "10",
+                "follow_me_resume_delay_seconds": "5",
+            },
+        )
+        self.assertEqual(core._transfer_resume_delay("person_a", self.redis), 45.0)
+        self.assertEqual(core._follow_me_move_resume_delay("person_a", self.redis), 10.0)
+        self.assertEqual(core._follow_me_resume_delay("person_a", self.redis), 5.0)
+        # The three settings do not bleed into each other.
+        self.assertEqual(core._transfer_resume_delay("", self.redis), 45.0)
+        # Per-Person link overrides win over the global setting.
+        self.link(
+            "person_a",
+            transfer_resume_delay_seconds="120",
+            follow_me_move_resume_delay_seconds="0",
+            follow_me_resume_delay_seconds="30",
+        )
+        self.assertEqual(core._transfer_resume_delay("person_a", self.redis), 120.0)
+        # An explicit 0 is a real override ("resume immediately"), not inherit.
+        self.assertEqual(core._follow_me_move_resume_delay("person_a", self.redis), 0.0)
+        self.assertEqual(core._follow_me_resume_delay("person_a", self.redis), 30.0)
+        # Blank means inherit; out-of-range clamps to 0-600.
+        self.link("person_b", transfer_resume_delay_seconds="", follow_me_resume_delay_seconds="9999")
+        self.assertEqual(core._transfer_resume_delay("person_b", self.redis), 45.0)
+        self.assertEqual(core._follow_me_resume_delay("person_b", self.redis), 600.0)
+        self.link("person_c", transfer_resume_delay_seconds="-7")
+        self.assertEqual(core._transfer_resume_delay("person_c", self.redis), 0.0)
+
+    def test_link_save_persists_resume_delay_fields(self):
+        core = self.core
+        people = types.SimpleNamespace(
+            load_store=lambda _client=None: {
+                "people": [{"id": "person_zoe", "display_name": "Zoe"}]
+            }
+        )
+        original_people = core._PEOPLE_API_MODULE
+        core._PEOPLE_API_MODULE = people
+        try:
+            result = core._save_person_link_action(
+                {
+                    "person_link_person_id": "person_zoe",
+                    "person_link_source": "",
+                    "person_link_transfer_resume_delay_seconds": " 25 ",
+                    "person_link_follow_me_move_resume_delay_seconds": "40",
+                    "person_link_follow_me_resume_delay_seconds": "0",
+                },
+                self.redis,
+            )
+            self.assertTrue(result["ok"], result)
+            link = core._person_link("person_zoe", self.redis)
+            self.assertEqual(link["transfer_resume_delay_seconds"], 25)
+            self.assertEqual(link["follow_me_move_resume_delay_seconds"], 40)
+            # Explicit 0 persists as an override, not as "inherit".
+            self.assertEqual(link["follow_me_resume_delay_seconds"], 0)
+            # Blank fields are dropped from the link so they inherit the global;
+            # unparsable values are treated the same way, out-of-range clamps.
+            result = core._save_person_link_action(
+                {
+                    "person_link_person_id": "person_zoe",
+                    "person_link_source": "",
+                    "person_link_transfer_resume_delay_seconds": "",
+                    "person_link_follow_me_move_resume_delay_seconds": "bogus",
+                    "person_link_follow_me_resume_delay_seconds": "9999",
+                },
+                self.redis,
+            )
+            self.assertTrue(result["ok"], result)
+            link = core._person_link("person_zoe", self.redis)
+            self.assertNotIn("transfer_resume_delay_seconds", link)
+            self.assertNotIn("follow_me_move_resume_delay_seconds", link)
+            self.assertEqual(link.get("follow_me_resume_delay_seconds"), 600)
+        finally:
+            core._PEOPLE_API_MODULE = original_people
+
+    # ---- the delayed handoff itself ----
+
+    def test_route_targets_with_delay_pauses_then_resumes_at_position(self):
+        core = self.core
+        self.stub_playback()
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"], position=30.0, elapsed=10.0)
+        player = core._route_player_targets(
+            ["voice_core:native:office"],
+            resume_delay=15,
+            person_id="person_a",
+            client=self.redis,
+        )
+        # Nothing plays yet: the gaining room waits.
+        self.assertEqual(self.played, [])
+        self.assertEqual(player["status"], "paused")
+        self.assertEqual(player["targets"], ["voice_core:native:office"])
+        self.assertAlmostEqual(player["position_offset_seconds"], 40.0, delta=1.0)
+        self.assertAlmostEqual(
+            player["resume_delay_until"] - time.time(), 15.0, delta=2.0
+        )
+        self.assertAlmostEqual(player["resume_delay_position"], 40.0, delta=1.0)
+        # Ticking before the delay elapses changes nothing.
+        core._delayed_resume_tick(self.redis, "person_a")
+        self.assertEqual(self.played, [])
+        # Once it elapses the music resumes where it left off.
+        player = core._player(self.redis, "person_a")
+        player["resume_delay_until"] = time.time() - 1.0
+        core._save_player(player, self.redis, "person_a")
+        core._delayed_resume_tick(self.redis, "person_a")
+        self.assertEqual(len(self.played), 1)
+        self.assertEqual(self.played[-1]["targets"], ["voice_core:native:office"])
+        self.assertAlmostEqual(self.played[-1]["start_position"], 40.0, delta=1.0)
+        resumed = core._player(self.redis, "person_a")
+        self.assertEqual(resumed["status"], "playing")
+        self.assertNotIn("resume_delay_until", resumed)
+        self.assertNotIn("resume_delay_position", resumed)
+        # The tick is a no-op once the pending resume is gone.
+        core._delayed_resume_tick(self.redis, "person_a")
+        self.assertEqual(len(self.played), 1)
+
+    def test_forced_restart_on_unchanged_targets_never_stalls(self):
+        core = self.core
+        self.stub_playback()
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"], position=30.0, elapsed=10.0)
+        player = core._route_player_targets(
+            ["voice_core:native:kitchen"],
+            force_restart=True,
+            resume_delay=15,
+            person_id="person_a",
+            client=self.redis,
+        )
+        # A sync calibration restart replays immediately, even with a delay set.
+        self.assertEqual(len(self.played), 1)
+        self.assertEqual(player["status"], "playing")
+        self.assertNotIn("resume_delay_until", player)
+
+    def test_manual_play_pause_and_stop_cancel_the_pending_resume(self):
+        core = self.core
+        self.stub_playback()
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"], position=30.0, elapsed=10.0)
+        core._route_player_targets(
+            ["voice_core:native:office"], resume_delay=60, person_id="person_a", client=self.redis
+        )
+        self.assertEqual(self.played, [])
+        # Pressing play in the gaining room starts the music right away.
+        core._resume_player(person_id="person_a", client=self.redis)
+        self.assertEqual(len(self.played), 1)
+        resumed = core._player(self.redis, "person_a")
+        self.assertEqual(resumed["status"], "playing")
+        self.assertNotIn("resume_delay_until", resumed)
+        core._delayed_resume_tick(self.redis, "person_a")
+        self.assertEqual(len(self.played), 1)
+        # Pause clears the pending resume too.
+        core._pause_player(person_id="person_a", client=self.redis)
+        core._route_player_targets(
+            ["voice_core:native:den"], resume_delay=60, person_id="person_a", client=self.redis
+        )
+        # A paused queue is not restarted by the move, so no new delay is armed;
+        # stop clears anything left over.
+        core._stop_player(person_id="person_a", client=self.redis)
+        self.assertNotIn("resume_delay_until", core._player(self.redis, "person_a"))
+        core._delayed_resume_tick(self.redis, "person_a")
+        self.assertEqual(len(self.played), 1)
+
+    def test_move_tool_applies_the_transfer_resume_delay(self):
+        core = self.core
+        self.stub_playback()
+        self.redis.hset(core.SETTINGS_KEY, mapping={"transfer_resume_delay_seconds": "20"})
+        self._originals["_resolve_targets"] = core._resolve_targets
+        core._resolve_targets = (
+            lambda requested="", room="", origin=None, client=None, provider_id="", person_id="": [
+                "voice_core:native:office"
+            ]
+        )
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"], position=30.0, elapsed=10.0)
+        result = asyncio.run(
+            core.run_hydra_kernel_tool(
+                tool_id="personal_music_move",
+                args={"rooms": ["Office"]},
+                origin=self.origin_for("person_a"),
+                redis_client=self.redis,
+            )
+        )
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(self.played, [])
+        moved = core._player(self.redis, "person_a")
+        self.assertEqual(moved["targets"], ["voice_core:native:office"])
+        self.assertEqual(moved["status"], "paused")
+        self.assertGreater(float(moved["resume_delay_until"]), time.time())
+        self.assertIn("resumes there in 20 seconds", json.dumps(result))
+        # A per-Person override changes both the wait and the wording.
+        self.link("person_a", transfer_resume_delay_seconds=0)
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"], position=30.0, elapsed=10.0)
+        result = asyncio.run(
+            core.run_hydra_kernel_tool(
+                tool_id="personal_music_move",
+                args={"rooms": ["Office"]},
+                origin=self.origin_for("person_a"),
+                redis_client=self.redis,
+            )
+        )
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(len(self.played), 1)
+        self.assertEqual(core._player(self.redis, "person_a")["status"], "playing")
+        self.assertNotIn("resumes there in", json.dumps(result))
+
+    def test_follow_me_move_and_away_return_use_their_delays(self):
+        core = self.core
+        self.stub_playback()
+        self.link(
+            "person_a",
+            follow_me_person_entity="person.john",
+            follow_me_move_resume_delay_seconds=20,
+            follow_me_resume_delay_seconds=10,
+        )
+        # A zone move into the new room pauses with a pending resume.
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"], position=30.0, elapsed=10.0)
+        result = core._follow_me_move(
+            "person_a", "Office", ["voice_core:native:office"], self.redis
+        )
+        self.assertTrue(result["moved"], result)
+        self.assertEqual(self.played, [])
+        moved = core._player(self.redis, "person_a")
+        self.assertEqual(moved["status"], "paused")
+        self.assertEqual(moved["targets"], ["voice_core:native:office"])
+        self.assertAlmostEqual(
+            moved["resume_delay_until"] - time.time(), 20.0, delta=2.0
+        )
+        # Expiring the wait resumes at the same spot in the new room.
+        moved["resume_delay_until"] = time.time() - 1.0
+        core._save_player(moved, self.redis, "person_a")
+        core._delayed_resume_tick(self.redis, "person_a")
+        self.assertEqual(len(self.played), 1)
+        self.assertAlmostEqual(self.played[-1]["start_position"], 40.0, delta=1.0)
+
+        # Away -> return: Follow-Me paused them, so the away-resume delay arms.
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"], position=50.0, elapsed=5.0)
+        self.played.clear()
+        state = {"status": "paused_away", "paused_by_follow_me": True}
+        core._save_follow_me_state("person_a", state, self.redis)
+        result = core._follow_me_move(
+            "person_a", "Office", ["voice_core:native:office"], self.redis
+        )
+        self.assertTrue(result["moved"], result)
+        self.assertEqual(self.played, [])
+        returned = core._player(self.redis, "person_a")
+        self.assertEqual(returned["status"], "paused")
+        self.assertAlmostEqual(
+            returned["resume_delay_until"] - time.time(), 10.0, delta=2.0
+        )
+        self.assertAlmostEqual(returned["resume_delay_position"], 55.0, delta=1.0)
+        returned["resume_delay_until"] = time.time() - 1.0
+        core._save_player(returned, self.redis, "person_a")
+        core._delayed_resume_tick(self.redis, "person_a")
+        self.assertEqual(len(self.played), 1)
+        self.assertAlmostEqual(self.played[-1]["start_position"], 55.0, delta=1.0)
+
+    def test_follow_me_tick_moves_and_waits_for_the_resume_delay(self):
+        core = self.core
+        self.stub_playback()
+        self.redis.hset(
+            core.SETTINGS_KEY,
+            mapping={"follow_me_enabled": "1", "follow_me_move_delay_seconds": "0"},
+        )
+        self.link("person_a", follow_me_person_entity="person.john", follow_me_move_resume_delay_seconds=15)
+        # Tater's built-in HA integration settings (reused, never rewritten).
+        self.redis.hset(
+            core.HA_SETTINGS_KEY,
+            mapping={"HA_BASE_URL": "http://ha.local:8123", "HA_TOKEN": "secret"},
+        )
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"], position=30.0, elapsed=10.0)
+        self._originals["_ha_person_location"] = core._ha_person_location
+        core._ha_person_location = lambda client, entity: {"state": "Office"}
+        self._originals["_room_name_to_targets"] = core._room_name_to_targets
+        core._room_name_to_targets = lambda name, client=None: {
+            "Office": "voice_core:native:office"
+        }.get(str(name), "")
+        try:
+            summary = core._follow_me_tick(self.redis)
+            self.assertEqual(summary["moved"], 1)
+            self.assertEqual(self.played, [])
+            player = core._player(self.redis, "person_a")
+            self.assertEqual(player["targets"], ["voice_core:native:office"])
+            self.assertEqual(player["status"], "paused")
+            self.assertGreater(float(player["resume_delay_until"]), time.time())
+        finally:
+            core._room_name_to_targets = self._originals["_room_name_to_targets"]
+            core._ha_person_location = self._originals["_ha_person_location"]
+
+
 class UpstreamCoexistenceTests(unittest.TestCase):
     """Both this core and the upstream Music Core enabled side by side."""
 
