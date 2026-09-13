@@ -989,16 +989,36 @@ class PerPersonLinkageTests(unittest.TestCase):
             }
         )
         original_people = self.core._PEOPLE_API_MODULE
+        core = self.core
         self.core._PEOPLE_API_MODULE = people
         try:
             self.link_person()
             data = self.core.get_htmlui_tab_data(redis_client=self.redis)
             cards = {item.get("id"): item for item in data["ui"]["item_forms"]}
+            # Compact cards stay out of the way: Edit and Remove only.
             for card_id in ("person:person_zoe", "person:new"):
                 actions = [a.get("action") for a in cards[card_id].get("actions") or []]
-                self.assertIn("music_person_link_test", actions)
+                self.assertIn("music_person_link_edit", actions)
+                self.assertNotIn("music_person_link_test", actions)
+                self.assertNotIn("fields", cards[card_id])
+            # Editing opens the full form for that Person (or the add form).
+            core._save_person_link_edit_target("person_zoe", self.redis)
+            data = self.core.get_htmlui_tab_data(redis_client=self.redis)
+            cards = {item.get("id"): item for item in data["ui"]["item_forms"]}
+            self.assertIn(
+                "music_person_link_test",
+                [a.get("action") for a in cards["person:person_zoe"]["actions"]],
+            )
+            core._save_person_link_edit_target("new", self.redis)
+            data = self.core.get_htmlui_tab_data(redis_client=self.redis)
+            cards = {item.get("id"): item for item in data["ui"]["item_forms"]}
+            self.assertIn(
+                "music_person_link_test",
+                [a.get("action") for a in cards["person:new"]["actions"]],
+            )
         finally:
             self.core._PEOPLE_API_MODULE = original_people
+            core._clear_person_link_edit_target(self.redis)
 
     def test_person_link_test_result_and_typed_values_survive_refetch(self):
         # The tab UI refetches after every action and only toasts errors, so the
@@ -1031,6 +1051,8 @@ class PerPersonLinkageTests(unittest.TestCase):
         self.core.EmbyMusicProvider = StubEmby
         try:
             self.link_person()
+            # The editor card is what carries the form, so open it for Zoe.
+            self.core._save_person_link_edit_target("person_zoe", self.redis)
             # A passing test is recorded and shown on the linked person's card,
             # with the password left blank (blank still means keep the saved one).
             draft = {
@@ -1060,7 +1082,8 @@ class PerPersonLinkageTests(unittest.TestCase):
             self.assertEqual(linked_fields["person_link_emby_username"], "zoe")
             self.assertEqual(linked_fields["person_link_emby_password"], "")
             # A failing test for a not-yet-linked person prefills the new-link
-            # card, including the chosen Person and the typed password.
+            # editor, including the chosen Person and the typed password.
+            self.core._save_person_link_edit_target("new", self.redis)
             with self.assertRaises(ValueError):
                 self.core._test_person_link_emby_action(
                     {
@@ -1089,6 +1112,7 @@ class PerPersonLinkageTests(unittest.TestCase):
         finally:
             self.core._PEOPLE_API_MODULE = original_people
             self.core.EmbyMusicProvider = original_provider
+            self.core._clear_person_link_edit_target(self.redis)
         original_people = self.core._PEOPLE_API_MODULE
         self.core._PEOPLE_API_MODULE = types.SimpleNamespace(
             load_store=lambda _client=None: {
@@ -1263,7 +1287,8 @@ class PerPersonLinkageTests(unittest.TestCase):
 
     def test_catalog_sync_state_shows_on_person_and_search_cards(self):
         # The tab UI drops success-path messages, so sync outcomes are recorded
-        # in CATALOG_STATS_KEY and shown as summary rows on the cards.
+        # in CATALOG_STATS_KEY and shown on the compact card's detail line (the
+        # summary-row boxes ellipsis-truncate long text like sync errors).
         people = types.SimpleNamespace(
             load_store=lambda _client=None: {
                 "people": [{"id": "person_zoe", "display_name": "Zoe"}]
@@ -1274,20 +1299,16 @@ class PerPersonLinkageTests(unittest.TestCase):
         try:
             self.link_person()
 
-            def card_rows():
+            def card_detail():
                 cards = {
                     item["id"]: item
                     for item in self.core._person_link_items(
                         self.core._settings(self.redis), self.redis
                     )
                 }
-                return {
-                    row["label"]: row["value"]
-                    for row in cards["person:person_zoe"]["summary_rows"]
-                }
+                return cards["person:person_zoe"]["detail"]
 
-            rows = card_rows()
-            self.assertIn("Not synced yet", rows["Their Library"])
+            self.assertIn("not been synced yet", card_detail())
             # A recorded failure names the error so a silent save-time sync
             # failure is visible on the card.
             self.core._record_catalog_stats(
@@ -1301,7 +1322,7 @@ class PerPersonLinkageTests(unittest.TestCase):
             )
             self.assertIn(
                 "This Emby user cannot see any libraries.",
-                card_rows()["Their Library"],
+                card_detail(),
             )
             # A successful sync shows counts plus the scan time.
             self.core._record_catalog_stats(
@@ -1317,15 +1338,15 @@ class PerPersonLinkageTests(unittest.TestCase):
                     "synced_at": time.time(),
                 },
             )
-            rows = card_rows()
-            self.assertIn("42 tracks", rows["Their Library"])
-            self.assertIn("7 artists", rows["Their Library"])
-            self.assertIn("scanned ", rows["Their Library"])
-            # While a background sync runs the row says so.
+            detail = card_detail()
+            self.assertIn("42 tracks", detail)
+            self.assertIn("7 artists", detail)
+            self.assertIn("scanned ", detail)
+            # While a background sync runs the card says so.
             self.core._record_catalog_stats(
                 self.redis, "person_zoe", {"status": "syncing"}
             )
-            self.assertEqual(card_rows()["Their Library"], "Syncing…")
+            self.assertEqual(card_detail(), "Syncing…")
             # The search card reports how many tracks a search covers.
             item = self.core._search_item(
                 {
@@ -1345,6 +1366,84 @@ class PerPersonLinkageTests(unittest.TestCase):
             )
         finally:
             self.core._PEOPLE_API_MODULE = original_people
+
+    def test_edit_flow_opens_and_closes_the_link_editor(self):
+        people = types.SimpleNamespace(
+            load_store=lambda _client=None: {
+                "people": [
+                    {"id": "person_zoe", "display_name": "Zoe"},
+                    {"id": "person_ama", "display_name": "Ama"},
+                ]
+            }
+        )
+        original_people = self.core._PEOPLE_API_MODULE
+        self.core._PEOPLE_API_MODULE = people
+        try:
+            self.link_person()
+            # Edit flips that Person's compact card into the full form.
+            result = self.core.handle_htmlui_tab_action(
+                action="music_person_link_edit",
+                payload={"values": {}, "id": "person:person_zoe"},
+                redis_client=self.redis,
+            )
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(self.core._person_link_edit_target(self.redis), "person_zoe")
+            cards = {
+                item["id"]: item
+                for item in self.core._person_link_items(
+                    self.core._settings(self.redis), self.redis
+                )
+            }
+            self.assertIn("fields", cards["person:person_zoe"])
+            self.assertNotIn("fields", cards["person:new"])
+            # Cancel closes it; the add form opens with the "new" target.
+            self.core.handle_htmlui_tab_action(
+                action="music_person_link_edit_cancel",
+                payload={"values": {}},
+                redis_client=self.redis,
+            )
+            self.assertEqual(self.core._person_link_edit_target(self.redis), "")
+            self.core.handle_htmlui_tab_action(
+                action="music_person_link_edit",
+                payload={"values": {"person_link_person_id": "new"}},
+                redis_client=self.redis,
+            )
+            cards = {
+                item["id"]: item
+                for item in self.core._person_link_items(
+                    self.core._settings(self.redis), self.redis
+                )
+            }
+            self.assertIn("fields", cards["person:new"])
+            self.assertNotIn("fields", cards["person:person_zoe"])
+            # Only linked People (or the add form) can be opened for editing.
+            self.core._clear_person_link_edit_target(self.redis)
+            with self.assertRaises(ValueError):
+                self.core.handle_htmlui_tab_action(
+                    action="music_person_link_edit",
+                    payload={"values": {"person_link_person_id": "person_ama"}},
+                    redis_client=self.redis,
+                )
+            # Saving a link closes the editor as well.
+            self.core.handle_htmlui_tab_action(
+                action="music_person_link_edit",
+                payload={"values": {"person_link_person_id": "person_zoe"}},
+                redis_client=self.redis,
+            )
+            self.core.handle_htmlui_tab_action(
+                action="music_person_link_save",
+                payload={
+                    "values": {
+                        "person_link_person_id": "person_zoe",
+                        "person_link_source": "",
+                    }
+                },
+                redis_client=self.redis,
+            )
+            self.assertEqual(self.core._person_link_edit_target(self.redis), "")
+        finally:
+            self.core._PEOPLE_API_MODULE = original_people
+            self.core._clear_person_link_edit_target(self.redis)
 
     def test_view_as_switch_syncs_empty_person_library(self):
         people = types.SimpleNamespace(
@@ -2423,13 +2522,20 @@ class FollowMeTests(unittest.TestCase):
             cards = {item["id"]: item for item in core._person_link_items(core._settings(self.redis), self.redis)}
             self.assertIn("person:person_zoe", cards)
             self.assertIn("person:new", cards)
+            # The follow-me status shows on the compact card; the fields live
+            # in the editor that the card's Edit action opens.
+            self.assertIn("Follow-me: in Kitchen → Kitchen", cards["person:person_zoe"]["subtitle"])
+            core._save_person_link_edit_target("person_zoe", self.redis)
+            cards = {item["id"]: item for item in core._person_link_items(core._settings(self.redis), self.redis)}
             fields = {field["key"]: field for field in cards["person:person_zoe"]["fields"]}
             self.assertEqual(fields["person_link_follow_me_entity"]["value"], "person.zoe")
             self.assertEqual(fields["person_link_follow_me_room_overrides"]["value"], "The Kitchen=Kitchen")
             self.assertEqual(fields["person_link_follow_me_takeover_mode"]["value"], "ask")
             self.assertEqual(fields["person_link_follow_me_away_action"]["value"], "pause")
             self.assertIn("Follow-me: in Kitchen → Kitchen", cards["person:person_zoe"]["subtitle"])
-            # The new-link card carries the same fields, defaulted from settings.
+            # The new-link editor carries the same fields, defaulted from settings.
+            core._save_person_link_edit_target("new", self.redis)
+            cards = {item["id"]: item for item in core._person_link_items(core._settings(self.redis), self.redis)}
             new_fields = {field["key"]: field for field in cards["person:new"]["fields"]}
             self.assertEqual(new_fields["person_link_follow_me_takeover_mode"]["value"], "auto")
             self.assertEqual(new_fields["person_link_follow_me_away_action"]["value"], "keep_pause")
@@ -2446,6 +2552,7 @@ class FollowMeTests(unittest.TestCase):
             )
         finally:
             core._PEOPLE_API_MODULE = original_people
+            core._clear_person_link_edit_target(self.redis)
 
     def test_link_save_persists_follow_me_fields(self):
         core = self.core

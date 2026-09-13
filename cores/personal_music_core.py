@@ -53,7 +53,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "2.2.2"
+__version__ = "2.3.0"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby user or network-share folder, browse and play "
@@ -297,6 +297,10 @@ PERSON_LINKS_KEY = "personal_music_core:person_links"
 # successful action, which also resets unsaved form edits — so the core keeps
 # the tested values and result here and prefills the link cards with them.
 PERSON_LINK_TEST_KEY = "personal_music_core:person_link_test"
+# Person id ("new" = the add-link form) whose link editor is open. The tab
+# renderer has no modal, so "Edit" flips that Person's card into the full
+# settings form until it is saved or cancelled.
+PERSON_LINK_EDIT_KEY = "personal_music_core:person_link_edit"
 # Compact sync outcome per catalog ("track/artist/album/genre counts +
 # synced_at", or "syncing/error") keyed by person id ("" = the household
 # catalog). Link cards and the search card read this instead of decoding
@@ -8722,36 +8726,76 @@ def _library_summary_row(
     store: Any = None,
 ) -> Dict[str, Any]:
     """One summary row describing a catalog's sync state (see CATALOG_STATS_KEY)."""
-    stats = _catalog_stats(person_id, store)
-    status = _text(stats.get("status"))
-    if status == "syncing":
-        return {"label": label, "value": "Syncing…"}
-    if status == "error":
-        return {
-            "label": label,
-            "value": f"Last sync failed: {_text(stats.get('error')) or 'unknown error'}",
-        }
-    if status != "ok":
-        return {"label": label, "value": not_synced_hint}
     return {
         "label": label,
-        "value": (
-            f"{_as_int(stats.get('track_count'), 0, 0, 10**9)} tracks"
-            f" · {_as_int(stats.get('artist_count'), 0, 0, 10**9)} artists"
-            f" · {_as_int(stats.get('album_count'), 0, 0, 10**9)} albums"
-            f" · {_as_int(stats.get('genre_count'), 0, 0, 10**9)} genres"
-            f" · scanned {_format_time(stats.get('synced_at'))}"
-        ),
+        "value": _library_summary_value(person_id, not_synced_hint=not_synced_hint, store=store),
     }
 
 
+def _library_summary_value(
+    person_id: Any,
+    *,
+    not_synced_hint: str,
+    store: Any = None,
+) -> str:
+    """Full-text sync state for one catalog.
+
+    Rendered on the card's detail line, whose host CSS wraps — the
+    summary-row boxes ellipsis-truncate long values (e.g. sync errors).
+    """
+    stats = _catalog_stats(person_id, store)
+    status = _text(stats.get("status"))
+    if status == "syncing":
+        return "Syncing…"
+    if status == "error":
+        return f"Last sync failed: {_text(stats.get('error')) or 'unknown error'}"
+    if status != "ok":
+        return not_synced_hint
+    return (
+        f"{_as_int(stats.get('track_count'), 0, 0, 10**9)} tracks"
+        f" · {_as_int(stats.get('artist_count'), 0, 0, 10**9)} artists"
+        f" · {_as_int(stats.get('album_count'), 0, 0, 10**9)} albums"
+        f" · {_as_int(stats.get('genre_count'), 0, 0, 10**9)} genres"
+        f" · scanned {_format_time(stats.get('synced_at'))}"
+    )
+
+
+def _person_link_edit_target(store: Any = None) -> str:
+    """Person id ("new" = add-link form) whose link editor is open, else ""."""
+    store = store or globals().get("redis_client")
+    try:
+        return _text(store.get(PERSON_LINK_EDIT_KEY)) if store is not None else ""
+    except Exception:
+        return ""
+
+
+def _save_person_link_edit_target(person_id: Any, store: Any = None) -> None:
+    if store is not None:
+        store.set(PERSON_LINK_EDIT_KEY, _text(person_id))
+
+
+def _clear_person_link_edit_target(store: Any = None) -> None:
+    if store is not None:
+        try:
+            store.delete(PERSON_LINK_EDIT_KEY)
+        except Exception:
+            pass
+
+
 def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
-    """Per-Person source links shown in the core tab's People section."""
+    """Per-Person source links shown in the core tab's People section.
+
+    Linked People render as compact cards (name, library sync state, Edit and
+    Remove); Edit flips that Person's card into the full settings form until
+    the link is saved, cancelled, or removed (see PERSON_LINK_EDIT_KEY) — the
+    tab renderer offers no modal to open the form in.
+    """
     items: List[Dict[str, Any]] = []
     person_options = _people_person_options(store)
     if len(person_options) <= 1:
         return items
     linked_ids = set(_person_links(store))
+    editing = _person_link_edit_target(store)
     for person_id, link in sorted(_person_links(store).items()):
         name = _people_person_name(person_id, store) or person_id
         source = _person_link_source(link)
@@ -8766,41 +8810,52 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                 f"on {_target_summary(person_queue_targets)}"
             )
         follow_me_status = _follow_me_card_status(person_id, link, cfg, store)
-        if source:
-            library_row = _library_summary_row(
-                person_id,
-                label="Their Library",
-                not_synced_hint="Not synced yet — press Save Person Link to load their library.",
-                store=store,
+        library_hint = (
+            "Their library has not been synced yet — press Edit, then Save Person Link to load it."
+            if source
+            else "The shared library has not been synced yet — press Rescan Library on the source card."
+        )
+        stats_status = _text(_catalog_stats(person_id, store).get("status"))
+        card: Dict[str, Any] = {
+            "id": f"person:{person_id}",
+            "group": "people",
+            "title": name,
+            "subtitle": (
+                f"Plays from {PROVIDER_LABELS[source]}" if source else "Uses the global music source"
             )
-        else:
-            library_row = _library_summary_row(
-                "",
-                label="Household Library",
-                not_synced_hint=(
-                    "Not synced yet — press Rescan Library on the source card to load the shared library."
-                ),
-                store=store,
-            )
-        items.append(
-            {
-                "id": f"person:{person_id}",
-                "group": "people",
-                "title": name,
-                "subtitle": (
-                    f"Plays from {PROVIDER_LABELS[source]}" if source else "Uses the global music source"
-                )
-                + queue_state
-                + (f" · {follow_me_status}" if follow_me_status else ""),
-                "detail": _text(values.get("server_url")) or _text(values.get("root_path")),
-                "summary_rows": [library_row],
-                "hero_badges": [
-                    {
-                        "label": PROVIDER_LABELS.get(source, "GLOBAL").upper(),
-                        "tone": "good" if source else "muted",
-                    }
-                ],
-                "fields": [
+            + queue_state
+            + (f" · {follow_me_status}" if follow_me_status else ""),
+            # The full sync state (and failure reason) lives on the detail
+            # line: the host renders it full width, unlike summary rows.
+            "detail": _library_summary_value(person_id, not_synced_hint=library_hint, store=store),
+            "hero_badges": [
+                {
+                    "label": PROVIDER_LABELS.get(source, "GLOBAL").upper(),
+                    "tone": "good" if source else "muted",
+                }
+            ]
+            + (
+                [{"label": "SYNC FAILED", "tone": "danger"}]
+                if stats_status == "error"
+                else [{"label": "SYNCING", "tone": "muted"}] if stats_status == "syncing" else []
+            ),
+        }
+        if editing != person_id:
+            card["actions"] = [
+                {
+                    "action": "music_person_link_edit",
+                    "label": "Edit",
+                },
+                {
+                    "action": "music_person_link_remove",
+                    "label": "Remove Link",
+                    "tone": "danger",
+                    "confirm": f"Remove {name}'s personal music link? Their library and history stay until removed.",
+                },
+            ]
+            items.append(card)
+            continue
+        card["fields"] = [
                     {
                         "key": "person_link_person_id",
                         "type": "text",
@@ -8882,42 +8937,56 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                             "Folder path of this Person's own share subfolder as mounted on the Tater host."
                         ),
                     },
-                ],
-                "save_action": "music_person_link_save",
-                "save_label": "Save Person Link",
-                "actions": [
-                    {
-                        "action": "music_view_as_switch",
-                        "label": "View Their Music",
-                    },
-                    {
-                        "action": "music_person_link_test",
-                        "label": "Test Emby Connection",
-                    },
-                    {
-                        "action": "music_person_link_remove",
-                        "label": "Remove Link",
-                        "tone": "danger",
-                        "confirm": f"Remove {name}'s personal music link? Their library and history stay until removed.",
-                    }
-                ],
-            }
-        )
+        ]
+        card["save_action"] = "music_person_link_save"
+        card["save_label"] = "Save Person Link"
+        card["actions"] = [
+            {
+                "action": "music_view_as_switch",
+                "label": "View Their Music",
+            },
+            {
+                "action": "music_person_link_test",
+                "label": "Test Emby Connection",
+            },
+            {
+                "action": "music_person_link_edit_cancel",
+                "label": "Cancel",
+            },
+            {
+                "action": "music_person_link_remove",
+                "label": "Remove Link",
+                "tone": "danger",
+                "confirm": f"Remove {name}'s personal music link? Their library and history stay until removed.",
+            },
+        ]
+        items.append(card)
     unlinked = [
         option
         for option in person_options
         if option.get("value") and option["value"] not in linked_ids
     ]
     if unlinked:
-        items.append(
-            {
-                "id": "person:new",
-                "group": "people",
-                "title": "Link a Person",
-                "subtitle": "Give one Person their own music source, library, and listening history.",
-                "detail": "Choose a Person, pick a source, and fill in that source's details.",
-                "hero_badges": [{"label": "NEW LINK", "tone": "muted"}],
-                "fields": [
+        new_card: Dict[str, Any] = {
+            "id": "person:new",
+            "group": "people",
+            "title": "Link a Person",
+            "subtitle": "Give one Person their own music source, library, and listening history.",
+        }
+        if editing != "new":
+            new_card["detail"] = "Add a Person's own Emby library or network-share folder."
+            new_card["hero_badges"] = [{"label": "NEW LINK", "tone": "muted"}]
+            new_card["actions"] = [
+                {
+                    "action": "music_person_link_edit",
+                    "label": "Add Person Link",
+                },
+            ]
+            items.append(new_card)
+        else:
+            new_card["detail"] = "Choose a Person, pick a source, and fill in that source's details."
+            new_card["hero_badges"] = [{"label": "NEW LINK", "tone": "muted"}]
+            new_card["fields"] = [
                     {
                         "key": "person_link_person_id",
                         "label": "Person",
@@ -8994,27 +9063,33 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                         "value": "",
                         "placeholder": "/mnt/music/<person>",
                     },
-                ],
-                "save_action": "music_person_link_save",
-                "save_label": "Link Person",
-                "actions": [
-                    {
-                        "action": "music_person_link_test",
-                        "label": "Test Emby Connection",
-                    },
-                ],
-            }
-        )
-    # Prefill the card the last test was run against with the tested values and
-    # its outcome, so the result stays visible after the tab's post-action
-    # refetch (which also resets unsaved form edits).
+            ]
+            new_card["save_action"] = "music_person_link_save"
+            new_card["save_label"] = "Link Person"
+            new_card["actions"] = [
+                {
+                    "action": "music_person_link_test",
+                    "label": "Test Emby Connection",
+                },
+                {
+                    "action": "music_person_link_edit_cancel",
+                    "label": "Cancel",
+                },
+            ]
+            items.append(new_card)
+    # Prefill the editor the last test was run against with the tested values
+    # and its outcome, so the result stays visible after the tab's post-action
+    # refetch (which also resets unsaved form edits). Compact cards carry no
+    # form, so they are skipped.
     state = _person_link_test_state(store)
     if state.get("person_id"):
         unlinked_ids = {option.get("value") for option in unlinked}
         for card in items:
+            if not card.get("fields"):
+                continue
             card_id = _text(card.get("id"))
             if card_id == "person:new":
-                # The new-link card only exists for still-unlinked people.
+                # The new-link editor only exists for still-unlinked people.
                 if state["person_id"] not in unlinked_ids:
                     continue
                 _apply_person_link_test_state(card, state, prefill_password=True)
@@ -9582,8 +9657,10 @@ def _save_person_link_action(values: Dict[str, Any], store: Any) -> Dict[str, An
                 "root_path": _text(values.get("person_link_share_root_path")),
             }
     _save_person_link(person_id, link, store)
-    # The link now holds the real values; drop the test draft and its result.
+    # The link now holds the real values; drop the test draft and its result,
+    # and close the link editor (the card collapses back to its compact form).
     _clear_person_link_test_state(person_id, store)
+    _clear_person_link_edit_target(store)
     sync_note = ""
     if source:
         try:
@@ -10007,6 +10084,22 @@ def handle_htmlui_tab_action(
     if action_name == "music_person_link_save":
         return _save_person_link_action(values, store)
 
+    if action_name == "music_person_link_edit":
+        person_id = _text(values.get("person_link_person_id"))
+        if not person_id:
+            person_id = _text(body.get("id")).replace("person:", "")
+        if person_id != "new" and person_id not in _person_links(store):
+            raise ValueError("Choose a Person to edit, or add a new Person link.")
+        _save_person_link_edit_target(person_id, store)
+        if person_id == "new":
+            return {"ok": True, "message": "Fill in the new Person's music link and press Link Person."}
+        name = _people_person_name(person_id, store) or person_id
+        return {"ok": True, "message": f"Editing {name}'s music link."}
+
+    if action_name == "music_person_link_edit_cancel":
+        _clear_person_link_edit_target(store)
+        return {"ok": True, "message": "Closed the music link editor."}
+
     if action_name == "music_person_link_test":
         return _test_person_link_emby_action(values, store)
 
@@ -10017,6 +10110,8 @@ def handle_htmlui_tab_action(
         name = _people_person_name(person_id, store) or person_id
         _delete_person_link(person_id, store)
         _clear_person_link_test_state(person_id, store)
+        if _person_link_edit_target(store) == person_id:
+            _clear_person_link_edit_target(store)
         if _text(_settings(store).get("webui_view_as_person")) == person_id:
             _save_hash(store, SETTINGS_KEY, {"webui_view_as_person": ""})
         for clear_key in (
