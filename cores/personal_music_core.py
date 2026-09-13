@@ -53,7 +53,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "2.2.1"
+__version__ = "2.2.2"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby user or network-share folder, browse and play "
@@ -297,6 +297,11 @@ PERSON_LINKS_KEY = "personal_music_core:person_links"
 # successful action, which also resets unsaved form edits — so the core keeps
 # the tested values and result here and prefills the link cards with them.
 PERSON_LINK_TEST_KEY = "personal_music_core:person_link_test"
+# Compact sync outcome per catalog ("track/artist/album/genre counts +
+# synced_at", or "syncing/error") keyed by person id ("" = the household
+# catalog). Link cards and the search card read this instead of decoding
+# multi-megabyte catalog payloads on every tab render.
+CATALOG_STATS_KEY = "personal_music_core:catalog_stats"
 CATALOG_KEY = "personal_music_core:catalog:v1"
 PLAYER_KEY = "personal_music_core:player"
 # Per-person queues live at "personal_music_core:player:<person_id>" while the
@@ -496,6 +501,9 @@ _catalog_memory_cache: Dict[str, Any] = {
 }
 _catalog_sync_lock = threading.Lock()
 _catalog_sync_started_at = 0.0
+# Worker thread for tab-triggered catalog syncs (View Their Music on a Person
+# whose library was never loaded); "" scope = the household catalog.
+_catalog_sync_thread: Optional[threading.Thread] = None
 _recommendation_lock = threading.Lock()
 _recommendation_started_at = 0.0
 _recommendation_thread: Optional[threading.Thread] = None
@@ -825,6 +833,37 @@ def _catalog_key(person_id: Any = "") -> str:
 
 def _history_key(person_id: Any = "") -> str:
     return _scoped_key(HISTORY_KEY, person_id)
+
+
+def _catalog_stats_field(person_id: Any = "") -> str:
+    """Hash field one catalog's stats live under (person id, "" = household)."""
+    return _text(person_id)
+
+
+def _record_catalog_stats(store: Any, person_id: Any, stats: Dict[str, Any]) -> None:
+    if store is None:
+        return
+    _save_hash(
+        store,
+        CATALOG_STATS_KEY,
+        {
+            _catalog_stats_field(person_id): json.dumps(
+                stats, ensure_ascii=False, separators=(",", ":")
+            )
+        },
+    )
+
+
+def _catalog_stats(person_id: Any, store: Any = None) -> Dict[str, Any]:
+    store = store or globals().get("redis_client")
+    try:
+        raw = _decode_hash(store.hgetall(CATALOG_STATS_KEY) or {}).get(
+            _catalog_stats_field(person_id), ""
+        )
+        value = json.loads(raw) if raw else {}
+    except Exception:
+        value = {}
+    return value if isinstance(value, dict) else {}
 
 
 def _recommendations_key(person_id: Any = "") -> str:
@@ -2663,6 +2702,19 @@ def _sync_catalog_impl(
         "synced_at": time.time(),
     }
     _save_json(store, _catalog_key(person_id), payload)
+    _record_catalog_stats(
+        store,
+        person_id,
+        {
+            "status": "ok",
+            "provider": selected,
+            "track_count": len(tracks),
+            "artist_count": len(artists),
+            "album_count": len(albums),
+            "genre_count": len(genres),
+            "synced_at": payload["synced_at"],
+        },
+    )
     with _catalog_memory_cache_lock:
         _catalog_memory_cache.update(
             {
@@ -2732,6 +2784,47 @@ def _sync_catalog(
     finally:
         _catalog_sync_started_at = 0.0
         _catalog_sync_lock.release()
+
+
+def _schedule_catalog_sync(person_id: Any = "", client: Any = None) -> bool:
+    """Sync one catalog off-thread (a Person's own, or "" for the household).
+
+    Used by tab actions that would otherwise leave a never-synced catalog
+    invisible. Returns False when a sync worker is already running; on-demand
+    and scheduled syncs all share _catalog_sync_lock underneath. The outcome is
+    recorded in CATALOG_STATS_KEY, which the link and search cards display.
+    """
+    global _catalog_sync_thread
+    store = client or globals().get("redis_client")
+    person_id = _text(person_id)
+    with _state_lock:
+        if _catalog_sync_thread is not None and _catalog_sync_thread.is_alive():
+            return False
+        # Cards show "Syncing…" until the worker records the outcome.
+        _record_catalog_stats(store, person_id, {"status": "syncing", "started_at": time.time()})
+
+        def worker() -> None:
+            try:
+                _sync_catalog(store, "", person_id)
+            except Exception as exc:
+                logger.warning("[Music] catalog sync failed: %s", exc)
+                _record_catalog_stats(
+                    store,
+                    person_id,
+                    {
+                        "status": "error",
+                        "error": _text(exc)[:200],
+                        "failed_at": time.time(),
+                    },
+                )
+
+        _catalog_sync_thread = threading.Thread(
+            target=worker,
+            daemon=True,
+            name="music-catalog-sync",
+        )
+        _catalog_sync_thread.start()
+        return True
 
 
 def _clean_query_tokens(value: Any) -> List[str]:
@@ -7409,13 +7502,23 @@ def _player_item(
     }
 
 
-def _search_item() -> Dict[str, Any]:
+def _search_item(catalog: Dict[str, Any]) -> Dict[str, Any]:
+    track_count = len(catalog.get("tracks") or [])
+    searchable = (
+        f"{track_count} tracks"
+        f" · {len(catalog.get('artists') or [])} artists"
+        f" · {len(catalog.get('albums') or [])} albums"
+        f" · {len(catalog.get('genres') or [])} genres"
+        if track_count
+        else "0 tracks — connect a source and sync the library first"
+    )
     return {
         "id": "search:music",
         "group": "search",
         "card_variant": "music_search",
         "title": "Search Your Library",
         "subtitle": "Find a genre, artist, album, or song and start a fresh track list.",
+        "summary_rows": [{"label": "Searchable Library", "value": searchable}],
         "fields_dropdown": False,
         "fields": [
             {
@@ -8611,6 +8714,37 @@ def _apply_person_link_test_state(
         )
 
 
+def _library_summary_row(
+    person_id: Any,
+    *,
+    label: str,
+    not_synced_hint: str,
+    store: Any = None,
+) -> Dict[str, Any]:
+    """One summary row describing a catalog's sync state (see CATALOG_STATS_KEY)."""
+    stats = _catalog_stats(person_id, store)
+    status = _text(stats.get("status"))
+    if status == "syncing":
+        return {"label": label, "value": "Syncing…"}
+    if status == "error":
+        return {
+            "label": label,
+            "value": f"Last sync failed: {_text(stats.get('error')) or 'unknown error'}",
+        }
+    if status != "ok":
+        return {"label": label, "value": not_synced_hint}
+    return {
+        "label": label,
+        "value": (
+            f"{_as_int(stats.get('track_count'), 0, 0, 10**9)} tracks"
+            f" · {_as_int(stats.get('artist_count'), 0, 0, 10**9)} artists"
+            f" · {_as_int(stats.get('album_count'), 0, 0, 10**9)} albums"
+            f" · {_as_int(stats.get('genre_count'), 0, 0, 10**9)} genres"
+            f" · scanned {_format_time(stats.get('synced_at'))}"
+        ),
+    }
+
+
 def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
     """Per-Person source links shown in the core tab's People section."""
     items: List[Dict[str, Any]] = []
@@ -8632,6 +8766,22 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                 f"on {_target_summary(person_queue_targets)}"
             )
         follow_me_status = _follow_me_card_status(person_id, link, cfg, store)
+        if source:
+            library_row = _library_summary_row(
+                person_id,
+                label="Their Library",
+                not_synced_hint="Not synced yet — press Save Person Link to load their library.",
+                store=store,
+            )
+        else:
+            library_row = _library_summary_row(
+                "",
+                label="Household Library",
+                not_synced_hint=(
+                    "Not synced yet — press Rescan Library on the source card to load the shared library."
+                ),
+                store=store,
+            )
         items.append(
             {
                 "id": f"person:{person_id}",
@@ -8643,6 +8793,7 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                 + queue_state
                 + (f" · {follow_me_status}" if follow_me_status else ""),
                 "detail": _text(values.get("server_url")) or _text(values.get("root_path")),
+                "summary_rows": [library_row],
                 "hero_badges": [
                     {
                         "label": PROVIDER_LABELS.get(source, "GLOBAL").upper(),
@@ -8976,7 +9127,10 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
         external_status.replace("_", " ").upper() or "UNKNOWN",
     )
 
-    item_forms = [_player_item(player, target_options, active_provider, cfg), _search_item()]
+    item_forms = [
+        _player_item(player, target_options, active_provider, cfg),
+        _search_item(catalog),
+    ]
     item_forms.extend(
         _recommendation_ui_items(cfg, catalog, runtime, active_provider, store, viewer_person_id)
     )
@@ -9437,6 +9591,13 @@ def _save_person_link_action(values: Dict[str, Any], store: Any) -> Dict[str, An
             sync_note = f" Loaded {len(catalog.get('tracks') or [])} of {name}'s tracks."
         except Exception as exc:
             sync_note = f" Their library did not load yet: {_text(exc)}"
+            # The tab UI drops success-path messages, so record the failure for
+            # the link card's "Their Library" row.
+            _record_catalog_stats(
+                store,
+                person_id,
+                {"status": "error", "error": _text(exc)[:200], "failed_at": time.time()},
+            )
     return {"ok": True, "message": f"Saved {name}'s music link.{sync_note}"}
 
 
@@ -9803,6 +9964,18 @@ def handle_htmlui_tab_action(
         if person_id:
             name = _people_person_name(person_id, store) or person_id
             message = f"Now viewing {name}'s music in this tab."
+            # Switching alone never loads their library; if their catalog was
+            # never synced (or their source changed), start one so the Browse
+            # Library tabs fill in without re-saving the link.
+            if not (
+                _catalog(store, _person_source_id(person_id, store), person_id).get("tracks")
+                or []
+            ):
+                message += (
+                    " Their library is syncing now; Browse Library fills in when it finishes."
+                    if _schedule_catalog_sync(person_id, store)
+                    else " Their library sync is already running."
+                )
         else:
             message = "Now viewing the household's shared music."
         _save_hash(store, SETTINGS_KEY, {"webui_view_as_person": person_id})
