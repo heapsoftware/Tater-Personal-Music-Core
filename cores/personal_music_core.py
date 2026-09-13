@@ -53,7 +53,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby user or network-share folder, browse and play "
@@ -8280,17 +8280,18 @@ def _recommendation_ui_items(
     runtime: Dict[str, Any],
     active_provider: str,
     client: Any = None,
+    person_id: Any = "",
 ) -> List[Dict[str, Any]]:
     assistant_name = _assistant_first_name(client)
     recommendations_label = _recommendations_label(client)
     default_mix_title = f"{assistant_name} Mix"
     history = [
         row
-        for row in _listening_history(client)
+        for row in _listening_history(client, person_id)
         if _provider_id(row.get("provider")) == active_provider
     ]
     enabled = _as_bool(cfg.get("recommendations_enabled"), True)
-    published = _recommendations(client)
+    published = _recommendations(client, person_id)
     if _provider_id(published.get("provider"), "") != active_provider:
         published = {}
     generated_at = _as_float(published.get("generated_at"))
@@ -8624,6 +8625,10 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                 "save_label": "Save Person Link",
                 "actions": [
                     {
+                        "action": "music_view_as_switch",
+                        "label": "View Their Music",
+                    },
+                    {
                         "action": "music_person_link_test",
                         "label": "Test Emby Connection",
                     },
@@ -8754,10 +8759,22 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
     ):
         people_options.append({"value": prompt_person_id, "label": f"Saved Person: {prompt_person_id}"})
     active_provider = _provider_id(cfg.get("provider"))
+    # When viewing a linked Person's music, their own source decides which
+    # catalog, queue, and recommendation set the tabs show.
+    viewer_person_id = _webui_viewer_person_id(store)
+    if viewer_person_id:
+        active_provider = _person_source_id(viewer_person_id, store) or active_provider
+        viewer_name = _people_person_name(viewer_person_id, store) or viewer_person_id
+    else:
+        viewer_name = ""
     runtime = _runtime(store)
-    catalog = _catalog(store, active_provider)
-    player = _reconcile_native_playback(_player(store), store)
-    connected = _paired(cfg, active_provider)
+    catalog = _catalog(store, active_provider, viewer_person_id)
+    player = _reconcile_native_playback(_player(store, viewer_person_id), store)
+    if viewer_person_id:
+        viewer_provider = _person_link_provider(viewer_person_id, active_provider, store)
+        connected = bool(viewer_provider and viewer_provider.connected)
+    else:
+        connected = _paired(cfg, active_provider)
     saved_player_targets = _normalize_stereo_targets(
         player.get("targets") or player.get("target")
     )
@@ -8835,8 +8852,9 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
 
     item_forms = [_player_item(player, target_options, active_provider, cfg), _search_item()]
     item_forms.extend(
-        _recommendation_ui_items(cfg, catalog, runtime, active_provider, store)
+        _recommendation_ui_items(cfg, catalog, runtime, active_provider, store, viewer_person_id)
     )
+    item_forms.extend(_view_as_items(cfg, store))
     item_forms.extend(_facet_items(catalog, "genres", "Genre"))
     item_forms.extend(_facet_items(catalog, "artists", "Artist"))
     item_forms.extend(_facet_items(catalog, "albums", "Album"))
@@ -9098,6 +9116,11 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
     return {
         "summary": "Personal Emby and network-share music with voice control, per-person recommendations, and multi-room playback.",
         "stats": [
+            *(
+                [{"label": "Viewing", "value": f"{viewer_name}'s music"}]
+                if viewer_person_id
+                else []
+            ),
             {
                 "label": "Music Source",
                 "value": (
@@ -9463,21 +9486,91 @@ def _disconnect_provider(provider_id: str, client: Any) -> Dict[str, Any]:
     return {"ok": True, "message": f"{PROVIDER_LABELS[provider_id]} disconnected locally."}
 
 
+def _webui_viewer_person_id(store: Any = None) -> str:
+    """Person whose music the dashboard tab is viewing ("" = household/global)."""
+    store = store or globals().get("redis_client")
+    person_id = _text(_settings(store).get("webui_view_as_person"))
+    # Only linked Persons have their own library to view.
+    if person_id and person_id in _person_links(store):
+        return person_id
+    return ""
+
+
+def _view_as_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
+    """'View Music As' cards shown atop the Library, Recommendations, and People tabs."""
+    viewer = _webui_viewer_person_id(store)
+    options = [{"value": "", "label": "Household (global source)"}]
+    for person_id in sorted(_person_links(store)):
+        options.append(
+            {
+                "value": person_id,
+                "label": _people_person_name(person_id, store) or person_id,
+            }
+        )
+    if len(options) <= 1:
+        return []
+    viewer_name = _people_person_name(viewer, store) or viewer if viewer else ""
+    cards = []
+    for group in ("search", "recommendations", "people"):
+        cards.append(
+            {
+                "id": f"view_as:{group}",
+                "group": group,
+                "title": "View Music As",
+                "subtitle": (
+                    f"Viewing {viewer_name}'s music — their library, queue, and mixes."
+                    if viewer
+                    else "Pick a linked Person to browse their library, queue, and mixes."
+                ),
+                "detail": (
+                    "Switches what the Playlist, Browse Library, and Recommendations tabs show. "
+                    "Voice requests always follow the speaking Person."
+                ),
+                "hero_badges": (
+                    [{"label": f"VIEWING: {viewer_name.upper()}", "tone": "good"}]
+                    if viewer
+                    else [{"label": "HOUSEHOLD", "tone": "muted"}]
+                ),
+                "fields": [
+                    {
+                        "key": "view_as_person_id",
+                        "label": "View Music As",
+                        "type": "select",
+                        "value": viewer,
+                        "options": options,
+                    }
+                ],
+                "save_action": "music_view_as_switch",
+                "save_label": "Switch Viewer",
+                "actions": (
+                    [{"action": "music_view_as_exit", "label": "Back to Household"}]
+                    if viewer
+                    else []
+                ),
+            }
+        )
+    return cards
+
+
 def _play_recommendation(
     item_id: Any,
     client: Any = None,
     *,
     requested_targets: Any = None,
     volume_percent: Any = None,
+    person_id: Any = "",
 ) -> Dict[str, Any]:
     store = client or globals().get("redis_client")
     recommendations_label = _recommendations_label(store)
     recommendation_id = _text(item_id)
     if recommendation_id.startswith("recommendation:"):
         recommendation_id = recommendation_id.split(":", 1)[1]
-    published = _recommendations(store)
+    published = _recommendations(store, person_id)
     cfg = _settings(store)
-    provider_id = _provider_id(cfg.get("provider"))
+    # A viewed Person's mixes come from their own source, not the global one.
+    provider_id = (
+        _person_source_id(person_id, store) or _provider_id(cfg.get("provider"))
+    )
     if _provider_id(published.get("provider"), "") != provider_id:
         raise ValueError(f"Refresh {recommendations_label} for the active music provider first.")
     playlist = next(
@@ -9490,7 +9583,7 @@ def _play_recommendation(
     )
     if not isinstance(playlist, dict):
         raise ValueError("That Tater recommendation is no longer available.")
-    catalog = _catalog(store, provider_id)
+    catalog = _catalog(store, provider_id, person_id)
     track_by_id = {
         _text(track.get("id")): track
         for track in catalog.get("tracks") or []
@@ -9504,7 +9597,7 @@ def _play_recommendation(
     if not tracks:
         raise ValueError("Those recommended tracks are no longer in the active library. Refresh recommendations.")
 
-    current = _player(store)
+    current = _player(store, person_id)
     selected_targets = _list(requested_targets) or _list(
         current.get("targets") or current.get("target")
     ) or _list(cfg.get("default_targets") or cfg.get("default_target"))
@@ -9512,6 +9605,7 @@ def _play_recommendation(
         selected_targets,
         client=store,
         provider_id=provider_id,
+        person_id=person_id,
     )
     if not targets:
         raise ValueError("Choose one or more players in the Music Player before starting this playlist.")
@@ -9527,6 +9621,7 @@ def _play_recommendation(
         targets=targets,
         shuffle=False,
         volume_percent=volume,
+        person_id=person_id,
         client=store,
     )
 
@@ -9544,6 +9639,36 @@ def handle_htmlui_tab_action(
     action_name = _text(action).lower()
     body = payload if isinstance(payload, dict) else {}
     values = _payload_values(body)
+    # Dashboard actions follow the "View Music As" Person ("" = household).
+    viewer_person_id = _webui_viewer_person_id(store)
+    viewer_origin = {"person_id": viewer_person_id} if viewer_person_id else {}
+    # The viewed Person's own source is the active provider for their actions.
+    viewer_provider_id = (
+        _person_source_id(viewer_person_id, store) if viewer_person_id else ""
+    )
+
+    def _action_provider(default: Any) -> str:
+        return viewer_provider_id or _provider_id(default)
+
+    if action_name == "music_view_as_switch":
+        person_id = _text(values.get("view_as_person_id")) or _text(
+            values.get("person_link_person_id")
+        )
+        if person_id and person_id not in _person_links(store):
+            raise ValueError(
+                "Choose a Person that has a music link (People tab) to view their music."
+            )
+        if person_id:
+            name = _people_person_name(person_id, store) or person_id
+            message = f"Now viewing {name}'s music in this tab."
+        else:
+            message = "Now viewing the household's shared music."
+        _save_hash(store, SETTINGS_KEY, {"webui_view_as_person": person_id})
+        return {"ok": True, "message": message}
+
+    if action_name == "music_view_as_exit":
+        _save_hash(store, SETTINGS_KEY, {"webui_view_as_person": ""})
+        return {"ok": True, "message": "Back to the household's shared music view."}
 
     if action_name == "music_provider_connect":
         return _connect_provider(_provider_from_card(body), values, store)
@@ -9576,6 +9701,8 @@ def handle_htmlui_tab_action(
             person_id = _text(body.get("id")).replace("person:", "")
         name = _people_person_name(person_id, store) or person_id
         _delete_person_link(person_id, store)
+        if _text(_settings(store).get("webui_view_as_person")) == person_id:
+            _save_hash(store, SETTINGS_KEY, {"webui_view_as_person": ""})
         for clear_key in (
             _catalog_key(person_id),
             _history_key(person_id),
@@ -9713,21 +9840,21 @@ def handle_htmlui_tab_action(
         }
 
     if action_name == "music_recommendation_play":
-        player = _play_recommendation(body.get("id"), store)
+        player = _play_recommendation(body.get("id"), store, person_id=viewer_person_id)
         return {
             "ok": True,
             "message": f"Playing {_track_label(player.get('current') or {})} from {recommendations_label}.",
         }
 
     if action_name == "music_ui_play":
-        existing = _player(store)
+        existing = _player(store, viewer_person_id)
         selected_provider = _provider_id(
             values.get("provider"),
-            _provider_id(_settings(store).get("provider")),
+            _action_provider(_settings(store).get("provider")),
         )
         existing_provider = _provider_id(
             existing.get("provider"),
-            _provider_id(_settings(store).get("provider")),
+            _action_provider(_settings(store).get("provider")),
         )
         queue = existing.get("queue") if isinstance(existing.get("queue"), list) else []
         if (
@@ -9755,9 +9882,9 @@ def handle_htmlui_tab_action(
                 0,
                 100,
             )
-            _save_player(existing, store)
-            _route_player_targets(targets, client=store)
-            player = _resume_player(client=store)
+            _save_player(existing, store, viewer_person_id)
+            _route_player_targets(targets, person_id=viewer_person_id, client=store)
+            player = _resume_player(person_id=viewer_person_id, client=store)
             return {
                 "ok": True,
                 "message": (
@@ -9785,7 +9912,7 @@ def handle_htmlui_tab_action(
                     else existing.get("volume_percent")
                 ),
             },
-            {},
+            viewer_origin,
             store,
             # The dashboard acts deliberately: take over busy rooms without
             # the TTS confirmation used for voice requests.
@@ -9794,9 +9921,9 @@ def handle_htmlui_tab_action(
         return {"ok": True, "message": _text(result.get("summary_for_user"))}
 
     if action_name == "music_ui_save_player":
-        player = _player(store)
+        player = _player(store, viewer_person_id)
         current_settings = _settings(store)
-        selected_provider = _provider_id(current_settings.get("provider"))
+        selected_provider = _action_provider(current_settings.get("provider"))
         old_targets = _list(player.get("targets") or player.get("target"))
         old_player_settings = _selected_player_settings(
             old_targets,
@@ -9855,11 +9982,12 @@ def handle_htmlui_tab_action(
         player["mixed_sync_adjustment_ms"] = mixed_sync_adjustment
         player["shuffle"] = _as_bool(values.get("shuffle"), bool(player.get("shuffle")))
         player["volume_percent"] = requested_volume
-        _save_player(player, store)
+        _save_player(player, store, viewer_person_id)
         targets_changed = old_targets != targets
         player = _route_player_targets(
             targets,
             force_restart=mixed_sync_changed or player_settings_changed,
+            person_id=viewer_person_id,
             client=store,
         )
         if was_playing and (targets_changed or mixed_sync_changed or player_settings_changed):
@@ -9874,11 +10002,11 @@ def handle_htmlui_tab_action(
         return {"ok": True, "message": f"Music player set to {_target_summary(targets)}."}
 
     if action_name == "music_ui_test_sync":
-        player = _player(store)
+        player = _player(store, viewer_person_id)
         cfg = _settings(store)
         selected_provider = _provider_id(
             values.get("provider"),
-            _provider_id(cfg.get("provider")),
+            _action_provider(cfg.get("provider")),
         )
         targets = _resolve_targets(
             values.get("targets") or values.get("target"),
@@ -9950,7 +10078,7 @@ def handle_htmlui_tab_action(
         }
 
     if action_name == "music_ui_set_volume":
-        player = _player(store)
+        player = _player(store, viewer_person_id)
         volume = _as_int(
             values.get("volume_percent"),
             _as_int(player.get("volume_percent"), 75, 0, 100),
@@ -9975,7 +10103,7 @@ def handle_htmlui_tab_action(
         ]
         if warnings:
             player["warnings"] = warnings
-        _save_player(player, store)
+        _save_player(player, store, viewer_person_id)
         return {
             "ok": True,
             "message": (
@@ -9988,16 +10116,18 @@ def handle_htmlui_tab_action(
     if action_name == "music_ui_seek":
         player = _seek_player(
             _as_float(values.get("position_seconds")),
+            person_id=viewer_person_id,
             client=store,
         )
         position = _player_position_seconds(player)
         return {"ok": True, "message": f"Moved to {round(position)} seconds."}
 
     if action_name == "music_ui_seek_relative":
-        current = _player(store)
+        current = _player(store, viewer_person_id)
         delta = _as_float(values.get("delta_seconds"))
         player = _seek_player(
             _player_position_seconds(current) + delta,
+            person_id=viewer_person_id,
             client=store,
         )
         position = _player_position_seconds(player)
@@ -10006,6 +10136,7 @@ def handle_htmlui_tab_action(
     if action_name == "music_ui_set_shuffle":
         player = _set_player_shuffle(
             _as_bool(values.get("shuffle"), False),
+            person_id=viewer_person_id,
             client=store,
         )
         return {
@@ -10014,22 +10145,22 @@ def handle_htmlui_tab_action(
         }
 
     if action_name == "music_ui_stop":
-        _stop_player(client=store)
+        _stop_player(person_id=viewer_person_id, client=store)
         return {"ok": True, "message": "Music stopped."}
 
     if action_name == "music_ui_pause":
-        player = _pause_player(client=store)
+        player = _pause_player(person_id=viewer_person_id, client=store)
         return {
             "ok": True,
             "message": f"Paused {_track_label(player.get('current') or {})}.",
         }
 
     if action_name == "music_ui_next":
-        player = _advance_player(1, client=store)
+        player = _advance_player(1, person_id=viewer_person_id, client=store)
         return {"ok": True, "message": f"Playing {_track_label(player.get('current') or {})}."}
 
     if action_name == "music_ui_previous":
-        player = _advance_player(-1, client=store)
+        player = _advance_player(-1, person_id=viewer_person_id, client=store)
         return {"ok": True, "message": f"Playing {_track_label(player.get('current') or {})}."}
 
     if action_name == "music_ui_queue_play":
@@ -10038,7 +10169,7 @@ def handle_htmlui_tab_action(
             index = int(item_id.split(":", 1)[1])
         except Exception as exc:
             raise ValueError("Queue position is invalid.") from exc
-        player = _start_player_index(index, client=store)
+        player = _start_player_index(index, person_id=viewer_person_id, client=store)
         return {"ok": True, "message": f"Playing {_track_label(player.get('current') or {})}."}
 
     if action_name == "music_ui_facet_play":
@@ -10046,11 +10177,11 @@ def handle_htmlui_tab_action(
         facet, separator, value = item_id.partition(":")
         if not separator or not value or facet not in {"genre", "artist", "album"}:
             raise ValueError("Music category is invalid.")
-        current_player = _player(store)
+        current_player = _player(store, viewer_person_id)
         current_settings = _settings(store)
         player_result = _play_request(
             {
-                "provider": _provider_id(current_settings.get("provider")),
+                "provider": _action_provider(current_settings.get("provider")),
                 facet: value,
                 "targets": (
                     _list(current_player.get("targets") or current_player.get("target"))
@@ -10062,7 +10193,7 @@ def handle_htmlui_tab_action(
                 "shuffle": facet != "album",
                 "volume_percent": current_player.get("volume_percent"),
             },
-            {},
+            viewer_origin,
             store,
             force=True,
         )

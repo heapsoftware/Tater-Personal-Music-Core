@@ -114,6 +114,21 @@ and the stock-like global path):
     the other queue keeps playing, paused at its position, on any rooms it has
     left.
 
+### View Music As
+
+By default the dashboard tabs (Playlist, Browse Library, Recommendations) show
+the household's shared view. **View Music As** switches the whole dashboard to
+one linked Person: their own library to browse and search, **their own playback
+queue** on the Playlist tab (with its own transport controls), and **their own
+AI-named mixes** on the Recommendations tab.
+
+- Reach it from each Person's card (**View Their Music** in People) or from the
+  **View Music As** card on the Browse Library and Recommendations tabs; only
+  linked People are offered, plus "Back to Household".
+- While viewing, playing from the dashboard goes to **that Person's queue** (and
+  records their listening history), and the stats row shows who you're viewing.
+- Voice is unaffected — requests always follow the speaking Person.
+
 ### Follow-Me presence
 
 Optionally, a linked Person's music can **follow them room to room**. Enable
@@ -174,8 +189,11 @@ enable.
 - Volume and per-target calibrations are shared per destination; two queues
   playing different rooms at once keep their own volume, but the same room's
   calibration is shared.
-- The dashboard player bar still shows the shared household queue; per-Person
-  queue state is visible on each Person's card in the People section.
+- By default the dashboard player bar and Playlist tab show the shared
+  household queue; per-Person queue state is visible on each Person's card in
+  the People section, or dashboard-wide via [View Music As](#view-music-as)
+  (one viewer at a time — Tater's WebUI doesn't yet tell cores who is viewing,
+  so the core can't scope the dashboard per viewer automatically).
 - Follow-Me tracks one zone per Person (their Home Assistant person entity's
   state) and moves the whole queue to the single room that zone resolves to.
   Zones with no matching Tater room are dead zones (handled by the selected
