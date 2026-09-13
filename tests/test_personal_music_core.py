@@ -1000,6 +1000,169 @@ class PerPersonLinkageTests(unittest.TestCase):
         finally:
             self.core._PEOPLE_API_MODULE = original_people
 
+    def test_view_as_switch_exit_and_validation(self):
+        original_people = self.core._PEOPLE_API_MODULE
+        self.core._PEOPLE_API_MODULE = types.SimpleNamespace(
+            load_store=lambda _client=None: {
+                "people": [
+                    {"id": "person_zoe", "display_name": "Zoe"},
+                    {"id": "person_ama", "display_name": "Ama"},
+                ]
+            }
+        )
+        try:
+            self._run_view_as_switch_exit_and_validation()
+        finally:
+            self.core._PEOPLE_API_MODULE = original_people
+
+    def _run_view_as_switch_exit_and_validation(self):
+        self.assertEqual(self.core._webui_viewer_person_id(self.redis), "")
+        # Only linked Persons can be viewed.
+        with self.assertRaises(ValueError):
+            self.core.handle_htmlui_tab_action(
+                action="music_view_as_switch",
+                payload={"values": {"view_as_person_id": "person_nobody"}},
+                redis_client=self.redis,
+            )
+        self.link_person()
+        result = self.core.handle_htmlui_tab_action(
+            action="music_view_as_switch",
+            payload={"values": {"view_as_person_id": "person_zoe"}},
+            redis_client=self.redis,
+        )
+        self.assertTrue(result["ok"])
+        self.assertIn("Zoe", result["message"])
+        self.assertEqual(self.core._webui_viewer_person_id(self.redis), "person_zoe")
+        # Switching back to the household clears the view.
+        result = self.core.handle_htmlui_tab_action(
+            action="music_view_as_exit",
+            payload={"values": {}},
+            redis_client=self.redis,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.core._webui_viewer_person_id(self.redis), "")
+        # A stale saved viewer (link removed) falls back to the household view.
+        self.core.handle_htmlui_tab_action(
+            action="music_view_as_switch",
+            payload={"values": {"view_as_person_id": "person_zoe"}},
+            redis_client=self.redis,
+        )
+        self.core.handle_htmlui_tab_action(
+            action="music_person_link_remove",
+            payload={"values": {"person_link_person_id": "person_zoe"}},
+            redis_client=self.redis,
+        )
+        self.assertEqual(self.core._webui_viewer_person_id(self.redis), "")
+
+    def test_view_as_scopes_tab_data(self):
+        people = types.SimpleNamespace(
+            load_store=lambda _client=None: {
+                "people": [
+                    {"id": "person_zoe", "display_name": "Zoe"},
+                    {"id": "person_ama", "display_name": "Ama"},
+                ]
+            }
+        )
+        original_people = self.core._PEOPLE_API_MODULE
+        self.core._PEOPLE_API_MODULE = people
+        try:
+            self.link_person()
+            self.core._sync_catalog(provider_id="network_share", person_id="person_zoe")
+            person_catalog = self.core._catalog(self.redis, "network_share", "person_zoe")
+            track_id = person_catalog["tracks"][0]["id"]
+            person_track = dict(person_catalog["tracks"][0])
+            self.core._save_json(
+                self.redis,
+                self.core._recommendations_key("person_zoe"),
+                {
+                    "provider": "network_share",
+                    "generated_at": time.time(),
+                    "summary": "Zoe's mixes",
+                    "playlists": [
+                        {
+                            "id": "mix1",
+                            "name": "Zoe Mix",
+                            "track_ids": [track_id],
+                            "items": [
+                                {
+                                    "type": "song",
+                                    "candidate_id": track_id,
+                                    "title": person_track["title"],
+                                    "artist": person_track.get("artist") or "Share Artist",
+                                    "album": person_track.get("album") or "Share Album",
+                                    "image_track_id": track_id,
+                                }
+                            ],
+                        }
+                    ],
+                },
+            )
+            person_track = dict(person_catalog["tracks"][0])
+            self.core._save_player(
+                {
+                    "status": "paused",
+                    "provider": "network_share",
+                    "queue": [person_track],
+                    "index": 0,
+                    "current": person_track,
+                    "targets": [],
+                },
+                self.redis,
+                "person_zoe",
+            )
+            self.core.handle_htmlui_tab_action(
+                action="music_view_as_switch",
+                payload={"values": {"view_as_person_id": "person_zoe"}},
+                redis_client=self.redis,
+            )
+            data = self.core.get_htmlui_tab_data(redis_client=self.redis)
+            self.assertIn(
+                {"label": "Viewing", "value": "Zoe's music"},
+                data["stats"],
+            )
+            cards = {item.get("id"): item for item in data["ui"]["item_forms"]}
+            for card_id in ("view_as:search", "view_as:recommendations", "view_as:people"):
+                self.assertIn(card_id, cards)
+            self.assertEqual(
+                [a["action"] for a in cards["view_as:search"]["actions"]],
+                ["music_view_as_exit"],
+            )
+            # The playlist card now shows Zoe's queue, not the household's.
+            player_card = next(
+                item for item in data["ui"]["item_forms"] if item.get("group") == "player"
+            )
+            self.assertEqual(
+                [row["title"] for row in player_card["track_list"]],
+                [person_track["title"]],
+            )
+            # The recommendations tab lists Zoe's own AI mix.
+            rec_cards = [
+                item
+                for item in data["ui"]["item_forms"]
+                if item.get("group") == "recommendations"
+            ]
+            self.assertTrue(
+                any(item.get("id") == "recommendation:mix1" for item in rec_cards),
+                rec_cards,
+            )
+            # Exiting returns to the household view: her mix disappears.
+            self.core.handle_htmlui_tab_action(
+                action="music_view_as_exit",
+                payload={"values": {}},
+                redis_client=self.redis,
+            )
+            data = self.core.get_htmlui_tab_data(redis_client=self.redis)
+            rec_cards = [
+                item
+                for item in data["ui"]["item_forms"]
+                if item.get("group") == "recommendations"
+            ]
+            self.assertFalse(
+                any(item.get("id") == "recommendation:mix1" for item in rec_cards)
+            )
+        finally:
+            self.core._PEOPLE_API_MODULE = original_people
+
     def test_person_scoped_emby_proxy_routes(self):
         self.redis.hset(
             self.core.PERSON_LINKS_KEY,
