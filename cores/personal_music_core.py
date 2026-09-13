@@ -53,7 +53,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "2.4.0"
+__version__ = "2.4.1"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby user or network-share folder, browse and play "
@@ -7331,6 +7331,9 @@ def _artwork_proxy_url(track: Dict[str, Any]) -> str:
     )
     if version and version != "0":
         query["v"] = version[:128]
+    scope = _text(track.get("person_scope"))
+    if scope:
+        query["person"] = scope
     return f"/api/cores/personal_music_core/webhook/artwork?{urlencode(query)}"
 
 
@@ -7988,16 +7991,49 @@ def get_client_music_state(
     }
 
 
-def _client_track(track_id: Any, provider_id: str, client: Any) -> Dict[str, Any]:
+def _find_track_in_catalog(catalog: Dict[str, Any], wanted_id: str) -> Optional[Dict[str, Any]]:
+    for track in catalog.get("tracks") or []:
+        if isinstance(track, dict) and _text(track.get("id")) == wanted_id:
+            return dict(track)
+    return None
+
+
+def _client_track(
+    track_id: Any,
+    provider_id: str,
+    client: Any,
+    person_id: Any = "",
+) -> Dict[str, Any]:
     wanted = _text(track_id)
     if not wanted:
         raise ValueError("Choose a track first.")
-    catalog = _catalog(client, provider_id)
+    wanted_provider = _provider_id(provider_id)
+    scoped = _text(person_id)
+    if scoped:
+        # Person-scoped artwork/stream requests resolve against that Person's
+        # own catalog and fetch with their own source credentials.
+        catalog = _catalog(client, wanted_provider, scoped)
+        track = _find_track_in_catalog(catalog, wanted)
+        if track is None:
+            raise ValueError("That track is no longer in the active music library.")
+        track["person_scope"] = scoped
+        return track
+    catalog = _catalog(client, wanted_provider)
     if not (catalog.get("tracks") or []):
-        catalog = _sync_catalog(client, provider_id)
-    for track in catalog.get("tracks") or []:
-        if isinstance(track, dict) and _text(track.get("id")) == wanted:
-            return dict(track)
+        catalog = _sync_catalog(client, wanted_provider)
+    track = _find_track_in_catalog(catalog, wanted)
+    if track is not None:
+        return track
+    # Artwork URLs built from a viewed Person's catalog carry no scope, so
+    # fall back to the linked Persons' catalogs and remember whose it was.
+    for linked_id in sorted(_person_links(client)):
+        if _person_source_id(linked_id, client) != wanted_provider:
+            continue
+        person_catalog = _catalog(client, wanted_provider, linked_id)
+        track = _find_track_in_catalog(person_catalog, wanted)
+        if track is not None:
+            track["person_scope"] = linked_id
+            return track
     raise ValueError("That track is no longer in the active music library.")
 
 
@@ -10722,9 +10758,14 @@ def handle_htmlui_tab_action(
     raise ValueError(f"Unknown Personal Music Core action: {action_name}")
 
 
-def _fetch_track_artwork(track: Dict[str, Any], client: Any = None) -> Dict[str, Any]:
+def _fetch_track_artwork(track: Dict[str, Any], client: Any = None, person_id: Any = "") -> Dict[str, Any]:
     provider_id = _provider_id(track.get("provider"))
-    provider = _provider(client, provider_id)
+    person_scope = _text(person_id) or _text(track.get("person_scope"))
+    provider = (
+        _provider(client, provider_id, person_scope)
+        if person_scope
+        else _provider(client, provider_id)
+    )
     artwork_url_fn = getattr(provider, "artwork_url", None)
     source_url = artwork_url_fn(track) if callable(artwork_url_fn) else ""
     source_url = _text(source_url)
@@ -10828,10 +10869,17 @@ def handle_core_webhook(
         params.get("provider"),
         _provider_id(_settings(redis_client).get("provider")),
     )
-    track = _client_track(params.get("track_id"), provider_id, redis_client)
+    # The viewed Person (when the tab is scoped) or the fallback search in
+    # _client_track decides whose credentials fetch the artwork.
+    viewer_person = _text(params.get("person"))
+    track = _client_track(params.get("track_id"), provider_id, redis_client, viewer_person)
     fallback = False
     try:
-        artwork = _fetch_track_artwork(track, redis_client)
+        artwork = _fetch_track_artwork(
+            track,
+            redis_client,
+            person_id=_text(track.get("person_scope")) or viewer_person,
+        )
     except Exception:
         artwork = _fallback_track_artwork(track)
         fallback = True

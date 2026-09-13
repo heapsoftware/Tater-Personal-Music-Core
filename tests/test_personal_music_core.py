@@ -392,6 +392,95 @@ class CustomMusicCoreTests(unittest.TestCase):
             core._PEOPLE_API_MODULE = original_people
             core._clear_person_link_edit_target(self.redis)
 
+    def test_artwork_lookup_falls_back_to_person_catalogs(self):
+        # Artwork URLs from a viewed Person's catalog carry no scope, so the
+        # artwork webhook must find the track in that Person's catalog and
+        # fetch with their own source credentials — not the household's.
+        core = self.core
+        self.save_settings({"provider": "emby"})
+        core._save_json(
+            self.redis,
+            core._catalog_key(""),
+            {"provider": "emby", "tracks": [{"id": "household1", "provider": "emby"}]},
+        )
+        self.redis.hset(
+            core.PERSON_LINKS_KEY,
+            mapping={
+                "person_zoe": json.dumps(
+                    {
+                        "music_source": "emby",
+                        "emby": {
+                            "server_url": "http://emby.local:8096",
+                            "auth_mode": "api_key",
+                            "api_key": "ZKEY",
+                            "user_id": "u-zoe",
+                        },
+                    }
+                )
+            },
+        )
+        core._save_json(
+            self.redis,
+            core._catalog_key("person_zoe"),
+            {
+                "provider": "emby",
+                "person": "person_zoe",
+                "tracks": [
+                    {
+                        "id": "9941",
+                        "provider": "emby",
+                        "has_artwork": True,
+                        "artwork_item_id": "9941",
+                        "artwork_version": "1",
+                    }
+                ],
+            },
+        )
+        # Unscoped track ids resolve through the Person fallback, tagged.
+        track = core._client_track("9941", "emby", self.redis)
+        self.assertEqual(track["id"], "9941")
+        self.assertEqual(track["person_scope"], "person_zoe")
+        # An explicit viewer scope resolves against that Person's catalog.
+        scoped = core._client_track("9941", "emby", self.redis, "person_zoe")
+        self.assertEqual(scoped["person_scope"], "person_zoe")
+        # Household tracks are unaffected.
+        self.assertEqual(core._client_track("household1", "emby", self.redis)["id"], "household1")
+        with self.assertRaises(ValueError):
+            core._client_track("nope", "emby", self.redis)
+        # The fetch builds the provider with the Person's scope.
+        seen = []
+
+        class FakeProvider:
+            provider_id = "emby"
+
+            def artwork_url(self, _track):
+                return "http://emby.local:8096/Items/9941/Images/Primary?api_key=ZKEY"
+
+        def fake_provider(client=None, provider_id="", person_id=""):
+            seen.append((provider_id, person_id))
+            return FakeProvider()
+
+        class FakeResponse:
+            content = b"img"
+            headers = {"Content-Type": "image/png"}
+
+            def raise_for_status(self):
+                pass
+
+        original_provider = core._provider
+        original_get = core.requests.get
+        core._provider = fake_provider
+        core.requests.get = lambda *args, **kwargs: FakeResponse()
+        try:
+            artwork = core._fetch_track_artwork(track, self.redis)
+            self.assertEqual(artwork["content_type"], "image/png")
+            self.assertEqual(seen[-1], ("emby", "person_zoe"))
+        finally:
+            core._provider = original_provider
+            core.requests.get = original_get
+            with core._artwork_cache_lock:
+                core._artwork_cache.clear()
+
     # ---- stream server proxy (end to end) ----
 
     def test_stream_server_proxies_with_range_and_token_auth(self):
