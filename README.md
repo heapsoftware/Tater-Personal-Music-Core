@@ -52,7 +52,7 @@ overrides the global source for that Person only.
   or when the library is mixed content (Emby does not tag those as music).
 - **Library Folder** (optional): scope the sync to one subfolder of the
   library — by name (`Music`) or by full server path
-  (`/home/filestorageusb/Files/<user>/Media/Music`). Use this when one
+  (`/mnt/media/<user>/Music`). Use this when one
   mixed-content library holds a Person's music, TV, and movies and only the
   music should be indexed. Blank means the whole library is synced.
 - **Test Emby Connection** (on Person link cards) signs in and verifies the
