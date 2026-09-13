@@ -53,7 +53,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "2.4.3"
+__version__ = "2.5.0"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby user or network-share folder, browse and play "
@@ -740,6 +740,11 @@ PERSON_LINK_TEST_FIELD_KEYS = (
     "person_link_person_id",
     "person_link_source",
     "person_link_queue_conflict_mode",
+    "person_link_recommendations_enabled",
+    "person_link_recommendation_interval_hours",
+    "person_link_recommendation_playlist_count",
+    "person_link_recommendation_items_per_playlist",
+    "person_link_prompt_context_enabled",
     "person_link_follow_me_entity",
     "person_link_follow_me_room_overrides",
     "person_link_follow_me_takeover_mode",
@@ -826,6 +831,71 @@ def _person_link_source(link: Dict[str, Any]) -> str:
     return _provider_id(link.get("music_source"), "")
 
 
+def _person_tri_state(link: Dict[str, Any], key: str) -> str:
+    """A person link toggle's "" / "on" / "off" state ("" = inherit global)."""
+    value = _text(link.get(key)).casefold()
+    return value if value in {"on", "off"} else ""
+
+
+def _person_recommendations_enabled(
+    person_id: Any,
+    cfg: Dict[str, Any],
+    client: Any = None,
+) -> bool:
+    """One Person's recommendation toggle; unlinked or "inherit" follows global."""
+    state = _person_tri_state(_person_link(person_id, client), "recommendations_enabled")
+    if state:
+        return state == "on"
+    return _as_bool(cfg.get("recommendations_enabled"), True)
+
+
+def _person_prompt_context_enabled(
+    person_id: Any,
+    cfg: Dict[str, Any],
+    client: Any = None,
+) -> bool:
+    """One Person's prompt-context toggle; unlinked or "inherit" follows global."""
+    state = _person_tri_state(_person_link(person_id, client), "prompt_context_enabled")
+    if state:
+        return state == "on"
+    return _as_bool(cfg.get("prompt_context_enabled"), True)
+
+
+def _person_recommendation_int(
+    person_id: Any,
+    key: str,
+    cfg: Dict[str, Any],
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+    client: Any = None,
+) -> int:
+    """One Person's numeric Personalization override; blank or invalid inherits global."""
+    global_value = _as_int(cfg.get(key), default, minimum, maximum)
+    return _as_int(_person_link(person_id, client).get(key), global_value, minimum, maximum)
+
+
+def _recommendations_possible(cfg: Dict[str, Any], client: Any = None) -> bool:
+    """True when recommendation refresh should run for the household or any linked Person."""
+    if _as_bool(cfg.get("recommendations_enabled"), True):
+        return True
+    return any(
+        _person_recommendations_enabled(linked_id, cfg, client)
+        for linked_id in _linked_person_ids(client)
+    )
+
+
+def _prompt_context_possible(cfg: Dict[str, Any], client: Any = None) -> bool:
+    """True when prompt-profile refresh should run for the household or any linked Person."""
+    if _as_bool(cfg.get("prompt_context_enabled"), True):
+        return True
+    return any(
+        _person_prompt_context_enabled(linked_id, cfg, client)
+        for linked_id in _linked_person_ids(client)
+    )
+
+
 def _scoped_key(base: str, person_id: Any) -> str:
     """Per-person data keys; "" keeps the shared global key."""
     wanted = _text(person_id)
@@ -862,9 +932,9 @@ def _record_catalog_stats(store: Any, person_id: Any, stats: Dict[str, Any]) -> 
 def _catalog_stats(person_id: Any, store: Any = None) -> Dict[str, Any]:
     store = store or globals().get("redis_client")
     try:
-        raw = _decode_hash(store.hgetall(CATALOG_STATS_KEY) or {}).get(
-            _catalog_stats_field(person_id), ""
-        )
+        # Read the field straight from the hash: the household field is "",
+        # which _decode_hash's empty-key filter would drop.
+        raw = _text((store.hgetall(CATALOG_STATS_KEY) or {}).get(_catalog_stats_field(person_id), ""))
         value = json.loads(raw) if raw else {}
     except Exception:
         value = {}
@@ -4288,13 +4358,17 @@ def _generate_music_prompt_profile(
         asyncio.set_event_loop(active_loop)
     try:
         model = llm_client if llm_client is not None else _get_primary_llm_client_from_env()
+        cfg = _settings(store)
         profile = _generate_music_prompt_profile_impl(active_loop, model, store, person_id)
         # Linked People get their own prompt-ready profile from their own
-        # history; one Person's failure never blocks the others.
+        # history; one Person's failure never blocks the others. People with
+        # prompt context off for them never need a profile.
         for linked_id in _linked_person_ids(store):
             if _text(person_id) and linked_id != _text(person_id):
                 continue
             try:
+                if not _person_prompt_context_enabled(linked_id, cfg, store):
+                    continue
                 _generate_music_prompt_profile_impl(active_loop, model, store, linked_id)
             except Exception as exc:
                 logger.warning(
@@ -4415,10 +4489,12 @@ def _music_prompt_fragment_message(
     personal_context: Optional[Dict[str, Any]],
 ) -> str:
     cfg = _settings(store)
-    if not _as_bool(cfg.get("prompt_context_enabled"), True):
-        return ""
     configured_person_id = _text(cfg.get("prompt_person_id"))
     active_person_id = _context_person_id(origin, memory_context, personal_context)
+    # Whoever is speaking decides whether music context is injected at all;
+    # an unlinked speaker follows the global toggle.
+    if not _person_prompt_context_enabled(active_person_id, cfg, store):
+        return ""
     if active_person_id and _music_prompt_profile(store, active_person_id):
         # Linked People read their own scoped profile, whoever is configured.
         profile = _music_prompt_profile(store, active_person_id)
@@ -4520,8 +4596,24 @@ def _generate_recommendations_impl(
     if not candidates:
         raise ValueError("The active music library has no recommendation candidates.")
 
-    playlist_count = _as_int(cfg.get("recommendation_playlist_count"), 3, 1, 6)
-    item_count = _as_int(cfg.get("recommendation_items_per_playlist"), 6, 3, 12)
+    playlist_count = _person_recommendation_int(
+        person_id,
+        "recommendation_playlist_count",
+        cfg,
+        default=3,
+        minimum=1,
+        maximum=6,
+        client=store,
+    )
+    item_count = _person_recommendation_int(
+        person_id,
+        "recommendation_items_per_playlist",
+        cfg,
+        default=6,
+        minimum=3,
+        maximum=12,
+        client=store,
+    )
     artist_counts: Dict[str, int] = {}
     genre_counts: Dict[str, int] = {}
     for event in history[-120:]:
@@ -4651,11 +4743,13 @@ def _generate_recommendations(
     loop: Optional[asyncio.AbstractEventLoop] = None,
     llm_client: Any = None,
     person_id: Any = "",
+    force: bool = False,
 ) -> Dict[str, Any]:
     global _recommendation_started_at
     if not _recommendation_lock.acquire(blocking=False):
         raise RuntimeError("Tater music recommendations are already being refreshed.")
     store = client or globals().get("redis_client")
+    cfg = _settings(store)
     _recommendation_started_at = time.time()
     owns_loop = loop is None
     active_loop = loop or asyncio.new_event_loop()
@@ -4671,6 +4765,28 @@ def _generate_recommendations(
             if _text(person_id) and linked_id != _text(person_id):
                 continue
             try:
+                if not _person_recommendations_enabled(linked_id, cfg, store):
+                    continue
+                if not force:
+                    # A Person with a longer-than-global refresh override keeps
+                    # their existing mixes until their own interval elapses.
+                    interval = (
+                        _person_recommendation_int(
+                            linked_id,
+                            "recommendation_interval_hours",
+                            cfg,
+                            default=12,
+                            minimum=1,
+                            maximum=168,
+                            client=store,
+                        )
+                        * 3600
+                    )
+                    last_generated = _as_float(
+                        _recommendations(store, linked_id).get("generated_at")
+                    )
+                    if last_generated and time.time() - last_generated < interval:
+                        continue
                 _generate_recommendations_impl(active_loop, model, store, linked_id)
             except Exception as exc:
                 logger.warning(
@@ -4724,7 +4840,7 @@ def _generate_recommendations(
         _recommendation_lock.release()
 
 
-def _schedule_recommendation_refresh(client: Any = None) -> bool:
+def _schedule_recommendation_refresh(client: Any = None, *, force: bool = False) -> bool:
     """Start one detached refresh so model latency never pauses queue advancement."""
     global _recommendation_thread
     with _state_lock:
@@ -4733,7 +4849,7 @@ def _schedule_recommendation_refresh(client: Any = None) -> bool:
 
         def worker() -> None:
             try:
-                _generate_recommendations(client)
+                _generate_recommendations(client, force=force)
             except Exception as exc:
                 logger.warning("[Music] recommendation refresh failed: %s", exc)
 
@@ -8538,10 +8654,15 @@ def _provider_fields(cfg: Dict[str, Any], provider_id: str) -> List[Dict[str, An
 
 def _provider_cards(
     cfg: Dict[str, Any],
-    catalog: Dict[str, Any],
     active_provider: str,
+    client: Any = None,
 ) -> List[Dict[str, Any]]:
-    catalog_provider = _provider_id(catalog.get("provider"))
+    """Global source cards under Sources.
+
+    These describe the household's shared source, so the track badge reads the
+    global catalog stats — never a linked Person's personal library counts.
+    """
+    global_stats = _catalog_stats("", client)
     cards: List[Dict[str, Any]] = []
     for provider_id in ("emby", "network_share"):
         label = PROVIDER_LABELS[provider_id]
@@ -8584,11 +8705,14 @@ def _provider_cards(
                         "tone": "good" if connected else "warn",
                     },
                     {
-                        "label": f"{len(catalog.get('tracks') or [])} TRACKS",
+                        "label": (
+                            f"{_as_int(global_stats.get('track_count'), 0, 0, 10**9)} TRACKS"
+                            if _text(global_stats.get("status")) == "ok"
+                            and _provider_id(global_stats.get("provider")) == provider_id
+                            else "0 TRACKS"
+                        ),
                         "tone": "muted",
-                    }
-                    if catalog_provider == provider_id
-                    else {"label": "NOT LOADED", "tone": "muted"},
+                    },
                 ],
                 "fields": _provider_fields(cfg, provider_id),
                 "fields_popup": False,
@@ -8615,7 +8739,7 @@ def _recommendation_ui_items(
         for row in _listening_history(client, person_id)
         if _provider_id(row.get("provider")) == active_provider
     ]
-    enabled = _as_bool(cfg.get("recommendations_enabled"), True)
+    enabled = _person_recommendations_enabled(person_id, cfg, client)
     published = _recommendations(client, person_id)
     if _provider_id(published.get("provider"), "") != active_provider:
         published = {}
@@ -8917,6 +9041,83 @@ def _clear_person_link_edit_target(store: Any = None) -> None:
             pass
 
 
+def _person_link_personalization_fields(
+    cfg: Dict[str, Any],
+    link: Dict[str, Any],
+    client: Any = None,
+) -> List[Dict[str, Any]]:
+    """Per-Person Personalization overrides; blank choices inherit the global settings."""
+    assistant_name = _assistant_first_name(client)
+    return [
+        {
+            "key": "person_link_recommendations_enabled",
+            "label": "Their Recommendations",
+            "type": "select",
+            "value": _person_tri_state(link, "recommendations_enabled"),
+            "options": [
+                {"value": "", "label": "Use the global Personalization setting"},
+                {"value": "on", "label": "On for this Person"},
+                {"value": "off", "label": "Off for this Person"},
+            ],
+            "description": (
+                f"Whether {assistant_name} builds AI-named mixes from this Person's "
+                "listening history."
+            ),
+        },
+        {
+            "key": "person_link_recommendation_interval_hours",
+            "label": "Their Mix Refresh (hours)",
+            "type": "number",
+            "value": _as_int(link.get("recommendation_interval_hours"), 0, 0, 168) or "",
+            "min": 1,
+            "max": 168,
+            "step": 1,
+            "description": (
+                "Their mixes normally refresh with the global cadence; a higher value "
+                "here keeps their mixes between shared refreshes. Leave blank for the "
+                "global setting."
+            ),
+        },
+        {
+            "key": "person_link_recommendation_playlist_count",
+            "label": "Their Recommendation Playlists",
+            "type": "number",
+            "value": _as_int(link.get("recommendation_playlist_count"), 0, 0, 6) or "",
+            "min": 1,
+            "max": 6,
+            "step": 1,
+            "description": "Leave blank to use the global Recommendation Playlists count.",
+        },
+        {
+            "key": "person_link_recommendation_items_per_playlist",
+            "label": "Their Albums & Songs Per Playlist",
+            "type": "number",
+            "value": _as_int(link.get("recommendation_items_per_playlist"), 0, 0, 12) or "",
+            "min": 3,
+            "max": 12,
+            "step": 1,
+            "description": (
+                "Leave blank to use the global Albums & Songs Per Playlist count."
+            ),
+        },
+        {
+            "key": "person_link_prompt_context_enabled",
+            "label": "Their Music Prompt Context",
+            "type": "select",
+            "value": _person_tri_state(link, "prompt_context_enabled"),
+            "options": [
+                {"value": "", "label": "Use the global Personalization setting"},
+                {"value": "on", "label": "On for this Person"},
+                {"value": "off", "label": "Off for this Person"},
+            ],
+            "description": (
+                f"Whether {assistant_name} gets this Person's music profile (tastes, "
+                "recent tracks) when they are speaking."
+            ),
+        },
+    ]
+
+
 def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
     """Per-Person source links shown in the core tab's People section.
 
@@ -9024,6 +9225,7 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                         ),
                     },
                     *_follow_me_link_fields(cfg, link),
+                    *_person_link_personalization_fields(cfg, link, store),
                     {
                         "key": "person_link_emby_server_url",
                         "label": "Emby Server URL",
@@ -9166,6 +9368,7 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                         ),
                     },
                     *_follow_me_link_fields(cfg, {}),
+                    *_person_link_personalization_fields(cfg, {}, store),
                     {
                         "key": "person_link_emby_server_url",
                         "label": "Emby Server URL",
@@ -9371,7 +9574,7 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
     item_forms.extend(_facet_items(catalog, "genres", "Genre"))
     item_forms.extend(_facet_items(catalog, "artists", "Artist"))
     item_forms.extend(_facet_items(catalog, "albums", "Album"))
-    item_forms.extend(_provider_cards(cfg, catalog, active_provider))
+    item_forms.extend(_provider_cards(cfg, active_provider, store))
     item_forms.extend(_person_link_items(cfg, store))
     item_forms.extend(
         [
@@ -9775,6 +9978,32 @@ def _save_person_link_action(values: Dict[str, Any], store: Any) -> Dict[str, An
     conflict_mode = _text(values.get("person_link_queue_conflict_mode")).casefold()
     if conflict_mode in QUEUE_CONFLICT_MODES:
         link["queue_conflict_mode"] = conflict_mode
+    # Personalization overrides: "" (or blank) means inherit the global
+    # setting, so the key is simply left out of the rebuilt link.
+    recommendations_state = _text(values.get("person_link_recommendations_enabled")).casefold()
+    if recommendations_state in {"on", "off"}:
+        link["recommendations_enabled"] = recommendations_state
+    prompt_state = _text(values.get("person_link_prompt_context_enabled")).casefold()
+    if prompt_state in {"on", "off"}:
+        link["prompt_context_enabled"] = prompt_state
+    for field_key, link_key, override_max in (
+        ("person_link_recommendation_interval_hours", "recommendation_interval_hours", 168),
+        ("person_link_recommendation_playlist_count", "recommendation_playlist_count", 6),
+        (
+            "person_link_recommendation_items_per_playlist",
+            "recommendation_items_per_playlist",
+            12,
+        ),
+    ):
+        raw = _text(values.get(field_key))
+        if not raw:
+            continue
+        try:
+            parsed = int(float(raw))
+        except Exception:
+            continue
+        if parsed > 0:
+            link[link_key] = parsed if parsed <= override_max else override_max
     if "person_link_follow_me_entity" in values:
         link["follow_me_person_entity"] = _text(values.get("person_link_follow_me_entity")).strip()
     if "person_link_follow_me_room_overrides" in values:
@@ -10403,7 +10632,7 @@ def handle_htmlui_tab_action(
         selected_person_id = _text(next_settings.get("prompt_person_id"))
         if (
             person_changed
-            and _as_bool(next_settings.get("prompt_context_enabled"), True)
+            and _person_prompt_context_enabled(selected_person_id, next_settings, store)
             and selected_person_id
             and _profile_history(
                 store,
@@ -10428,7 +10657,7 @@ def handle_htmlui_tab_action(
         }
 
     if action_name == "music_recommendations_refresh":
-        started = _schedule_recommendation_refresh(store)
+        started = _schedule_recommendation_refresh(store, force=True)
         return {
             "ok": True,
             "message": (
@@ -10960,13 +11189,20 @@ def get_core_system_tasks(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
     profile_interval = (
         _as_int(cfg.get("prompt_profile_interval_hours"), 12, 1, 168) * 3600
     )
-    recommendations_enabled = _as_bool(cfg.get("recommendations_enabled"), True)
-    prompt_context_enabled = _as_bool(cfg.get("prompt_context_enabled"), True)
+    # A task stays available while either the global toggle or any Person's
+    # own override still wants it to run.
+    recommendations_enabled = _recommendations_possible(cfg, store)
+    prompt_context_enabled = _prompt_context_possible(cfg, store)
     prompt_person_id = _text(cfg.get("prompt_person_id"))
     prompt_person_name = _people_person_name(prompt_person_id, store) if prompt_person_id else ""
     has_history = any(
         _provider_id(row.get("provider")) == provider_id
         for row in _listening_history(store)
+    ) or any(
+        # Linked People's own listening history also feeds recommendations.
+        _provider_id(row.get("provider")) == provider_id
+        for linked_id in _linked_person_ids(store)
+        for row in _listening_history(store, linked_id)
     )
     last_sync = max(
         _as_float(runtime.get("last_sync_finished_at")),
@@ -11007,7 +11243,7 @@ def get_core_system_tasks(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
     )
     profile_available = bool(
         connected
-        and prompt_context_enabled
+        and _person_prompt_context_enabled(prompt_person_id, cfg, store)
         and prompt_person_id
         and prompt_person_name
         and has_profile_history
@@ -11628,9 +11864,15 @@ def run(stop_event: Optional[object] = None) -> None:
                 has_history = any(
                     _provider_id(row.get("provider")) == active_provider
                     for row in _listening_history()
+                ) or any(
+                    # A fully linked household may have no shared history at
+                    # all; its People's own mixes still need refreshing.
+                    _provider_id(row.get("provider")) == active_provider
+                    for linked_id in _linked_person_ids()
+                    for row in _listening_history(None, linked_id)
                 )
                 if (
-                    _as_bool(cfg.get("recommendations_enabled"), True)
+                    _recommendations_possible(cfg)
                     and active_provider in CATALOG_PROVIDER_IDS
                     and has_history
                     and now - last_recommendation_cycle >= recommendation_interval
@@ -11651,7 +11893,7 @@ def run(stop_event: Optional[object] = None) -> None:
                 ):
                     last_profile_cycle = 0.0
                 if (
-                    _as_bool(cfg.get("prompt_context_enabled"), True)
+                    _prompt_context_possible(cfg)
                     and prompt_person_id
                     and _people_person_name(prompt_person_id)
                     and _profile_history(
