@@ -41,7 +41,8 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
-from urllib.parse import parse_qsl, quote, urlencode, urlparse
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse
+from xml.etree import ElementTree
 
 import requests
 
@@ -53,7 +54,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.0.0"
+__version__ = "3.1.0"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby user or network-share folder (or both), browse "
@@ -324,9 +325,48 @@ CORE_SETTINGS = {
             "default": "",
             "description": (
                 "Playlist name for the \"Tracks from a playlist\" Endless Playback mode — one of "
-                "the AI-named mixes on the Recommendations tab (matched by name, "
-                "case-insensitive). Leave blank to use the newest mix. Each Person can pick "
-                "their own on their link card."
+                "the AI-named mixes on the Recommendations tab, a playlist you created in Emby, "
+                "an .m3u/.m3u8 playlist file on the share, or a Folder Playlists entry (matched "
+                "by name, case-insensitive). Leave blank to use the newest mix. Each Person can "
+                "pick their own on their link card."
+            ),
+        },
+        "recommendation_playlist_order": {
+            "label": "Playlist Order",
+            "type": "select",
+            "default": "shuffle",
+            "options": [
+                {"value": "shuffle", "label": "Shuffle each play"},
+                {"value": "track_asc", "label": "Track number (1 → 9)"},
+                {"value": "track_desc", "label": "Track number (9 → 1)"},
+                {"value": "title_asc", "label": "Title (A → Z)"},
+                {"value": "title_desc", "label": "Title (Z → A)"},
+                {"value": "artist_asc", "label": "Artist (A → Z)"},
+                {"value": "artist_desc", "label": "Artist (Z → A)"},
+                {"value": "album_asc", "label": "Album (A → Z)"},
+                {"value": "album_desc", "label": "Album (Z → A)"},
+            ],
+            "description": (
+                "How AI-named mixes (dynamic playlists) and the \"Tracks from a playlist\" "
+                "loop are ordered when they play. Shuffle each play keeps today's behaviour; "
+                "the other options play the playlist in a fixed order — by track number, "
+                "title, artist, or album, ascending or descending — so it sounds the same "
+                "every time."
+            ),
+        },
+        "folder_playlists": {
+            "label": "Folder Playlists",
+            "type": "text",
+            "default": "",
+            "description": (
+                "Turn library folders into always-up-to-date playlists: \"Christmas Music="
+                "Christmas, Road Trip=Tunes/Road\" builds a \"Christmas Music\" playlist from "
+                "every track under the Christmas folder and a \"Road Trip\" playlist from the "
+                "Tunes/Road folder (Name=Folder pairs, comma-separated; subfolders are "
+                "included). The playlists are rebuilt from the library on every sync and "
+                "play, so songs added to the folder join automatically. They work everywhere "
+                "a picked playlist works — the \"Tracks from a playlist\" Endless Playback "
+                "mode and voice (\"play my Christmas Music playlist\")."
             ),
         },
         "smart_shuffle_enabled": {
@@ -430,6 +470,7 @@ EMBY_ARTWORK_MAX_WIDTH = 1000
 STREAM_DEFAULT_PORT = 8621
 STREAM_CHUNK_SIZE = 128 * 1024
 SHARE_AUDIO_EXTENSIONS = {".mp3", ".flac", ".ogg", ".oga", ".opus", ".m4a", ".mp4", ".wav", ".wma"}
+SHARE_PLAYLIST_EXTENSIONS = {".m3u", ".m3u8"}
 # Case-insensitive folder-image names, checked in this order.
 SHARE_FOLDER_ARTWORK_NAMES = (
     "cover.jpg",
@@ -1972,7 +2013,7 @@ class EmbyMusicProvider:
                     "ParentId": folder_id,
                     "Recursive": "true",
                     "IncludeItemTypes": "Song",
-                    "Fields": "Genres,MediaSources",
+                    "Fields": "Genres,MediaSources,Path",
                     "SortBy": "Album,SortName",
                     "SortOrder": "Ascending",
                     "StartIndex": start_index,
@@ -1990,14 +2031,106 @@ class EmbyMusicProvider:
             start_index += len(rows)
             if not rows or (total and start_index >= total) or start_index >= MAX_CATALOG_TRACKS:
                 break
+        try:
+            user_playlists = self.user_playlists()
+        except Exception as exc:
+            # Playlists are a bonus on top of the song sync — a failure listing
+            # them (permissions, a playlist item that errors) must not break it.
+            logger.warning("[Music] Emby playlist listing failed: %s", exc)
+            user_playlists = []
         return {
             "catalog_id": folder_id,
             "tracks": tracks[:MAX_CATALOG_TRACKS],
             "total": len(tracks),
+            "playlists": user_playlists,
             "libraries": {
                 folder_id: f"{view_name} · {folder_name}" if folder_name else view_name,
             },
         }
+
+    def user_playlists(self) -> List[Dict[str, Any]]:
+        """The signed-in Emby user's own playlists, with their song ids.
+
+        Used by the "Tracks from a playlist" Endless Playback mode and by voice
+        "play playlist" requests when no AI-named mix matches the name. Track ids
+        are Emby item ids, resolved against the synced catalog like mix tracks.
+        """
+        user_id = self.resolve_user_id()
+        playlists: List[Dict[str, Any]] = []
+        start_index = 0
+        while start_index < 2000 and len(playlists) < 200:
+            page = self.request(
+                "GET",
+                f"Users/{quote(str(user_id), safe='')}/Items",
+                params={
+                    "IncludeItemTypes": "Playlist",
+                    "Recursive": "true",
+                    "SortBy": "SortName",
+                    "SortOrder": "Ascending",
+                    "StartIndex": start_index,
+                    "Limit": EMBY_PAGE_SIZE,
+                },
+                timeout=60,
+            ) or {}
+            rows = page.get("Items") if isinstance(page, dict) else page
+            if not isinstance(rows, list):
+                break
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                playlist_id = _text(row.get("Id"))
+                name = _text(row.get("Name"))
+                if not playlist_id or not name:
+                    continue
+                playlists.append(
+                    {
+                        "id": f"emby_playlist:{playlist_id}",
+                        "name": name,
+                        "description": "",
+                        "track_ids": self._playlist_track_ids(user_id, playlist_id),
+                    }
+                )
+                if len(playlists) >= 200:
+                    break
+            total = _as_int(
+                page.get("TotalRecordCount") if isinstance(page, dict) else 0, 0, 0, 10**9
+            )
+            start_index += len(rows)
+            if not rows or (total and start_index >= total):
+                break
+        return playlists
+
+    def _playlist_track_ids(self, user_id: str, playlist_id: str) -> List[str]:
+        track_ids: List[str] = []
+        start_index = 0
+        while start_index < MAX_CATALOG_TRACKS:
+            page = self.request(
+                "GET",
+                f"Users/{quote(str(user_id), safe='')}/Items",
+                params={
+                    "ParentId": playlist_id,
+                    "IncludeItemTypes": "Audio",
+                    "Recursive": "true",
+                    "SortBy": "ParentIndexNumber,IndexNumber,SortName",
+                    "SortOrder": "Ascending",
+                    "StartIndex": start_index,
+                    "Limit": EMBY_PAGE_SIZE,
+                },
+                timeout=60,
+            ) or {}
+            rows = page.get("Items") if isinstance(page, dict) else page
+            if not isinstance(rows, list):
+                break
+            for row in rows:
+                if isinstance(row, dict) and _text(row.get("Id")):
+                    track_ids.append(_text(row.get("Id")))
+            total = _as_int(
+                page.get("TotalRecordCount") if isinstance(page, dict) else 0, 0, 0, 10**9
+            )
+            start_index += len(rows)
+            if not rows or (total and start_index >= total):
+                break
+        return track_ids
 
 # --------------------------------------------------------------------------
 # Network Share tag reading (stdlib only — the Tater image has no mutagen).
@@ -2498,6 +2631,132 @@ def _share_tags_from_path(path: str) -> Dict[str, Any]:
     return tags
 
 
+def _share_nfo_album_metadata(text: str) -> Dict[str, str]:
+    """Read album fields out of one Kodi-style NFO document."""
+    stripped = _text(text).lstrip("﻿")
+    if not stripped:
+        return {}
+    root: Any = None
+    try:
+        root = ElementTree.fromstring(stripped)
+    except Exception:
+        # Kodi NFOs may carry trailing junk after the XML document; retry with
+        # just the <album>…</album> block when the full parse fails.
+        start = stripped.casefold().find("<album")
+        end = stripped.casefold().rfind("</album>")
+        if start < 0 or end <= start:
+            return {}
+        try:
+            root = ElementTree.fromstring(stripped[start : end + 8])
+        except Exception:
+            return {}
+    if root is None:
+        return {}
+
+    def tag_name(element: Any) -> str:
+        return _text(getattr(element, "tag", "")).rsplit("}", 1)[-1].casefold()
+
+    album = root if tag_name(root) == "album" else next(
+        (element for element in root.iter() if tag_name(element) == "album"), None
+    )
+    if album is None:
+        return {}
+    metadata: Dict[str, str] = {}
+    for key in ("albumartist", "artist"):
+        values = [
+            _text(child.text)
+            for child in album
+            if tag_name(child) == key and _text(child.text)
+        ]
+        if values:
+            metadata[key] = ", ".join(values)
+    return metadata
+
+
+def _share_album_nfo(dirpath: str, filenames: List[str]) -> Dict[str, str]:
+    """The album.nfo sitting next to a share album's tracks, if any."""
+    for name in filenames:
+        if _text(name).casefold() != "album.nfo":
+            continue
+        try:
+            with open(os.path.join(dirpath, name), "r", encoding="utf-8", errors="replace") as handle:
+                return _share_nfo_album_metadata(handle.read())
+        except OSError:
+            return {}
+    return {}
+
+
+def _share_m3u_track_rel(entry: str, m3u_rel: str) -> Optional[str]:
+    """Normalize one .m3u line to a share-relative path (forward slashes)."""
+    line = _text(entry).strip().strip('"')
+    if not line or line.startswith("#"):
+        return None
+    if line.casefold().startswith("file://"):
+        line = unquote(line[7:])
+    # Windows-authored playlists use backslashes; UNC hosts stay untouched.
+    if line.startswith("\\\\"):
+        return None
+    line = line.replace("\\", "/")
+    # Remote entries (http://…) and anything not on this share cannot resolve.
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", line):
+        return None
+    candidates = []
+    if line.startswith("/"):
+        candidates.append(line.lstrip("/"))
+    else:
+        # Relative entries resolve against the .m3u's own folder first, then
+        # the share root (the common "flat" export).
+        m3u_dir = "/".join(m3u_rel.split("/")[:-1])
+        if m3u_dir:
+            candidates.append(f"{m3u_dir}/{line}")
+        candidates.append(line)
+    for candidate in candidates:
+        normalized = os.path.normpath(candidate).replace(os.sep, "/")
+        if normalized and not normalized.startswith("../") and normalized != "..":
+            return normalized
+    return None
+
+
+def _share_m3u_playlists(
+    root: str,
+    m3u_files: List[str],
+    path_to_id: Dict[str, str],
+) -> List[Dict[str, Any]]:
+    """User-made .m3u/.m3u8 playlists on the share, as resolvable track id lists."""
+    if not m3u_files:
+        return []
+    lookup = dict(path_to_id)
+    casefolded = {key.casefold(): value for key, value in path_to_id.items()}
+    playlists: List[Dict[str, Any]] = []
+    for m3u_rel in sorted(m3u_files):
+        try:
+            with open(os.path.join(root, m3u_rel), "r", encoding="utf-8", errors="replace") as handle:
+                lines = handle.read().splitlines()
+        except OSError:
+            continue
+        track_ids: List[str] = []
+        for line in lines:
+            rel = _share_m3u_track_rel(line, m3u_rel)
+            if not rel:
+                continue
+            track_id = lookup.get(rel) or casefolded.get(rel.casefold())
+            if track_id and track_id not in track_ids:
+                track_ids.append(track_id)
+        if not track_ids:
+            continue
+        playlists.append(
+            {
+                "id": "share_m3u:" + hashlib.sha1(m3u_rel.encode("utf-8")).hexdigest()[:16],
+                "name": Path(m3u_rel).stem,
+                "description": "",
+                "track_ids": track_ids[:MAX_CATALOG_TRACKS],
+            }
+        )
+        if len(playlists) >= 200:
+            break
+    return sorted(playlists, key=lambda row: _text(row.get("name")).casefold())
+
+
 def _share_read_tags(path: str) -> Dict[str, Any]:
     suffix = Path(path).suffix.casefold()
     if suffix == ".mp3":
@@ -2520,6 +2779,9 @@ def _share_read_tags(path: str) -> Dict[str, Any]:
             tags[key] = value
     if not tags.get("album_artist") and tags.get("artist"):
         tags["album_artist"] = tags["artist"]
+        # Marker for the catalog walk: album.nfo should outrank the track
+        # artist when it carries a real album artist.
+        tags["album_artist_fallback"] = True
     return tags
 
 
@@ -2682,6 +2944,9 @@ class NetworkShareMusicProvider:
             art_scope = ""
         tracks: List[Dict[str, Any]] = []
         art_index: Dict[str, Dict[str, Any]] = {}
+        path_to_id: Dict[str, str] = {}
+        m3u_files: List[str] = []
+        nfo_cache: Dict[str, Dict[str, str]] = {}
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = sorted(name for name in dirnames if not name.startswith("."))
             album_art: Optional[Dict[str, Any]] = None
@@ -2694,6 +2959,9 @@ class NetworkShareMusicProvider:
                     )
                     break
             for name in sorted(filenames):
+                if Path(name).suffix.casefold() in SHARE_PLAYLIST_EXTENSIONS:
+                    m3u_files.append(os.path.relpath(os.path.join(dirpath, name), root))
+            for name in sorted(filenames):
                 if Path(name).suffix.casefold() not in SHARE_AUDIO_EXTENSIONS:
                     continue
                 if len(tracks) >= MAX_CATALOG_TRACKS:
@@ -2705,6 +2973,15 @@ class NetworkShareMusicProvider:
                     tags = _share_read_tags(full_path)
                 except OSError:
                     continue
+                if tags.pop("album_artist_fallback", False):
+                    # No AlbumArtist ID3 tag: a local album.nfo outranks the
+                    # track-artist fallback (compilations, Various Artists).
+                    nfo = nfo_cache.get(dirpath)
+                    if nfo is None:
+                        nfo = _share_album_nfo(dirpath, filenames)
+                        nfo_cache[dirpath] = nfo
+                    if nfo.get("albumartist") or nfo.get("artist"):
+                        tags["album_artist"] = nfo.get("albumartist") or nfo.get("artist")
                 artwork: Dict[str, Any] = {}
                 embedded = tags.pop("picture", None)
                 version = str(int(stat.st_mtime))
@@ -2717,13 +2994,15 @@ class NetworkShareMusicProvider:
                     if art_id:
                         artwork = {"id": art_id, "version": version}
                 genres = _genres(tags.get("genre"))
+                track_id = (
+                    _share_track_id(rel_path)
+                    if not art_scope
+                    else "track:" + hashlib.sha256(f"{root}\x00{rel_path}".encode("utf-8")).hexdigest()[:24]
+                )
+                path_to_id[rel_path.replace(os.sep, "/")] = track_id
                 tracks.append(
                     {
-                        "id": (
-                            _share_track_id(rel_path)
-                            if not art_scope
-                            else "track:" + hashlib.sha256(f"{root}\x00{rel_path}".encode("utf-8")).hexdigest()[:24]
-                        ),
+                        "id": track_id,
                         "provider_track_id": _share_scoped_stream_id(rel_path, root),
                         "title": _text(tags.get("title")) or Path(name).stem,
                         "artist": _text(tags.get("artist")),
@@ -2755,6 +3034,7 @@ class NetworkShareMusicProvider:
             "catalog_id": catalog_id,
             "tracks": tracks,
             "total": len(tracks),
+            "playlists": _share_m3u_playlists(root, m3u_files, path_to_id),
             "libraries": {catalog_id: "Network Share"},
         }
 
@@ -3173,6 +3453,7 @@ def _person_catalog(
             _catalog(store, extra_source, _person_extra_slot(wanted_person, extra_source))
         )
     tracks: List[Dict[str, Any]] = []
+    playlists: List[Dict[str, Any]] = []
     seen_ids: set = set()
     for payload in payloads:
         for track in payload.get("tracks") or []:
@@ -3188,6 +3469,9 @@ def _person_catalog(
             if track_id:
                 seen_ids.add(track_id)
             tracks.append(track)
+        for playlist in payload.get("playlists") or []:
+            if isinstance(playlist, dict) and _text(playlist.get("name")):
+                playlists.append(playlist)
     return {
         "provider": sources[0],
         "artwork_schema": CATALOG_ARTWORK_SCHEMA,
@@ -3198,6 +3482,7 @@ def _person_catalog(
         ),
         "albums": _facet_values(tracks, "album"),
         "genres": _facet_values(tracks, "genres"),
+        "playlists": playlists,
         "synced_at": max(
             (_as_float(payload.get("synced_at")) for payload in payloads), default=0.0
         ),
@@ -3251,6 +3536,11 @@ def _sync_catalog_impl(
     )
     albums = _facet_values(tracks, "album")
     genres = _facet_values(tracks, "genres")
+    playlists = [
+        row
+        for row in (raw.get("playlists") if isinstance(raw, dict) else []) or []
+        if isinstance(row, dict) and _text(row.get("name")) and isinstance(row.get("track_ids"), list)
+    ]
     payload = {
         "provider": selected,
         "artwork_schema": CATALOG_ARTWORK_SCHEMA,
@@ -3259,6 +3549,7 @@ def _sync_catalog_impl(
         "artists": artists,
         "albums": albums,
         "genres": genres,
+        "playlists": playlists,
         "libraries": raw.get("libraries") if isinstance(raw, dict) and isinstance(raw.get("libraries"), dict) else {},
         "synced_at": time.time(),
     }
@@ -4340,6 +4631,100 @@ def _persist_shared_player_volume(
             },
         )
     return volume
+
+
+def _set_player_volume(
+    player: Dict[str, Any],
+    volume_percent: Any,
+    *,
+    store: Any = None,
+) -> Dict[str, Any]:
+    """Set every destination in the group to one absolute volume ("All" control).
+
+    Speakers already receive the same value — a group at 12/10/7/15 set to 10
+    ends up at 10/10/10/10 — and the level is persisted per target so it
+    survives the next track start.
+    """
+    store = store or globals().get("redis_client")
+    previous_volume = _as_int(player.get("volume_percent"), 75, 0, 100)
+    volume = _as_int(
+        volume_percent,
+        previous_volume,
+        0,
+        100,
+    )
+    live_result = {"sent_count": 0, "warnings": []}
+    if _text(player.get("status")).lower() == "playing":
+        live_result = _set_target_volume(player, volume)
+        if _as_int(live_result.get("sent_count"), 0, 0, 10000) <= 0:
+            warning = "; ".join(
+                _text(value)
+                for value in list(live_result.get("warnings") or [])
+                if _text(value)
+            )
+            raise ValueError(warning or "The active players could not change volume.")
+    _persist_shared_player_volume(player, volume, client=store)
+    if volume > 0:
+        player["muted"] = False
+        player.pop("pre_mute_volume", None)
+    elif not _as_bool(player.get("muted")):
+        # Dragging the slider to zero mutes the group too; unmute restores it.
+        player["muted"] = True
+        player.setdefault("pre_mute_volume", previous_volume)
+    return live_result
+
+
+def _apply_player_mute(
+    player: Dict[str, Any],
+    *,
+    mute: bool,
+    client: Any = None,
+) -> Dict[str, Any]:
+    """Mute or unmute every member of the destination group in one action.
+
+    Muting remembers the volume it replaced (per queue) so unmuting puts the
+    whole group back where it was. Mute is applied as volume 0, which every
+    supported target type (satellites, stereo pairs, Sonos, AirPlay, media
+    players) honors.
+    """
+    store = client or globals().get("redis_client")
+    volume = _as_int(player.get("volume_percent"), 75, 0, 100)
+    if mute:
+        if _as_bool(player.get("muted")) and volume == 0:
+            return {"sent_count": 0, "warnings": []}
+        player["pre_mute_volume"] = volume or _as_int(
+            player.get("pre_mute_volume"), 75, 0, 100
+        )
+        player["muted"] = True
+        new_volume = 0
+    else:
+        player["muted"] = False
+        new_volume = _as_int(player.pop("pre_mute_volume", 0), 0, 0, 100)
+        if new_volume <= 0:
+            new_volume = volume if volume > 0 else 75
+    live_result = {"sent_count": 0, "warnings": []}
+    if _text(player.get("status")).lower() == "playing":
+        live_result = _set_target_volume(player, new_volume)
+        if _as_int(live_result.get("sent_count"), 0, 0, 10000) <= 0:
+            warning = "; ".join(
+                _text(value)
+                for value in list(live_result.get("warnings") or [])
+                if _text(value)
+            )
+            raise ValueError(warning or "The active players could not change volume.")
+    _persist_shared_player_volume(player, new_volume, client=store)
+    return live_result
+
+
+def _apply_mute_warnings(player: Dict[str, Any], live_result: Any) -> None:
+    """Surface partial-failure warnings from a group mute on the player card."""
+    warnings = [
+        _text(value)
+        for value in list((live_result or {}).get("warnings") or [])
+        if _text(value)
+    ]
+    if warnings:
+        player["warnings"] = warnings
 
 
 def _listening_history(client: Any = None, person_id: Any = "") -> List[Dict[str, Any]]:
@@ -5628,6 +6013,182 @@ def _endless_playlist_payload(store: Any, person_id: Any) -> Dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _folder_playlist_specs(cfg: Dict[str, Any]) -> List[tuple]:
+    """Parse the Folder Playlists setting into (playlist name, folder path) pairs."""
+    specs: List[tuple] = []
+    for chunk in _text(cfg.get("folder_playlists")).split(","):
+        name, separator, folder = chunk.partition("=")
+        name, folder = _text(name), _text(folder).strip().strip("/")
+        if separator and name and folder:
+            specs.append((name, folder))
+    return specs
+
+
+def _folder_defined_playlists(
+    store: Any,
+    person_id: Any,
+    provider_id: Any,
+    cfg: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Playlists defined by a library folder in the Folder Playlists setting.
+
+    Rebuilt from the live catalog on every call, so a song added to the folder
+    joins the playlist on the next sync without touching any stored playlist.
+    """
+    specs = _folder_playlist_specs(cfg)
+    if not specs:
+        return []
+    catalog = _person_catalog(store, provider_id, person_id)
+    tracks = [row for row in catalog.get("tracks") or [] if isinstance(row, dict)]
+    playlists: List[Dict[str, Any]] = []
+    for name, folder in specs:
+        needle = f"/{folder.casefold()}/"
+        track_ids: List[str] = []
+        for track in tracks:
+            path = _text(track.get("path")).replace("\\", "/").casefold()
+            if path and needle in f"/{path.lstrip('/')}/":
+                track_id = _text(track.get("id"))
+                if track_id:
+                    track_ids.append(track_id)
+        if track_ids:
+            playlists.append(
+                {
+                    "id": f"folder_playlist:{hashlib.sha1(name.casefold().encode('utf-8')).hexdigest()[:16]}",
+                    "name": name,
+                    "description": f"All tracks under the {folder} folder",
+                    "track_ids": track_ids,
+                }
+            )
+    return playlists
+
+
+def _catalog_user_playlists(
+    store: Any,
+    person_id: Any,
+    provider_id: Any = "",
+) -> List[Dict[str, Any]]:
+    """Playlists the user made themselves: Emby playlists, share .m3u files, and
+    the folder-defined playlists from the Folder Playlists setting.
+
+    These refresh on every library sync (folder playlists on every lookup), so
+    they need no extra requests at playback time.
+    """
+    cfg = _settings(store)
+    playlists: List[Dict[str, Any]] = []
+    seen_names: set = set()
+    catalog = _person_catalog(store, provider_id, person_id)
+    for row in catalog.get("playlists") or []:
+        if (
+            isinstance(row, dict)
+            and _text(row.get("name"))
+            and row.get("track_ids")
+            and _text(row.get("name")).casefold() not in seen_names
+        ):
+            seen_names.add(_text(row.get("name")).casefold())
+            playlists.append(dict(row))
+    for row in _folder_defined_playlists(store, person_id, provider_id, cfg):
+        if _text(row.get("name")).casefold() not in seen_names:
+            seen_names.add(_text(row.get("name")).casefold())
+            playlists.append(row)
+    return playlists
+
+
+def _find_named_playlist(
+    store: Any,
+    person_id: Any,
+    playlist_name: Any,
+    *,
+    provider_id: Any = "",
+) -> Dict[str, Any]:
+    """Match a playlist by name across AI mixes, then user-created playlists."""
+    payload = _endless_playlist_payload(store, person_id)
+    wanted = _text(playlist_name).casefold()
+    if wanted:
+        playlist = next(
+            (
+                row
+                for row in payload.get("playlists") or []
+                if isinstance(row, dict) and _text(row.get("name")).casefold() == wanted
+            ),
+            None,
+        )
+        if isinstance(playlist, dict):
+            return playlist
+        user_playlists = _catalog_user_playlists(store, person_id, provider_id)
+        return next(
+            (
+                row
+                for row in user_playlists
+                if _text(row.get("name")).casefold() == wanted
+            ),
+            {},
+        )
+    published = [row for row in payload.get("playlists") or [] if isinstance(row, dict)]
+    if published:
+        return published[0]
+    user_playlists = _catalog_user_playlists(store, person_id, provider_id)
+    return user_playlists[0] if user_playlists else {}
+
+
+PLAYLIST_ORDERS = (
+    "shuffle",
+    "track_asc",
+    "track_desc",
+    "title_asc",
+    "title_desc",
+    "artist_asc",
+    "artist_desc",
+    "album_asc",
+    "album_desc",
+)
+
+
+def _playlist_order_value(cfg: Dict[str, Any]) -> str:
+    order = _text(cfg.get("recommendation_playlist_order")).casefold()
+    return order if order in PLAYLIST_ORDERS else "shuffle"
+
+
+def _order_playlist_tracks(
+    tracks: List[Dict[str, Any]],
+    order: Any,
+) -> List[Dict[str, Any]]:
+    """Apply the fixed Playlist Order setting to a resolved playlist.
+
+    `shuffle` (the default) returns the list untouched; anything else returns a
+    deterministically sorted copy so the playlist plays the same way every time.
+    """
+    order = _text(order).casefold()
+    if order in ("", "shuffle") or len(tracks) <= 1:
+        return [dict(track) for track in tracks]
+    reverse = order.endswith("_desc")
+    field = order.split("_", 1)[0]
+
+    def sort_key(track: Dict[str, Any]) -> tuple:
+        if field == "track":
+            # Track number within the album; untagged tracks keep their relative
+            # order at the end (a large stable sentinel).
+            return (
+                _as_int(track.get("disc_number"), 0, 0, 1000),
+                _as_int(track.get("track_number"), 0, 0, 10000) or 100000,
+                _text(track.get("title")).casefold(),
+            )
+        if field == "artist":
+            return (
+                _text(track.get("artist") or track.get("album_artist")).casefold(),
+                _text(track.get("album")).casefold(),
+                _as_int(track.get("track_number"), 0, 0, 10000),
+            )
+        if field == "album":
+            return (
+                _text(track.get("album")).casefold(),
+                _as_int(track.get("disc_number"), 0, 0, 1000),
+                _as_int(track.get("track_number"), 0, 0, 10000),
+            )
+        return (_text(track.get("title")).casefold(),)
+
+    return [dict(track) for track in sorted(tracks, key=sort_key, reverse=reverse)]
+
+
 def _resolve_playlist_tracks(
     store: Any,
     person_id: Any,
@@ -5664,19 +6225,13 @@ def _playlist_loop_tracks(
     cfg = _settings(store)
     provider_id = _provider_id(player.get("provider"), _provider_id(cfg.get("provider")))
     playlist_name = _person_endless_playlist(queue_person, cfg, store)
-    payload = _endless_playlist_payload(store, queue_person)
-    playlists = [row for row in payload.get("playlists") or [] if isinstance(row, dict)]
-    playlist: Dict[str, Any] = {}
-    if playlist_name:
-        wanted = playlist_name.casefold()
-        playlist = next(
-            (row for row in playlists if _text(row.get("name")).casefold() == wanted), {}
-        )
-    elif playlists:
-        playlist = playlists[0]
+    playlist = _find_named_playlist(store, queue_person, playlist_name, provider_id=provider_id)
     if not playlist:
         return [], {}, 0
-    tracks = _resolve_playlist_tracks(store, queue_person, playlist, provider_id=provider_id)
+    tracks = _order_playlist_tracks(
+        _resolve_playlist_tracks(store, queue_person, playlist, provider_id=provider_id),
+        _playlist_order_value(cfg),
+    )
     if not tracks:
         return [], playlist, 0
     # Rotation offset advances only by tracks actually appended, so a slow
@@ -5874,18 +6429,21 @@ def _add_queue_tracks(
         )[:60]
 
     playlist_name = _text(args.get("playlist"))
+    playlist_ordered = False
     if playlist_name:
-        payload = _endless_playlist_payload(store, person_id)
-        playlists = [row for row in payload.get("playlists") or [] if isinstance(row, dict)]
-        wanted = playlist_name.casefold()
-        playlist = next(
-            (row for row in playlists if _text(row.get("name")).casefold() == wanted), {}
+        playlist = _find_named_playlist(
+            store, person_id, playlist_name, provider_id=selected_provider
         )
         if not playlist:
-            raise ValueError(f'No mix named "{playlist_name}" is on the Recommendations tab.')
-        tracks = _resolve_playlist_tracks(store, person_id, playlist)
+            raise ValueError(
+                f'No mix named "{playlist_name}" is on the Recommendations tab, and no '
+                "playlist of that name exists in the library."
+            )
+        tracks = _resolve_playlist_tracks(store, person_id, playlist, provider_id=selected_provider)
         if not tracks:
-            raise ValueError(f'The mix "{_text(playlist.get("name"))}" has no playable tracks left.')
+            raise ValueError(f'The playlist "{_text(playlist.get("name"))}" has no playable tracks left.')
+        tracks = _order_playlist_tracks(tracks, _playlist_order_value(cfg))
+        playlist_ordered = _playlist_order_value(cfg) != "shuffle"
     else:
         tracks = _search_tracks(
             query=_text(args.get("query") or args.get("music")),
@@ -5912,7 +6470,7 @@ def _add_queue_tracks(
             "player": _create_and_start_queue(
                 tracks,
                 targets=_list(player.get("targets") or player.get("target")),
-                shuffle=smart,
+                shuffle=smart and not playlist_ordered,
                 volume_percent=_as_int(player.get("volume_percent"), _as_int(cfg.get("default_volume_percent"), 75, 0, 100), 0, 100),
                 person_id=person_id,
                 client=store,
@@ -8134,16 +8692,20 @@ def get_hydra_kernel_tools(*, platform: str = "", **_kwargs) -> List[Dict[str, A
                 "transport actions act on the music playing in the speaking room first, then that "
                 "Person's own queue. Use the add action to queue an extra album, playlist, artist, "
                 "or genre on top of what is playing — with Smart Shuffle on, several sources mix "
-                "together on the fly. Use the sleep_timer action (minutes, 0 cancels) when the user "
-                "asks for music to stop after a while, e.g. \"play my music for an hour\"; the timer "
-                "force-stops playback and overrides endless playback when it hits zero."
+                "together on the fly. Use the volume action when the user asks to set the volume "
+                "across the whole speaker group (\"set all speakers to 70 percent\") — it sets every "
+                "destination in the group to the same absolute level. Use mute_all / unmute_all when "
+                "the user asks to mute or unmute every speaker at once. Use the sleep_timer action "
+                "(minutes, 0 cancels) when the user asks for music to stop after a while, e.g. "
+                "\"play my music for an hour\"; the timer force-stops playback and overrides endless "
+                "playback when it hits zero."
             ),
             "usage": (
                 '{"function":"personal_music_control","arguments":'
                 '{"action":"next|previous|stop|replay|pause|resume|shuffle|repeat|add|sleep_timer|move|set_targets|'
-                'bind_room|unbind_room",'
+                'bind_room|unbind_room|volume|mute_all|unmute_all",'
                 '"targets":["Kitchen","Living Room"],"enabled":true,"mode":"off|all|one",'
-                '"minutes":60,"album":"","playlist":"","artist":"","genre":"","query":"",'
+                '"minutes":60,"volume_percent":70,"album":"","playlist":"","artist":"","genre":"","query":"",'
                 '"person":"person_id"}}'
             ),
         },
@@ -8540,10 +9102,62 @@ async def run_hydra_kernel_tool(
                         )
                     ),
                 }
+            elif action == "volume":
+                player = _player(store, control_queue_id)
+                requested = values.get("volume_percent")
+                if requested in (None, ""):
+                    requested = values.get("volume")
+                if requested in (None, ""):
+                    raise ValueError(
+                        'Say a percentage, e.g. "set all speakers to 70 percent".'
+                    )
+                volume = _as_int(requested, 75, 0, 100)
+                live_result = await asyncio.to_thread(
+                    _set_player_volume, player, volume, store=store
+                )
+                _apply_mute_warnings(player, live_result)
+                _save_player(player, store, control_queue_id)
+                targets = _list(player.get("targets") or player.get("target"))
+                return {
+                    "ok": True,
+                    "status": _text(player.get("status")),
+                    "volume_percent": volume,
+                    "target_count": len(targets),
+                    "summary_for_user": (
+                        f"Every speaker in the group is now at {volume}%."
+                        if len(targets) > 1
+                        else f"Volume set to {volume}%."
+                    ),
+                }
+            elif action in {"mute_all", "unmute_all"}:
+                player = _player(store, control_queue_id)
+                live_result = await asyncio.to_thread(
+                    _apply_player_mute,
+                    player,
+                    mute=action == "mute_all",
+                    client=store,
+                )
+                _apply_mute_warnings(player, live_result)
+                _save_player(player, store, control_queue_id)
+                if action == "mute_all":
+                    return {
+                        "ok": True,
+                        "muted": True,
+                        "summary_for_user": "All speakers in the group are muted.",
+                    }
+                restored = _as_int(player.get("volume_percent"), 75, 0, 100)
+                return {
+                    "ok": True,
+                    "muted": False,
+                    "summary_for_user": (
+                        f"All speakers unmuted — volume restored to {restored}%."
+                    ),
+                }
             else:
                 raise ValueError(
                     "Music control action must be next, previous, stop, replay, shuffle, repeat, "
-                    "add, sleep_timer, set_targets, bind_room, or unbind_room."
+                    "add, sleep_timer, set_targets, bind_room, unbind_room, volume, mute_all, "
+                    "or unmute_all."
                 )
             targets = _list(player.get("targets") or player.get("target"))
             return {
@@ -8820,6 +9434,7 @@ def _player_item(
                 "label": status,
                 "tone": "good" if status == "PLAYING" else ("warn" if status == "ERROR" else "muted"),
             },
+            *([{"label": "MUTED", "tone": "warn"}] if _as_bool(player.get("muted")) else []),
             {
                 "label": (
                     "RADIO MIXING"
@@ -8915,6 +9530,22 @@ def _player_item(
                 "tooltip": "Next track",
                 "working_text": "Loading next track...",
                 "success_text": "Next track started.",
+            },
+            {
+                "action": "music_ui_mute_all",
+                "label": "🔇 All",
+                "aria_label": "Mute all speakers",
+                "tooltip": "Mute every selected speaker",
+                "working_text": "Muting all speakers...",
+                "success_text": "All speakers muted.",
+            },
+            {
+                "action": "music_ui_unmute_all",
+                "label": "🔊 All",
+                "aria_label": "Unmute all speakers",
+                "tooltip": "Unmute every selected speaker",
+                "working_text": "Unmuting all speakers...",
+                "success_text": "All speakers unmuted.",
             },
         ],
     }
@@ -10286,11 +10917,18 @@ def _person_link_personalization_fields(
     playlist_options = [
         {"value": "", "label": "Use the global Endless Playback playlist (or the newest mix)"}
     ]
+    seen_playlist_names = set()
     for row in playlist_payload.get("playlists") or []:
-        if isinstance(row, dict) and _text(row.get("name")):
-            playlist_options.append(
-                {"value": _text(row.get("name")), "label": _text(row.get("name"))}
-            )
+        name = _text(row.get("name")) if isinstance(row, dict) else ""
+        if name and name.casefold() not in seen_playlist_names:
+            seen_playlist_names.add(name.casefold())
+            playlist_options.append({"value": name, "label": name})
+    # Playlists the user made themselves (Emby playlists, share .m3u files).
+    for row in _catalog_user_playlists(client, _text(person_id)):
+        name = _text(row.get("name"))
+        if name and name.casefold() not in seen_playlist_names:
+            seen_playlist_names.add(name.casefold())
+            playlist_options.append({"value": name, "label": name})
     return [
         {
             "key": "person_link_recommendations_enabled",
@@ -11851,6 +12489,9 @@ def _play_recommendation(
     ]
     if not tracks:
         raise ValueError("Those recommended tracks are no longer in the active library. Refresh recommendations.")
+    # The Playlist Order setting decides whether a mix plays shuffled or in a
+    # fixed order (track number, title, artist, album).
+    tracks = _order_playlist_tracks(tracks, _playlist_order_value(cfg))
 
     current = _player(store, person_id)
     selected_targets = _list(requested_targets) or _list(
@@ -12416,23 +13057,12 @@ def handle_htmlui_tab_action(
 
     if action_name == "music_ui_set_volume":
         player = _player(store, viewer_person_id)
-        volume = _as_int(
+        live_result = _set_player_volume(
+            player,
             values.get("volume_percent"),
-            _as_int(player.get("volume_percent"), 75, 0, 100),
-            0,
-            100,
+            store=store,
         )
-        live_result = {"sent_count": 0, "warnings": []}
-        if _text(player.get("status")).lower() == "playing":
-            live_result = _set_target_volume(player, volume)
-            if _as_int(live_result.get("sent_count"), 0, 0, 10000) <= 0:
-                warning = "; ".join(
-                    _text(value)
-                    for value in list(live_result.get("warnings") or [])
-                    if _text(value)
-                )
-                raise ValueError(warning or "The active players could not change volume.")
-        _persist_shared_player_volume(player, volume, client=store)
+        volume = _as_int(player.get("volume_percent"), 75, 0, 100)
         warnings = [
             _text(value)
             for value in list(live_result.get("warnings") or [])
@@ -12449,6 +13079,21 @@ def handle_htmlui_tab_action(
                 else f"Music volume set to {volume}%."
             ),
         }
+
+    if action_name == "music_ui_mute_all":
+        player = _player(store, viewer_person_id)
+        live_result = _apply_player_mute(player, mute=True, client=store)
+        _apply_mute_warnings(player, live_result)
+        _save_player(player, store, viewer_person_id)
+        return {"ok": True, "message": "All speakers muted."}
+
+    if action_name == "music_ui_unmute_all":
+        player = _player(store, viewer_person_id)
+        live_result = _apply_player_mute(player, mute=False, client=store)
+        _apply_mute_warnings(player, live_result)
+        _save_player(player, store, viewer_person_id)
+        volume = _as_int(player.get("volume_percent"), 75, 0, 100)
+        return {"ok": True, "message": f"All speakers unmuted — volume back to {volume}%."}
 
     if action_name == "music_ui_seek":
         player = _seek_player(

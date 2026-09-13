@@ -354,6 +354,60 @@ class CustomMusicCoreTests(unittest.TestCase):
         finally:
             provider.request = original_request
 
+    def test_emby_user_playlists_are_fetched_with_their_songs(self):
+        core = self.core
+        provider = core.EmbyMusicProvider(
+            server_url="http://emby.local:8096", auth_mode="api_key", api_key="KEY", user_id="u-1"
+        )
+        calls = []
+
+        def fake_request(_method, path, params=None, client=None, **_kwargs):
+            calls.append((path, dict(params or {})))
+            include = (params or {}).get("IncludeItemTypes", "")
+            if include == "Playlist":
+                return {
+                    "Items": [{"Id": "pl1", "Name": "Road Trip"}, {"Id": "", "Name": "Bad"}],
+                    "TotalRecordCount": 2,
+                }
+            if include == "Audio":
+                return {
+                    "Items": [{"Id": "s2"}, {"Id": "s1"}],
+                    "TotalRecordCount": 2,
+                }
+            return {"Items": [], "TotalRecordCount": 0}
+
+        original_request = provider.request
+        provider.request = fake_request
+        try:
+            playlists = provider.user_playlists()
+        finally:
+            provider.request = original_request
+        self.assertEqual(
+            playlists,
+            [{"id": "emby_playlist:pl1", "name": "Road Trip", "description": "", "track_ids": ["s2", "s1"]}],
+        )
+        # Playlist items are paged through the playlist's Audio children.
+        audio_calls = [entry for entry in calls if entry[1].get("IncludeItemTypes") == "Audio"]
+        self.assertTrue(audio_calls)
+        self.assertEqual(audio_calls[0][1]["ParentId"], "pl1")
+        # The catalog carries the user playlists alongside the songs.
+        def catalog_request(_method, path, params=None, client=None, **_kwargs):
+            include = (params or {}).get("IncludeItemTypes", "")
+            if include == "Playlist":
+                return {"Items": [{"Id": "pl1", "Name": "Road Trip"}], "TotalRecordCount": 1}
+            if include == "Audio":
+                return {"Items": [{"Id": "s1"}], "TotalRecordCount": 1}
+            if path.endswith("/Views"):
+                return {"Items": [{"Id": "view1", "Name": "Music", "CollectionType": "music"}]}
+            return {"Items": [], "TotalRecordCount": 0}
+
+        provider.request = catalog_request
+        try:
+            payload = provider.catalog()
+        finally:
+            provider.request = original_request
+        self.assertEqual(payload["playlists"][0]["name"], "Road Trip")
+
     def test_emby_album_art_fallback(self):
         # Cover art usually hangs off the Album item in Emby; when the song has
         # no Primary image of its own, artwork fetching uses the album item.
@@ -971,6 +1025,66 @@ class NetworkShareProviderTests(unittest.TestCase):
         for title in ("Tagged Song", "Flac Song", "Ogg Song", "M4a Song"):
             self.assertTrue(by_title[title]["has_artwork"], title)
         self.assertFalse(by_title["Untitled"]["has_artwork"])  # no art source at all
+
+    def test_album_nfo_fallback_and_m3u_playlists(self):
+        core = self.core
+        # An album whose files carry no AlbumArtist tag but ship an album.nfo:
+        # the NFO's album artist outranks the track-artist path fallback.
+        nfo_album = Path(self.share_root) / "NFO Folder" / "NFO Album"
+        nfo_album.mkdir(parents=True)
+        (nfo_album / "album.nfo").write_text(
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>\n'
+            "<album>\n  <title>NFO Album</title>\n  <albumartist>NFO Album Artist</albumartist>\n"
+            "  <artist>Track Artist</artist>\n</album>\n",
+            encoding="utf-8",
+        )
+        _write_wav(nfo_album / "01 - NFO Song.wav")
+        # A malformed album.nfo must not break the sync.
+        broken = Path(self.share_root) / "Broken NFO" / "Broken Album"
+        broken.mkdir(parents=True)
+        (broken / "album.nfo").write_text("<album><artist>Oops", encoding="utf-8")
+        _write_wav(broken / "01 - Broken Song.wav")
+        # User-made .m3u playlists: root-relative and folder-relative entries.
+        (Path(self.share_root) / "Road Trip.m3u").write_text(
+            "#EXTM3U\n"
+            "Share Artist/Share Album/01 - Tagged Song.mp3\n"
+            "./Share Artist/Share Album/02 - flac song.flac\n"
+            "https://streams.example/remote.mp3\n",
+            encoding="utf-8",
+        )
+        (Path(self.share_root) / "Share Artist" / "folder-list.m3u8").write_text(
+            "Share Album/03 - ogg song.ogg\n",
+            encoding="utf-8",
+        )
+        self.connect_share()
+        payload = self.catalog()
+        by_title = {track["title"]: track for track in payload["tracks"]}
+        self.assertEqual(by_title["NFO Song"]["album_artist"], "NFO Album Artist")
+        # With no usable NFO the track-artist fallback still applies.
+        self.assertEqual(by_title["Broken Song"]["album_artist"], "Broken NFO")
+        # The tagged MP3 keeps its real album artist (NFO never overrides it).
+        self.assertEqual(by_title["Tagged Song"]["album_artist"], "Share Artist")
+        playlists = {row["name"]: row for row in payload.get("playlists") or []}
+        self.assertEqual(
+            sorted(playlists), ["Road Trip", "folder-list"]
+        )
+        catalog = core._catalog(provider_id="network_share")
+        by_id = {track["id"]: track for track in catalog["tracks"]}
+        road_trip = playlists["Road Trip"]
+        self.assertEqual(
+            [by_id[track_id]["title"] for track_id in road_trip["track_ids"]],
+            ["Tagged Song", "Flac Song"],  # remote URLs are skipped
+        )
+        self.assertEqual(
+            [by_id[track_id]["title"] for track_id in playlists["folder-list"]["track_ids"]],
+            ["Ogg Song"],
+        )
+        # Voice "play playlist" resolution finds the m3u playlist by name.
+        playlist = core._find_named_playlist(self.redis, "", "road trip", provider_id="network_share")
+        self.assertEqual(playlist.get("name"), "Road Trip")
+        self.assertEqual(len(playlist["track_ids"]), 2)
+        resolved = core._resolve_playlist_tracks(self.redis, "", playlist, provider_id="network_share")
+        self.assertEqual([track["title"] for track in resolved], ["Tagged Song", "Flac Song"])
 
     def test_stream_proxy_serves_share_files_with_range(self):
         self.connect_share()
@@ -2143,6 +2257,116 @@ class MultiQueueTests(unittest.TestCase):
         finally:
             core._preferred_room_target = self._originals["_preferred_room_target"]
 
+    # ---- group volume, mute all / unmute all ----
+
+    def stub_group_volume(self):
+        self.volume_calls = []
+        self._originals["_set_target_volume"] = self.core._set_target_volume
+
+        def fake_set_target_volume(player, volume_percent):
+            self.volume_calls.append(volume_percent)
+            return {
+                "sent_count": len(player.get("targets") or []),
+                "warnings": [],
+            }
+
+        self.core._set_target_volume = fake_set_target_volume
+
+    def test_volume_action_sets_every_group_member_to_the_same_level(self):
+        core = self.core
+        self.stub_playback()
+        self.stub_group_volume()
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen", "voice_core:native:office"])
+        # "Set all speakers 70%": one action, every member at the same level.
+        result = asyncio.run(
+            core.run_hydra_kernel_tool(
+                tool_id="personal_music_control",
+                args={"action": "volume", "volume_percent": 70},
+                origin=self.origin_for("person_a"),
+                redis_client=self.redis,
+            )
+        )
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(self.volume_calls, [70])
+        player = core._player(self.redis, "person_a")
+        self.assertEqual(player["volume_percent"], 70)
+        self.assertEqual(result["summary_for_user"], "Every speaker in the group is now at 70%.")
+        # A missing percentage is asked for, not guessed.
+        missing = asyncio.run(
+            core.run_hydra_kernel_tool(
+                tool_id="personal_music_control",
+                args={"action": "volume"},
+                origin=self.origin_for("person_a"),
+                redis_client=self.redis,
+            )
+        )
+        self.assertFalse(missing.get("ok"))
+        self.assertIn("percentage", missing["error"]["message"])
+
+    def test_mute_all_and_unmute_all_round_trip(self):
+        core = self.core
+        self.stub_playback()
+        self.stub_group_volume()
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"])  # volume 60
+        muted = asyncio.run(
+            core.run_hydra_kernel_tool(
+                tool_id="personal_music_control",
+                args={"action": "mute_all"},
+                origin=self.origin_for("person_a"),
+                redis_client=self.redis,
+            )
+        )
+        self.assertTrue(muted.get("ok"), muted)
+        player = core._player(self.redis, "person_a")
+        self.assertTrue(player.get("muted"))
+        self.assertEqual(player["volume_percent"], 0)
+        self.assertEqual(self.volume_calls[-1], 0)
+        # Unmuting restores the pre-mute volume on every speaker.
+        unmuted = asyncio.run(
+            core.run_hydra_kernel_tool(
+                tool_id="personal_music_control",
+                args={"action": "unmute_all"},
+                origin=self.origin_for("person_a"),
+                redis_client=self.redis,
+            )
+        )
+        self.assertTrue(unmuted.get("ok"), unmuted)
+        player = core._player(self.redis, "person_a")
+        self.assertFalse(player.get("muted"))
+        self.assertEqual(player["volume_percent"], 60)
+        self.assertEqual(self.volume_calls[-1], 60)
+        # Unmuting without a stored level falls back to the default volume.
+        player = core._player(self.redis, "person_a")
+        player.pop("pre_mute_volume", None)
+        core._apply_player_mute(player, mute=False, client=self.redis)
+        self.assertEqual(player["volume_percent"], 60)
+        # Muting a paused queue needs no live speakers and still persists.
+        core._pause_player(person_id="person_a", client=self.redis)
+        result = core.handle_htmlui_tab_action(
+            action="music_ui_mute_all", payload={}, redis_client=self.redis
+        )
+        self.assertTrue(result["ok"], result)
+        # The dashboard acts on the shared (household) player; person_a's
+        # paused queue keeps its own volume.
+        shared = core._player(self.redis)
+        self.assertTrue(shared.get("muted"))
+        self.assertEqual(shared["volume_percent"], 0)
+        self.assertEqual(core._player(self.redis, "person_a")["volume_percent"], 60)
+
+    def test_player_card_offers_mute_all_buttons(self):
+        core = self.core
+        player = self.seed_playing_queue("", ["voice_core:native:kitchen"])
+        core._save_player(player, self.redis, "")
+        item = core._player_item(core._player(self.redis), [], "emby", core._settings(self.redis))
+        actions = {row["action"] for row in item["actions"]}
+        self.assertIn("music_ui_mute_all", actions)
+        self.assertIn("music_ui_unmute_all", actions)
+        self.assertNotIn("MUTED", [badge["label"] for badge in item["hero_badges"]])
+        player = core._player(self.redis)
+        player["muted"] = True
+        item = core._player_item(player, [], "emby", core._settings(self.redis))
+        self.assertIn("MUTED", [badge["label"] for badge in item["hero_badges"]])
+
     def test_move_tool_hands_off_with_position(self):
         core = self.core
         self.stub_playback()
@@ -3084,11 +3308,16 @@ class EndlessPlaybackTests(unittest.TestCase):
 
         self.core._stop_target = fake_stop_target
 
-    def seed_person_catalog(self, person_id, tracks):
+    def seed_person_catalog(self, person_id, tracks, playlists=None):
         self.core._save_json(
             self.redis,
             self.core._catalog_key(person_id),
-            {"provider": "emby", "tracks": tracks, "synced_at": time.time()},
+            {
+                "provider": "emby",
+                "tracks": tracks,
+                "playlists": playlists or [],
+                "synced_at": time.time(),
+            },
         )
 
     def seed_playing_queue(self, person_id, tracks, *, index=0):
@@ -3188,6 +3417,146 @@ class EndlessPlaybackTests(unittest.TestCase):
         core._save_person_link("p1", {"endless_playback_playlist": "Missing"}, self.redis)
         batch, _playlist, _offset = core._playlist_loop_tracks(player, self.redis, count=2)
         self.assertEqual(batch, [])
+
+    def test_playlist_loop_mode_loops_a_user_created_playlist(self):
+        core = self.core
+        tracks = [_track_row(1, "One"), _track_row(2, "Two"), _track_row(3, "Three")]
+        self.seed_person_catalog(
+            "p1",
+            tracks,
+            playlists=[{"id": "emby_playlist:pl1", "name": "Road Trip", "track_ids": ["track:1", "track:3"]}],
+        )
+        player = self.seed_playing_queue("p1", [tracks[0]], index=0)
+        # An exact name match on a user-created (Emby) playlist loops it…
+        core._save_hash(
+            self.redis,
+            core.SETTINGS_KEY,
+            {"endless_playback_mode": "playlist_loop", "endless_playback_playlist": "road trip"},
+        )
+        batch, playlist, _offset = core._playlist_loop_tracks(player, self.redis, count=1)
+        self.assertEqual(playlist.get("name"), "Road Trip")
+        self.assertEqual([track["id"] for track in batch], ["track:3"])
+        # …and with no pick configured the first user playlist is the fallback
+        # when there are no AI mixes at all.
+        core._save_hash(self.redis, core.SETTINGS_KEY, {"endless_playback_mode": "playlist_loop"})
+        batch, playlist, _offset = core._playlist_loop_tracks(player, self.redis, count=1)
+        self.assertEqual(playlist.get("name"), "Road Trip")
+        self.assertEqual([track["id"] for track in batch], ["track:3"])
+        # Voice "add playlist" finds user playlists the same way.
+        result = core._add_queue_tracks(
+            {"playlist": "Road Trip"}, origin={"person_id": "p1"}, client=self.redis
+        )
+        self.assertEqual(result["added"], 1)
+        # An unknown name still raises, naming both places it looked.
+        with self.assertRaises(ValueError) as caught:
+            core._add_queue_tracks(
+                {"playlist": "Nowhere"}, origin={"person_id": "p1"}, client=self.redis
+            )
+        self.assertIn("Nowhere", str(caught.exception))
+
+    def test_folder_playlists_are_built_from_library_folders(self):
+        core = self.core
+        tracks = [
+            dict(_track_row(1, "Frosty"), path="/mnt/music/Christmas/Frosty.mp3"),
+            dict(_track_row(2, "Jingle"), path="/mnt/music/Christmas/Kids/Jingle.mp3"),
+            dict(_track_row(3, "Regular"), path="/mnt/music/Rock/Regular.mp3"),
+            dict(_track_row(4, "Eve"), path="/mnt/music/Christmas Eve/Eve.mp3"),
+        ]
+        self.seed_person_catalog("p1", tracks)
+        core._save_hash(
+            self.redis,
+            core.SETTINGS_KEY,
+            {"folder_playlists": "Christmas Music=Christmas, Empty=Nowhere, Bad"},
+        )
+        playlists = core._catalog_user_playlists(self.redis, "p1", "emby")
+        self.assertEqual([row["name"] for row in playlists], ["Christmas Music"])
+        christmas = playlists[0]
+        # The folder's subfolders are included; a sibling folder whose name only
+        # shares a prefix ("Christmas Eve") is not.
+        self.assertEqual(christmas["track_ids"], ["track:1", "track:2"])
+        # The endless loop and person-card options see it like any playlist.
+        core._save_hash(
+            self.redis,
+            core.SETTINGS_KEY,
+            {
+                "endless_playback_mode": "playlist_loop",
+                "endless_playback_playlist": "Christmas Music",
+                "folder_playlists": "Christmas Music=Christmas",
+            },
+        )
+        player = self.seed_playing_queue("p1", [tracks[0]], index=0)
+        batch, playlist, _offset = core._playlist_loop_tracks(player, self.redis, count=1)
+        self.assertEqual(playlist.get("name"), "Christmas Music")
+        self.assertEqual([track["id"] for track in batch], ["track:2"])
+        # Songs added to the folder join on the next lookup with no re-save.
+        tracks.append(dict(_track_row(5, "New Song"), path="/mnt/music/Christmas/New.mp3"))
+        self.seed_person_catalog("p1", tracks)
+        with self.core._catalog_memory_cache_lock:
+            self.core._catalog_memory_cache.clear()
+        batch, playlist, _offset = core._playlist_loop_tracks(player, self.redis, count=3)
+        self.assertEqual(
+            sorted(track["id"] for track in batch), ["track:1", "track:2", "track:5"]
+        )
+
+    def test_playlist_order_setting_plays_mixes_in_a_fixed_order(self):
+        core = self.core
+        tracks = [
+            dict(_track_row(1, "Beta"), album="Second", track_number=2, disc_number=1),
+            dict(_track_row(2, "Alpha"), album="First", track_number=1, disc_number=1),
+            dict(_track_row(3, "Gamma"), album="First", track_number=3, disc_number=1),
+        ]
+        self.seed_person_catalog("p1", tracks)
+        core._save_json(
+            self.redis,
+            core._recommendations_key("p1"),
+            {
+                "provider": "emby",
+                "playlists": [{"id": "mix1", "name": "Mix", "track_ids": ["track:1", "track:2", "track:3"]}],
+            },
+        )
+        # The default stays shuffled (no fixed order applied at play time).
+        core._save_hash(self.redis, core.SETTINGS_KEY, {"recommendation_playlist_order": "shuffle"})
+        ordered = core._order_playlist_tracks(
+            [dict(track) for track in tracks], core._playlist_order_value(core._settings(self.redis))
+        )
+        self.assertEqual(
+            [track["id"] for track in ordered], ["track:1", "track:2", "track:3"]
+        )
+        # Track number ascending reorders by disc/track number.
+        core._save_hash(self.redis, core.SETTINGS_KEY, {"recommendation_playlist_order": "track_asc"})
+        ordered = core._order_playlist_tracks(
+            [dict(track) for track in tracks], core._playlist_order_value(core._settings(self.redis))
+        )
+        self.assertEqual([track["id"] for track in ordered], ["track:2", "track:1", "track:3"])
+        # Title descending, and the artist/album fields as tie-breakers.
+        core._save_hash(self.redis, core.SETTINGS_KEY, {"recommendation_playlist_order": "title_desc"})
+        ordered = core._order_playlist_tracks(
+            [dict(track) for track in tracks], core._playlist_order_value(core._settings(self.redis))
+        )
+        self.assertEqual([track["id"] for track in ordered], ["track:3", "track:1", "track:2"])
+        # The endless playlist loop follows the same fixed order.
+        core._save_hash(
+            self.redis,
+            core.SETTINGS_KEY,
+            {
+                "endless_playback_mode": "playlist_loop",
+                "endless_playback_playlist": "Mix",
+                "recommendation_playlist_order": "track_asc",
+            },
+        )
+        player = self.seed_playing_queue("p1", [tracks[0]], index=0)
+        batch, _playlist, _offset = core._playlist_loop_tracks(player, self.redis, count=3)
+        self.assertEqual([track["id"] for track in batch], ["track:2", "track:1", "track:3"])
+        # Playing the mix from the Recommendations tab queues it in that order
+        # with shuffle off.
+        self._originals["_resolve_targets"] = core._resolve_targets
+        core._resolve_targets = lambda *args, **kwargs: ["voice_core:native:kitchen"]
+        self._originals["_validate_catalog_provider_targets"] = core._validate_catalog_provider_targets
+        core._validate_catalog_provider_targets = lambda targets: None
+        core._save_hash(self.redis, core.SETTINGS_KEY, {"recommendation_playlist_order": "track_asc"})
+        player = core._play_recommendation("recommendation:mix1", self.redis, person_id="p1")
+        self.assertEqual([track["id"] for track in player["queue"]], ["track:2", "track:1", "track:3"])
+        self.assertFalse(player["shuffle"])
 
     def test_continuation_impl_dispatches_modes_without_the_llm(self):
         core = self.core
