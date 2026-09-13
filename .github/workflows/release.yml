@@ -15,6 +15,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Read core version
         id: version
@@ -35,14 +37,77 @@ jobs:
       - name: Create GitHub release if new
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
-          TAG="v${{ steps.version.outputs.version }}"
+          TAG="v${RELEASE_VERSION}"
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG already exists — nothing to do."
             exit 0
           fi
+          NOTES_FILE=$(mktemp)
+          python3 <<'PYEOF' > "$NOTES_FILE"
+          import os
+          import re
+          import subprocess
+
+          tag = "v" + os.environ["RELEASE_VERSION"]
+          tags = subprocess.run(
+              ["git", "tag", "--sort=-creatordate"],
+              capture_output=True, text=True, check=True,
+          ).stdout.split()
+          # Only this repo's own release tags count — the seeded upstream
+          # history carries Tater_Shop tags (Music_Core_v*, …) that would
+          # otherwise be mistaken for the previous release.
+          prev = next(
+              (t for t in tags if t != tag and re.match(r"^v\d+\.\d+\.\d+$", t)), ""
+          )
+          commit_range = f"{prev}..HEAD" if prev else "HEAD"
+          subjects = subprocess.run(
+              ["git", "log", "--format=%s", commit_range],
+              capture_output=True, text=True, check=True,
+          ).stdout.splitlines()
+          # Drop CI/manifest bookkeeping commits from the notes.
+          subjects = [
+              re.sub(r"\s*\(v[\d.]+\)\s*$", "", s)
+              for s in subjects
+              if not s.lower().startswith(("chore:", "ci:", "release:", "build:"))
+          ]
+
+          features = [
+              s for s in subjects
+              if s.lower().startswith(
+                  ("add", "new", "improve", "enable", "introduce", "support", "update", "rename")
+              )
+          ]
+          fixes = [
+              s for s in subjects
+              if s.lower().startswith(("fix", "correct", "handle", "prevent"))
+          ]
+          other = [s for s in subjects if s not in features and s not in fixes]
+
+          print("## What's changed")
+          print()
+          for title, rows in (("Features", features), ("Fixes", fixes), ("Other", other)):
+              if rows:
+                  print(f"### {title}")
+                  for row in rows:
+                      print(f"- {row}")
+                  print()
+          if prev:
+              print(
+                  "**Full Changelog**: "
+                  f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/compare/{prev}...{tag}"
+              )
+          else:
+              print(
+                  "**Full Changelog**: "
+                  f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/commits/{tag}"
+              )
+          PYEOF
+          echo "--- release notes ---"
+          cat "$NOTES_FILE"
           gh release create "$TAG" \
             cores/personal_music_core.py \
             core_manifest.json \
             --title "Personal Music Core $TAG" \
-            --generate-notes
+            --notes-file "$NOTES_FILE"
