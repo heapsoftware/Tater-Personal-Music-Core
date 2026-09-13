@@ -392,6 +392,55 @@ class CustomMusicCoreTests(unittest.TestCase):
             core._PEOPLE_API_MODULE = original_people
             core._clear_person_link_edit_target(self.redis)
 
+    def test_link_remove_clears_queue_and_per_person_state(self):
+        people = types.SimpleNamespace(
+            load_store=lambda _client=None: {
+                "people": [{"id": "person_zoe", "display_name": "Zoe"}]
+            }
+        )
+        original_people = self.core._PEOPLE_API_MODULE
+        self.core._PEOPLE_API_MODULE = people
+        try:
+            self.redis.hset(
+                self.core.PERSON_LINKS_KEY,
+                mapping={
+                    "person_zoe": json.dumps(
+                        {"music_source": "network_share", "network_share": {"root_path": "/mnt/music/zoe"}}
+                    )
+                },
+            )
+            self.core._save_json(
+                self.redis,
+                self.core._player_key("person_zoe"),
+                {"status": "paused", "queue": [{"id": "t1"}]},
+            )
+            self.core._register_queue("person_zoe", self.redis)
+            self.core._save_follow_me_state(
+                "person_zoe", {"status": "following", "zone": "Kitchen"}, self.redis
+            )
+            self.core._record_catalog_stats(
+                self.redis,
+                "person_zoe",
+                {"status": "ok", "track_count": 3, "synced_at": time.time()},
+            )
+            result = self.core.handle_htmlui_tab_action(
+                action="music_person_link_remove",
+                payload={"values": {"person_link_person_id": "person_zoe"}},
+                redis_client=self.redis,
+            )
+            self.assertTrue(result["ok"], result)
+            # Link, catalog, history, queue, follow-me state, and sync stats
+            # are all gone; re-linking the Person starts clean.
+            self.assertEqual(self.core._person_link("person_zoe", self.redis), {})
+            player = self.core._player(self.redis, "person_zoe")
+            self.assertEqual(player.get("queue") or [], [])
+            self.assertEqual(player.get("status"), "idle")
+            self.assertNotIn("person_zoe", self.core._queue_registry(self.redis))
+            self.assertEqual(self.core._follow_me_state("person_zoe", self.redis), {})
+            self.assertEqual(self.core._catalog_stats("person_zoe", self.redis), {})
+        finally:
+            self.core._PEOPLE_API_MODULE = original_people
+
     def test_artwork_lookup_falls_back_to_person_catalogs(self):
         # Artwork URLs from a viewed Person's catalog carry no scope, so the
         # artwork webhook must find the track in that Person's catalog and
@@ -445,6 +494,15 @@ class CustomMusicCoreTests(unittest.TestCase):
         self.assertEqual(scoped["person_scope"], "person_zoe")
         # Household tracks are unaffected.
         self.assertEqual(core._client_track("household1", "emby", self.redis)["id"], "household1")
+        # The 2.4.1 regression: an empty household catalog (here: no connected
+        # Emby at all) must not block the Person fallback with a sync error.
+        with core._catalog_memory_cache_lock:
+            core._catalog_memory_cache.update(
+                {"store": None, "payload": {}, "loaded_at": 0.0, "person": ""}
+            )
+        self.redis.delete(core._catalog_key(""))
+        track = core._client_track("9941", "emby", self.redis)
+        self.assertEqual(track["person_scope"], "person_zoe")
         with self.assertRaises(ValueError):
             core._client_track("nope", "emby", self.redis)
         # The fetch builds the provider with the Person's scope.
