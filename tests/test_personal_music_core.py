@@ -1,4 +1,4 @@
-"""Tests for cores/custom_music_core.py.
+"""Tests for cores/personal_music_core.py.
 
 Mirrors Tater_Shop's core test style: stub the shared ``helpers`` module with a
 FakeRedis, load the core file directly via importlib, and exercise it without a
@@ -52,7 +52,7 @@ class FakeRedis:
             row.pop(field, None)
 
 
-def load_custom_music_core():
+def load_personal_music_core():
     helpers = types.ModuleType("helpers")
     helpers.redis_client = FakeRedis()
     helpers.extract_json = lambda value: value
@@ -60,8 +60,8 @@ def load_custom_music_core():
     helpers.get_primary_llm_client_from_env = lambda: None
     sys.modules["helpers"] = helpers
 
-    path = Path(__file__).resolve().parents[1] / "cores" / "custom_music_core.py"
-    spec = importlib.util.spec_from_file_location("custom_music_core_test_module", path)
+    path = Path(__file__).resolve().parents[1] / "cores" / "personal_music_core.py"
+    spec = importlib.util.spec_from_file_location("personal_music_core_test_module", path)
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
     sys.modules[spec.name] = module
@@ -72,7 +72,7 @@ def load_custom_music_core():
 class CustomMusicCoreTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.core = load_custom_music_core()
+        cls.core = load_personal_music_core()
         cls.helpers = sys.modules["helpers"]
 
     def setUp(self):
@@ -93,22 +93,22 @@ class CustomMusicCoreTests(unittest.TestCase):
 
     def test_redis_keys_do_not_collide_with_music_core(self):
         core = self.core
-        self.assertEqual(core.SETTINGS_KEY, "custom_music_core_settings")
-        self.assertEqual(core.RUNTIME_KEY, "custom_music_core:runtime")
-        self.assertEqual(core.PERSON_LINKS_KEY, "custom_music_core:person_links")
-        self.assertEqual(core.CATALOG_KEY, "custom_music_core:catalog:v1")
-        self.assertEqual(core.PLAYER_KEY, "custom_music_core:player")
-        self.assertEqual(core.HISTORY_KEY, "custom_music_core:history:v1")
-        self.assertEqual(core.RECOMMENDATIONS_KEY, "custom_music_core:recommendations:v1")
-        self.assertEqual(core.PROMPT_PROFILE_KEY, "custom_music_core:profile:v1")
-        self.assertEqual(core.ACTIVITY_KEY, "custom_music_core:activity_feed")
+        self.assertEqual(core.SETTINGS_KEY, "personal_music_core_settings")
+        self.assertEqual(core.RUNTIME_KEY, "personal_music_core:runtime")
+        self.assertEqual(core.PERSON_LINKS_KEY, "personal_music_core:person_links")
+        self.assertEqual(core.CATALOG_KEY, "personal_music_core:catalog:v1")
+        self.assertEqual(core.PLAYER_KEY, "personal_music_core:player")
+        self.assertEqual(core.HISTORY_KEY, "personal_music_core:history:v1")
+        self.assertEqual(core.RECOMMENDATIONS_KEY, "personal_music_core:recommendations:v1")
+        self.assertEqual(core.PROMPT_PROFILE_KEY, "personal_music_core:profile:v1")
+        self.assertEqual(core.ACTIVITY_KEY, "personal_music_core:activity_feed")
         for key in (core.SETTINGS_KEY, core.RUNTIME_KEY, core.CATALOG_KEY, core.PLAYER_KEY):
             self.assertFalse(key.startswith("music_core"), key)
 
     def test_settings_category_and_tab_are_distinct(self):
         core = self.core
-        self.assertEqual(core.CORE_SETTINGS["category"], "Custom Music Core Settings")
-        self.assertEqual(core.CORE_WEBUI_TAB["label"], "Custom Music")
+        self.assertEqual(core.CORE_SETTINGS["category"], "Personal Music Core Settings")
+        self.assertEqual(core.CORE_WEBUI_TAB["label"], "Personal Music")
 
     def test_provider_ids_never_reuse_tater_tube(self):
         core = self.core
@@ -122,13 +122,13 @@ class CustomMusicCoreTests(unittest.TestCase):
         self.assertEqual(
             ids,
             [
-                "custom_music_play",
-                "custom_music_search",
-                "custom_music_control",
-                "custom_music_now_playing",
-                "custom_music_move",
-                "custom_music_confirm",
-                "custom_music_browse",
+                "personal_music_play",
+                "personal_music_search",
+                "personal_music_control",
+                "personal_music_now_playing",
+                "personal_music_move",
+                "personal_music_confirm",
+                "personal_music_browse",
             ],
         )
         for tool_id in ids:
@@ -276,7 +276,7 @@ class CustomMusicCoreTests(unittest.TestCase):
             self.assertEqual(len(self.core._search_tracks(album="exodus", limit=2)), 2)
 
             artwork_url = self.core._public_track(hits[0])["artwork_url"]
-            self.assertIn("/api/cores/custom_music_core/webhook/artwork?", artwork_url)
+            self.assertIn("/api/cores/personal_music_core/webhook/artwork?", artwork_url)
 
             track = dict(hits[0])
             self.core._record_listening_history(
@@ -290,7 +290,7 @@ class CustomMusicCoreTests(unittest.TestCase):
             self.assertEqual(history[0]["provider"], "emby")
             activity = self.core.get_music_activity_events()
             self.assertEqual(len(activity), 1)
-            self.assertEqual(activity[0]["source"], "custom_music_core")
+            self.assertEqual(activity[0]["source"], "personal_music_core")
             # The same track within the dedupe window is not recorded twice.
             self.core._record_listening_history(
                 track, ["voice_core:native:kitchen"], person_id="person_abc"
@@ -383,7 +383,7 @@ class CustomMusicCoreTests(unittest.TestCase):
         self.core._provider = lambda client=None, provider_id="": FakeEmbyProvider()
         try:
             data = self.core.get_htmlui_tab_data()
-            self.assertEqual(data["ui"]["title"], "Custom Music Core")
+            self.assertEqual(data["ui"]["title"], "Personal Music Core")
             tab_keys = [tab["key"] for tab in data["ui"]["manager_tabs"]]
             self.assertIn("providers", tab_keys)
             self.assertIn("settings", tab_keys)
@@ -394,7 +394,7 @@ class CustomMusicCoreTests(unittest.TestCase):
 
     def test_core_system_tasks_shape(self):
         tasks = self.core.get_core_system_tasks()
-        self.assertEqual(tasks["label"], "Custom Music Core")
+        self.assertEqual(tasks["label"], "Personal Music Core")
         self.assertEqual(
             [task["id"] for task in tasks["tasks"]],
             [
@@ -607,7 +607,7 @@ class ShareFixture:
 class NetworkShareProviderTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.core = load_custom_music_core()
+        cls.core = load_personal_music_core()
 
     def setUp(self):
         self.redis = FakeRedis()
@@ -758,7 +758,7 @@ class NetworkShareProviderTests(unittest.TestCase):
 class PerPersonLinkageTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.core = load_custom_music_core()
+        cls.core = load_personal_music_core()
 
     def setUp(self):
         self.redis = FakeRedis()
@@ -816,7 +816,7 @@ class PerPersonLinkageTests(unittest.TestCase):
         self.assertEqual(len(self.core._catalog(person_id="person_zoe")["tracks"]), 6)
         self.assertEqual(
             self.core._catalog_key("person_zoe"),
-            "custom_music_core:catalog:v1:person_zoe",
+            "personal_music_core:catalog:v1:person_zoe",
         )
         track = dict(payload["tracks"][0])
         self.core._record_listening_history(
@@ -956,7 +956,7 @@ class MultiQueueTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.core = load_custom_music_core()
+        cls.core = load_personal_music_core()
 
     def setUp(self):
         self.redis = FakeRedis()
@@ -1037,7 +1037,7 @@ class MultiQueueTests(unittest.TestCase):
     def test_player_keys_and_registry(self):
         core = self.core
         self.assertEqual(core._player_key(""), core.PLAYER_KEY)
-        self.assertEqual(core._player_key("p1"), "custom_music_core:player:p1")
+        self.assertEqual(core._player_key("p1"), "personal_music_core:player:p1")
         self.stub_playback()
         self.make_queue("person_a", ["voice_core:native:kitchen"])
         registry = core._queue_registry(self.redis)
@@ -1169,7 +1169,7 @@ class MultiQueueTests(unittest.TestCase):
         self.assertTrue(result.get("needs_confirmation"))
         confirmed = asyncio.run(
             core.run_hydra_kernel_tool(
-                tool_id="custom_music_confirm",
+                tool_id="personal_music_confirm",
                 args={"choice": "yes"},
                 origin=self.origin_for("person_a"),
                 redis_client=self.redis,
@@ -1195,7 +1195,7 @@ class MultiQueueTests(unittest.TestCase):
         )
         confirmed = asyncio.run(
             core.run_hydra_kernel_tool(
-                tool_id="custom_music_confirm",
+                tool_id="personal_music_confirm",
                 args={"choice": "start_new"},
                 origin=self.origin_for("person_a"),
                 redis_client=self.redis,
@@ -1251,7 +1251,7 @@ class MultiQueueTests(unittest.TestCase):
         try:
             result = asyncio.run(
                 core.run_hydra_kernel_tool(
-                    tool_id="custom_music_control",
+                    tool_id="personal_music_control",
                     args={"action": "pause"},
                     origin=self.origin_for("person_a", selector="native:kitchen"),
                     redis_client=self.redis,
@@ -1276,7 +1276,7 @@ class MultiQueueTests(unittest.TestCase):
         self.seed_playing_queue("person_a", ["voice_core:native:kitchen"], position=30.0, elapsed=10.0)
         result = asyncio.run(
             core.run_hydra_kernel_tool(
-                tool_id="custom_music_move",
+                tool_id="personal_music_move",
                 args={"rooms": ["Office"]},
                 origin=self.origin_for("person_a"),
                 redis_client=self.redis,
@@ -1299,7 +1299,7 @@ class MultiQueueTests(unittest.TestCase):
         )
         result = asyncio.run(
             core.run_hydra_kernel_tool(
-                tool_id="custom_music_move",
+                tool_id="personal_music_move",
                 args={"rooms": ["Office"]},
                 origin=self.origin_for("person_a"),
                 redis_client=self.redis,
@@ -1344,7 +1344,7 @@ class FollowMeTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.core = load_custom_music_core()
+        cls.core = load_personal_music_core()
 
     def setUp(self):
         self.redis = FakeRedis()
@@ -1756,7 +1756,7 @@ class FollowMeTests(unittest.TestCase):
         # The Person's yes takes the room over and stops the other queue.
         confirmed = asyncio.run(
             core.run_hydra_kernel_tool(
-                tool_id="custom_music_confirm",
+                tool_id="personal_music_confirm",
                 args={"choice": "yes"},
                 origin={"people_resolution": {"master_user_id": "person_a"}},
                 redis_client=self.redis,
@@ -1773,7 +1773,7 @@ class FollowMeTests(unittest.TestCase):
         core._follow_me_tick(self.redis)
         declined = asyncio.run(
             core.run_hydra_kernel_tool(
-                tool_id="custom_music_confirm",
+                tool_id="personal_music_confirm",
                 args={"choice": "no"},
                 origin={"people_resolution": {"master_user_id": "person_a"}},
                 redis_client=self.redis,
@@ -1887,12 +1887,12 @@ class FollowMeTests(unittest.TestCase):
             },
         )
         note = core._follow_me_pending_note("person_a", self.redis)
-        self.assertIn("custom_music_confirm", note)
+        self.assertIn("personal_music_confirm", note)
         self.assertIn("'yes'", note)
         fragments = core.get_hydra_system_prompt_fragments(
             role="chat", redis_client=self.redis, origin=origin
         )
-        self.assertTrue(any("custom_music_confirm" in m for m in fragments["chat"]))
+        self.assertTrue(any("personal_music_confirm" in m for m in fragments["chat"]))
         # No pending question -> no note (and no fragment without a profile).
         core._clear_pending_confirmation(self.redis, "person_a")
         self.assertEqual(core._follow_me_pending_note("person_a", self.redis), "")
@@ -2020,7 +2020,7 @@ class UpstreamCoexistenceTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.core = load_custom_music_core()
+        cls.core = load_personal_music_core()
         # Snapshot of Tater_Shop's cores/music_core.py this file was renamed
         # from (pre-divergence), kept so coexistence is testable offline.
         upstream_path = (
@@ -2038,7 +2038,7 @@ class UpstreamCoexistenceTests(unittest.TestCase):
         ours = {
             value
             for name, value in vars(self.core).items()
-            if name.isupper() and isinstance(value, str) and "custom_music_core" in value
+            if name.isupper() and isinstance(value, str) and "personal_music_core" in value
         }
         theirs = {
             value
@@ -2048,7 +2048,7 @@ class UpstreamCoexistenceTests(unittest.TestCase):
         overlap = {
             key
             for key in ours & theirs
-            if key.startswith(("music_core", "custom_music_core"))
+            if key.startswith(("music_core", "personal_music_core"))
         }
         self.assertEqual(overlap, set())
 
