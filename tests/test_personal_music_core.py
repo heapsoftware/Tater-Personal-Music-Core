@@ -3502,6 +3502,314 @@ class ResumeDelayTests(unittest.TestCase):
             core._ha_person_location = self._originals["_ha_person_location"]
 
 
+class ResumeRoomTests(unittest.TestCase):
+    """Resume in Another Room: what "resume my music" does from another room."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.core = load_personal_music_core()
+
+    def setUp(self):
+        self.redis = FakeRedis()
+        self.core.redis_client = self.redis
+        self.core._shutdown_stream_server()
+        self.played = []
+        self.stopped = []
+        self.spoken = []
+        self._originals = {}
+
+    def tearDown(self):
+        for name, value in self._originals.items():
+            setattr(self.core, name, value)
+        self.core._shutdown_stream_server()
+
+    def stub_playback(self):
+        self._originals["_play_track"] = self.core._play_track
+
+        def fake_play_track(track, targets, *, volume_percent, start_position_seconds=0.0, **_kwargs):
+            self.played.append(
+                {
+                    "track_id": track.get("id"),
+                    "targets": list(targets),
+                    "start_position": float(start_position_seconds or 0.0),
+                    "volume": volume_percent,
+                }
+            )
+            return {"ok": True, "sent_count": len(targets), "voice_core_sessions": []}
+
+        self.core._play_track = fake_play_track
+        self._originals["_stop_target"] = self.core._stop_target
+
+        def fake_stop_target(targets, *, expected_voice_core_sessions=None):
+            self.stopped.append(list(targets))
+            return []
+
+        self.core._stop_target = fake_stop_target
+        self._originals["_speak_follow_me_prompt"] = self.core._speak_follow_me_prompt
+
+        def fake_speak(targets, text):
+            self.spoken.append({"targets": list(targets), "text": text})
+            return True
+
+        self.core._speak_follow_me_prompt = fake_speak
+
+    def seed_playing_queue(self, person_id, targets, *, position=30.0, elapsed=10.0, duration=180.0):
+        player = {
+            "status": "playing",
+            "provider": "emby",
+            "queue": [_track_row(1, "Jamming", duration), _track_row(2, "Exodus", duration)],
+            "queue_original": [_track_row(1, "Jamming", duration), _track_row(2, "Exodus", duration)],
+            "index": 0,
+            "current": _track_row(1, "Jamming", duration),
+            "targets": targets,
+            "person_id": person_id,
+            "shuffle": False,
+            "repeat": "off",
+            "volume_percent": 60,
+            "mixed_sync_adjustment_ms": 0,
+            "created_at": time.time(),
+            "queue_session_id": f"session-{person_id or 'shared'}",
+            "continuous_radio": True,
+            "continuation_pending": False,
+            "radio_name": "Tater Continuous Radio",
+            "started_at": time.time() - elapsed if position else 0.0,
+            "position_offset_seconds": position,
+            "duration_seconds": duration,
+            "last_error": "",
+        }
+        self.core._save_player(player, self.redis, person_id)
+        return player
+
+    def seed_paused_queue(self, person_id, targets):
+        self.seed_playing_queue(person_id, targets, position=30.0, elapsed=10.0)
+        self.core._pause_player(person_id=person_id, client=self.redis)
+        self.played.clear()
+
+    def link(self, person_id, **extra):
+        link = {"music_source": ""}
+        link.update(extra)
+        self.redis.hset(self.core.PERSON_LINKS_KEY, mapping={person_id: json.dumps(link)})
+
+    def origin_for(self, person_id, selector):
+        return {
+            "people_resolution": {"master_user_id": person_id},
+            "satellite_selector": selector,
+        }
+
+    def run_control(self, action, origin):
+        return asyncio.run(
+            self.core.run_hydra_kernel_tool(
+                tool_id="personal_music_control",
+                args={"action": action},
+                origin=origin,
+                redis_client=self.redis,
+            )
+        )
+
+    # ---- mode resolution ----
+
+    def test_resume_room_mode_resolution(self):
+        core = self.core
+        self.assertEqual(core._person_resume_room_mode("person_a", self.redis), "stay")
+        self.redis.hset(core.SETTINGS_KEY, mapping={"resume_room_mode": "follow"})
+        self.assertEqual(core._person_resume_room_mode("person_a", self.redis), "follow")
+        self.assertEqual(core._person_resume_room_mode("", self.redis), "follow")
+        # Per-Person override wins; invalid falls back to the global.
+        self.link("person_a", resume_room_mode="ask")
+        self.assertEqual(core._person_resume_room_mode("person_a", self.redis), "ask")
+        self.link("person_b", resume_room_mode="yolo")
+        self.assertEqual(core._person_resume_room_mode("person_b", self.redis), "follow")
+        self.link("person_c", resume_room_mode="")
+        self.assertEqual(core._person_resume_room_mode("person_c", self.redis), "follow")
+
+    def test_link_save_persists_resume_room_mode(self):
+        core = self.core
+        people = types.SimpleNamespace(
+            load_store=lambda _client=None: {
+                "people": [{"id": "person_zoe", "display_name": "Zoe"}]
+            }
+        )
+        original_people = core._PEOPLE_API_MODULE
+        core._PEOPLE_API_MODULE = people
+        try:
+            result = core._save_person_link_action(
+                {
+                    "person_link_person_id": "person_zoe",
+                    "person_link_source": "",
+                    "person_link_resume_room_mode": " Follow ",
+                },
+                self.redis,
+            )
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(
+                core._person_link("person_zoe", self.redis)["resume_room_mode"], "follow"
+            )
+            # An invalid select value never wipes the saved choice.
+            result = core._save_person_link_action(
+                {
+                    "person_link_person_id": "person_zoe",
+                    "person_link_source": "",
+                    "person_link_resume_room_mode": "teleport",
+                },
+                self.redis,
+            )
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(
+                core._person_link("person_zoe", self.redis)["resume_room_mode"], "follow"
+            )
+        finally:
+            core._PEOPLE_API_MODULE = original_people
+
+    # ---- the resume itself ----
+
+    def test_follow_mode_moves_the_paused_queue_to_the_speaking_room(self):
+        core = self.core
+        self.stub_playback()
+        self.link("person_a", resume_room_mode="follow")
+        self.seed_paused_queue("person_a", ["voice_core:native:kitchen"])
+        result = self.run_control("resume", self.origin_for("person_a", "office"))
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(len(self.played), 1)
+        self.assertEqual(self.played[-1]["targets"], ["voice_core:office"])
+        self.assertAlmostEqual(self.played[-1]["start_position"], 40.0, delta=1.0)
+        player = core._player(self.redis, "person_a")
+        self.assertEqual(player["targets"], ["voice_core:office"])
+        self.assertEqual(player["status"], "playing")
+        self.assertIn("same spot", result["summary_for_user"])
+
+    def test_follow_mode_stays_put_when_the_speaking_room_is_busy(self):
+        core = self.core
+        self.stub_playback()
+        self.link("person_a", resume_room_mode="follow")
+        self.seed_playing_queue("person_b", ["voice_core:office"])
+        self.seed_paused_queue("person_a", ["voice_core:native:kitchen"])
+        result = self.run_control("resume", self.origin_for("person_a", "office"))
+        self.assertTrue(result.get("ok"), result)
+        # The move was abandoned: person_a's music resumed where it was paused,
+        # and person_b's queue in the office was untouched.
+        self.assertEqual(len(self.played), 1)
+        self.assertEqual(self.played[-1]["targets"], ["voice_core:native:kitchen"])
+        self.assertAlmostEqual(self.played[-1]["start_position"], 40.0, delta=1.0)
+        self.assertEqual(core._player(self.redis, "person_a")["targets"], ["voice_core:native:kitchen"])
+        self.assertEqual(core._player(self.redis, "person_b")["status"], "playing")
+        self.assertIn("was still playing", result["summary_for_user"])
+        # The busy room kept ownership: no takeover question, no interruption.
+        self.assertEqual(self.spoken, [])
+        self.assertEqual(core._load_pending_confirmation(self.redis, "person_a"), {})
+
+    def test_stay_mode_keeps_the_nearby_room_wins_rule(self):
+        core = self.core
+        self.stub_playback()
+        # Default mode: a foreign queue paused in the speaking room is acted on
+        # first, exactly as before.
+        self.seed_paused_queue("person_b", ["voice_core:office"])
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"])
+        self.core._pause_player(person_id="person_a", client=self.redis)
+        self.played.clear()
+        result = self.run_control("resume", self.origin_for("person_a", "office"))
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(self.played[-1]["targets"], ["voice_core:office"])
+        # With no queue near the speaker, their own queue resumes in place.
+        self.core._stop_player(person_id="person_b", client=self.redis)
+        self.played.clear()
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"])
+        self.core._pause_player(person_id="person_a", client=self.redis)
+        self.played.clear()
+        result = self.run_control("resume", self.origin_for("person_a", "office"))
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(self.played[-1]["targets"], ["voice_core:native:kitchen"])
+        self.assertEqual(core._player(self.redis, "person_a")["targets"], ["voice_core:native:kitchen"])
+
+    def test_ask_mode_asks_then_resumes_where_answered(self):
+        core = self.core
+        self.stub_playback()
+        self.link("person_a", resume_room_mode="ask")
+        self.seed_paused_queue("person_a", ["voice_core:native:kitchen"])
+        # Nothing plays yet; the room gets the question instead.
+        result = self.run_control("resume", self.origin_for("person_a", "office"))
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(self.played, [])
+        self.assertEqual(len(self.spoken), 1)
+        self.assertIn("resume it here", self.spoken[-1]["text"])
+        self.assertEqual(self.spoken[-1]["targets"], ["voice_core:office"])
+        pending = core._load_pending_confirmation(self.redis, "person_a")
+        self.assertEqual(pending.get("type"), "resume_room")
+        self.assertEqual(pending.get("targets"), ["voice_core:office"])
+        # "here" moves it into the speaking room at the same spot.
+        result = asyncio.run(
+            core.run_hydra_kernel_tool(
+                tool_id="personal_music_confirm",
+                args={"choice": "here"},
+                origin=self.origin_for("person_a", "office"),
+                redis_client=self.redis,
+            )
+        )
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(len(self.played), 1)
+        self.assertEqual(self.played[-1]["targets"], ["voice_core:office"])
+        self.assertAlmostEqual(self.played[-1]["start_position"], 40.0, delta=1.0)
+        # Again from the top; "there" leaves it where it was paused.
+        self.seed_paused_queue("person_a", ["voice_core:native:kitchen"])
+        self.run_control("resume", self.origin_for("person_a", "office"))
+        result = asyncio.run(
+            core.run_hydra_kernel_tool(
+                tool_id="personal_music_confirm",
+                args={"choice": "there"},
+                origin=self.origin_for("person_a", "office"),
+                redis_client=self.redis,
+            )
+        )
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(self.played[-1]["targets"], ["voice_core:native:kitchen"])
+        self.assertAlmostEqual(self.played[-1]["start_position"], 40.0, delta=1.0)
+
+    def test_ask_mode_resumes_in_place_when_the_room_is_busy(self):
+        core = self.core
+        self.stub_playback()
+        self.link("person_a", resume_room_mode="ask")
+        self.seed_playing_queue("person_b", ["voice_core:office"])
+        self.seed_paused_queue("person_a", ["voice_core:native:kitchen"])
+        result = self.run_control("resume", self.origin_for("person_a", "office"))
+        self.assertTrue(result.get("ok"), result)
+        # Asking would be pointless (this room is taken): it just resumes.
+        self.assertEqual(self.spoken, [])
+        self.assertEqual(core._load_pending_confirmation(self.redis, "person_a"), {})
+        self.assertEqual(self.played[-1]["targets"], ["voice_core:native:kitchen"])
+
+    def test_follow_mode_applies_the_transfer_resume_delay(self):
+        core = self.core
+        self.stub_playback()
+        self.redis.hset(core.SETTINGS_KEY, mapping={"transfer_resume_delay_seconds": "15"})
+        self.link("person_a", resume_room_mode="follow")
+        self.seed_paused_queue("person_a", ["voice_core:native:kitchen"])
+        result = self.run_control("resume", self.origin_for("person_a", "office"))
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(self.played, [])
+        player = core._player(self.redis, "person_a")
+        self.assertEqual(player["targets"], ["voice_core:office"])
+        self.assertEqual(player["status"], "paused")
+        self.assertAlmostEqual(player["resume_delay_until"] - time.time(), 15.0, delta=2.0)
+        self.assertIn("resumes there in 15 seconds", result["summary_for_user"])
+        # Once the wait elapses it starts at the saved spot in the new room.
+        player["resume_delay_until"] = time.time() - 1.0
+        core._save_player(player, self.redis, "person_a")
+        core._delayed_resume_tick(self.redis, "person_a")
+        self.assertEqual(len(self.played), 1)
+        self.assertEqual(self.played[-1]["targets"], ["voice_core:office"])
+        self.assertAlmostEqual(self.played[-1]["start_position"], 40.0, delta=1.0)
+
+    def test_follow_mode_never_reroutes_within_the_same_room(self):
+        core = self.core
+        self.stub_playback()
+        self.link("person_a", resume_room_mode="follow")
+        self.seed_paused_queue("person_a", ["voice_core:office"])
+        result = self.run_control("resume", self.origin_for("person_a", "office"))
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(len(self.played), 1)
+        self.assertEqual(self.played[-1]["targets"], ["voice_core:office"])
+        self.assertAlmostEqual(self.played[-1]["start_position"], 40.0, delta=1.0)
+
+
 class UpstreamCoexistenceTests(unittest.TestCase):
     """Both this core and the upstream Music Core enabled side by side."""
 
