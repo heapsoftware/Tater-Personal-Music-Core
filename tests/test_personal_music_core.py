@@ -3033,5 +3033,504 @@ class UpstreamCoexistenceTests(unittest.TestCase):
             self.upstream._provider = original_upstream_provider
 
 
+def _share_track_row(number, title, root_tag="a"):
+    """A share-provider track with ids unique to its share root."""
+    core = sys.modules.get("personal_music_core_test_module")
+    rel_path = f"{root_tag}/song{number}.mp3"
+    row = _track_row(number, title)
+    row["provider"] = "network_share"
+    row["path"] = rel_path
+    row["id"] = "track:" + f"{root_tag}{number}"
+    if core is not None:
+        row["provider_track_id"] = core._share_scoped_stream_id(rel_path, f"/mnt/music/{root_tag}")
+    return row
+
+
+class EndlessPlaybackTests(unittest.TestCase):
+    """Endless Playback modes, Smart Shuffle, sleep timers, and multi-source links."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.core = load_personal_music_core()
+
+    def setUp(self):
+        self.redis = FakeRedis()
+        self.core.redis_client = self.redis
+        self.core._shutdown_stream_server()
+        self.played = []
+        self.stopped = []
+        self._originals = {}
+        self.stub_playback()
+
+    def tearDown(self):
+        for name, value in self._originals.items():
+            setattr(self.core, name, value)
+        self.core._shutdown_stream_server()
+        self.core.STREAMING_PROVIDER_CLASSES.pop("test_stream", None)
+
+    def stub_playback(self):
+        self._originals["_play_track"] = self.core._play_track
+
+        def fake_play_track(track, targets, *, volume_percent, start_position_seconds=0.0, **_kwargs):
+            self.played.append({"track_id": track.get("id"), "targets": list(targets)})
+            return {"ok": True, "sent_count": len(targets), "voice_core_sessions": []}
+
+        self.core._play_track = fake_play_track
+        self._originals["_stop_target"] = self.core._stop_target
+
+        def fake_stop_target(targets, *, expected_voice_core_sessions=None):
+            self.stopped.append(list(targets))
+            return []
+
+        self.core._stop_target = fake_stop_target
+
+    def seed_person_catalog(self, person_id, tracks):
+        self.core._save_json(
+            self.redis,
+            self.core._catalog_key(person_id),
+            {"provider": "emby", "tracks": tracks, "synced_at": time.time()},
+        )
+
+    def seed_playing_queue(self, person_id, tracks, *, index=0):
+        player = {
+            "status": "playing",
+            "provider": "emby",
+            "queue": [dict(track) for track in tracks],
+            "queue_original": [dict(track) for track in tracks],
+            "index": index,
+            "current": tracks[index],
+            "targets": ["voice_core:native:kitchen"],
+            "person_id": person_id,
+            "shuffle": False,
+            "repeat": "off",
+            "volume_percent": 60,
+            "queue_session_id": "session-1",
+            "continuous_radio": True,
+            "continuation_pending": False,
+            "radio_name": "Tater Continuous Radio",
+            "started_at": time.time() - 5.0,
+            "position_offset_seconds": 5.0,
+            "duration_seconds": 180.0,
+        }
+        self.core._save_player(player, self.redis, person_id)
+        return player
+
+    # ---- Endless Playback modes ----
+
+    def test_endless_mode_inherits_global_and_overrides_per_person(self):
+        core = self.core
+        self.save = lambda mapping: core._save_hash(self.redis, core.SETTINGS_KEY, mapping)
+        # Default stays the original LLM radio behaviour.
+        self.assertEqual(core._endless_mode_for_queue({"queue_id": ""}, self.redis), "llm_auto")
+        self.save({"endless_playback_mode": "library_mix"})
+        self.assertEqual(core._endless_mode_for_queue({"queue_id": ""}, self.redis), "library_mix")
+        # A linked Person can pick their own mode.
+        core._save_person_link(
+            "p1", {"endless_playback_mode": "playlist_loop"}, self.redis
+        )
+        self.assertEqual(core._endless_mode_for_queue({"queue_id": "p1"}, self.redis), "playlist_loop")
+        # An unknown mode falls back to the global setting.
+        core._save_person_link("p2", {"endless_playback_mode": "bogus"}, self.redis)
+        self.assertEqual(core._endless_mode_for_queue({"queue_id": "p2"}, self.redis), "library_mix")
+
+    def test_library_mix_prioritises_least_played_and_nearby_genres(self):
+        core = self.core
+        tracks = [
+            dict(_track_row(1, "Heard A", 180.0), artist="A", album_artist="A", genres=["reggae"], genre="reggae"),
+            dict(_track_row(2, "Never Played B", 180.0), artist="B", album_artist="B", genres=["jazz"], genre="jazz"),
+            dict(_track_row(3, "Never Played C", 180.0), artist="C", album_artist="C", genres=["reggae"], genre="reggae"),
+            dict(_track_row(4, "Heard B", 180.0), artist="D", album_artist="D", genres=["reggae"], genre="reggae"),
+        ]
+        self.seed_person_catalog("p1", tracks)
+        # Tracks 1 and 4 were already played; track 1 is a recent play.
+        for number in (1, 4):
+            core._record_listening_history(
+                tracks[number - 1],
+                client=self.redis,
+                person_id="p1",
+            )
+        player = self.seed_playing_queue("p1", [tracks[0]], index=0)
+        batch = core._library_mix_tracks(player, self.redis, count=4, person_id="p1")
+        ids = [track["id"] for track in batch]
+        # The track already playing is never appended again.
+        self.assertEqual(set(ids), {"track:2", "track:3", "track:4"})
+        # Genre relevance leads (the queue is listening to reggae), then the
+        # least-played reggae track, and the jazz track (least-played but off
+        # genre) fills the gap after them.
+        self.assertEqual(ids, ["track:3", "track:4", "track:2"])
+
+    def test_playlist_loop_mode_loops_the_chosen_mix(self):
+        core = self.core
+        core._save_hash(
+            self.redis,
+            core.SETTINGS_KEY,
+            {"endless_playback_mode": "playlist_loop", "endless_playback_playlist": "Chill Mix"},
+        )
+        tracks = [_track_row(1, "One"), _track_row(2, "Two"), _track_row(3, "Three")]
+        self.seed_person_catalog("p1", tracks)
+        core._save_json(
+            self.redis,
+            core._recommendations_key("p1"),
+            {
+                "provider": "emby",
+                "playlists": [{"id": "mix1", "name": "Chill Mix", "track_ids": ["track:1", "track:2"]}],
+            },
+        )
+        player = self.seed_playing_queue("p1", [tracks[0]], index=0)
+        # A one-track refill skips what's already queued...
+        batch, playlist, _offset = core._playlist_loop_tracks(player, self.redis, count=1)
+        self.assertEqual(playlist.get("name"), "Chill Mix")
+        self.assertEqual([track["id"] for track in batch], ["track:2"])
+        # ...and a two-track loop over a two-track playlist wraps to itself.
+        batch, _playlist, _offset = core._playlist_loop_tracks(player, self.redis, count=2)
+        self.assertEqual({track["id"] for track in batch}, {"track:1", "track:2"})
+        # A person-level pick overrides the global playlist name.
+        core._save_person_link("p1", {"endless_playback_playlist": "Missing"}, self.redis)
+        batch, _playlist, _offset = core._playlist_loop_tracks(player, self.redis, count=2)
+        self.assertEqual(batch, [])
+
+    def test_continuation_impl_dispatches_modes_without_the_llm(self):
+        core = self.core
+        core._save_hash(self.redis, core.SETTINGS_KEY, {"endless_playback_mode": "library_mix"})
+        tracks = [
+            dict(_track_row(number, f"S{number}"), genres=["reggae"], genre="reggae")
+            for number in range(1, 8)
+        ]
+        self.seed_person_catalog("p1", tracks)
+        player = self.seed_playing_queue("p1", tracks[:3], index=2)
+        loop = asyncio.new_event_loop()
+        try:
+            added = core._generate_continuation_impl(loop, None, player, "session-1", self.redis)
+        finally:
+            loop.close()
+        self.assertGreater(added, 0)
+        updated = core._player(self.redis, "p1")
+        appended = [track["id"] for track in updated["queue"][3:]]
+        self.assertTrue(appended)
+        self.assertNotIn("track:1", appended)
+        # The refill records which mode fed it.
+        self.assertEqual(updated.get("radio_source"), "library_mix")
+
+    def test_automatic_mode_falls_back_to_the_library_mix(self):
+        core = self.core
+        core._save_hash(self.redis, core.SETTINGS_KEY, {"endless_playback_mode": "automatic"})
+        tracks = [
+            dict(_track_row(number, f"S{number}"), genres=["jazz"], genre="jazz")
+            for number in range(1, 6)
+        ]
+        self.seed_person_catalog("p1", tracks)
+        player = self.seed_playing_queue("p1", tracks[:2], index=1)
+        # No streaming provider is registered, so the library mix feeds the queue.
+        fallback = core._fallback_continuation_tracks(player, self.redis, count=3)
+        self.assertTrue(fallback)
+        self.assertTrue(all(track["provider"] == "emby" for track in fallback))
+
+    def test_streaming_provider_delivers_similar_tracks(self):
+        core = self.core
+
+        class FakeStreamProvider:
+            provider_id = "test_stream"
+
+            def __init__(self, settings):
+                self.settings = settings
+
+            @classmethod
+            def from_settings(cls, settings):
+                return cls(settings)
+
+            @property
+            def connected(self):
+                return True
+
+            def similar_tracks(self, seed_tracks, *, count=12):
+                return [
+                    {"id": f"stream:{index}", "title": f"Stream {index}", "provider": "test_stream"}
+                    for index in range(1, count + 1)
+                ]
+
+        core.STREAMING_PROVIDER_CLASSES["test_stream"] = FakeStreamProvider
+        core._save_hash(self.redis, core.SETTINGS_KEY, {"endless_playback_mode": "similar_played"})
+        tracks = [_track_row(1, "Seed"), _track_row(2, "Filler")]
+        self.seed_person_catalog("p1", tracks)
+        player = self.seed_playing_queue("p1", tracks, index=0)
+        loop = asyncio.new_event_loop()
+        try:
+            added = core._generate_continuation_impl(loop, None, player, "session-1", self.redis)
+        finally:
+            loop.close()
+        self.assertGreater(added, 0)
+        updated = core._player(self.redis, "p1")
+        stream_tracks = [track for track in updated["queue"] if track["id"].startswith("stream:")]
+        self.assertTrue(stream_tracks)
+        self.assertEqual(updated.get("radio_source"), "streaming_provider")
+
+    def test_streaming_provider_registry_empty_by_default(self):
+        self.assertEqual(self.core.STREAMING_PROVIDER_CLASSES, {})
+        # With no providers connected the scaffolding answers an empty list.
+        self.assertEqual(
+            self.core._streaming_similar_tracks([{"id": "track:1"}], client=self.redis),
+            [],
+        )
+
+    # ---- Smart Shuffle ----
+
+    def test_smart_shuffle_pushes_recent_to_back_and_windows_the_pool(self):
+        core = self.core
+        core._save_hash(self.redis, core.SETTINGS_KEY, {"smart_shuffle_enabled": True})
+        tracks = [_track_row(number, f"Song {number}") for number in range(1, 41)]
+        self.seed_person_catalog("p1", tracks)
+        # The person recently played tracks 1-3; they must land at the back.
+        for number in (1, 2, 3):
+            core._record_listening_history(
+                tracks[number - 1],
+                client=self.redis,
+                person_id="p1",
+            )
+        player = core._create_and_start_queue(
+            [dict(track) for track in tracks],
+            targets=["voice_core:native:kitchen"],
+            shuffle=True,
+            volume_percent=50,
+            person_id="p1",
+            client=self.redis,
+        )
+        self.assertTrue(player.get("smart_shuffle"))
+        self.assertEqual(len(player["queue"]), core.SMART_SHUFFLE_QUEUE_WINDOW)
+        self.assertEqual(len(player.get("smart_pool")), len(tracks) - core.SMART_SHUFFLE_QUEUE_WINDOW)
+        # The full stored ordering (window + pool) keeps recent tracks last.
+        ordering = [track["id"] for track in player["queue"]] + [
+            track["id"] for track in player["smart_pool"]
+        ]
+        self.assertLess(ordering.index("track:1"), 40)
+        # The recently played tracks fill the back (order within is shuffled).
+        self.assertEqual(set(ordering[-3:]), {"track:1", "track:2", "track:3"})
+
+    def test_smart_shuffle_off_keeps_full_queue(self):
+        core = self.core
+        tracks = [_track_row(number, f"Song {number}") for number in range(1, 41)]
+        player = core._create_and_start_queue(
+            [dict(track) for track in tracks],
+            targets=["voice_core:native:kitchen"],
+            shuffle=True,
+            volume_percent=50,
+            person_id="p1",
+            client=self.redis,
+        )
+        self.assertFalse(player.get("smart_shuffle"))
+        self.assertEqual(len(player["queue"]), len(tracks))
+        self.assertEqual(player.get("smart_pool"), [])
+
+    def test_smart_round_robin_alternates_sources(self):
+        core = self.core
+        pool = []
+        for number in range(1, 7):
+            pool.append({**_track_row(number, f"A{number}"), "source_label": "Album A"})
+        for number in range(7, 13):
+            pool.append({**_track_row(number, f"B{number}"), "source_label": "Playlist B"})
+        selected, remaining = core._smart_round_robin(pool, 6)
+        labels = [track["source_label"] for track in selected]
+        self.assertEqual(
+            labels,
+            ["Album A", "Playlist B", "Album A", "Playlist B", "Album A", "Playlist B"],
+        )
+        self.assertEqual(len(remaining), 6)
+
+    def test_add_action_pours_into_the_smart_pool(self):
+        core = self.core
+        core._save_hash(self.redis, core.SETTINGS_KEY, {"smart_shuffle_enabled": True})
+        tracks = [_track_row(number, f"Song {number}") for number in range(1, 41)]
+        self.seed_person_catalog("p1", tracks)
+        player = core._create_and_start_queue(
+            [dict(track) for track in tracks[:30]],
+            targets=["voice_core:native:kitchen"],
+            shuffle=True,
+            volume_percent=50,
+            person_id="p1",
+            client=self.redis,
+        )
+        result = core._add_queue_tracks(
+            {"album": "Exodus", "source_label": "Album: Exodus"},
+            origin={"person_id": "p1"},
+            client=self.redis,
+        )
+        # The 10 tracks the window had no room for wait in the pool; the top-up
+        # pulls one in immediately to keep the window full.
+        updated = core._player(self.redis, "p1")
+        self.assertEqual(result["added"], 10)
+        self.assertEqual(len(updated["smart_pool"]), 9)
+        self.assertEqual(len(updated["queue"]), core.SMART_SHUFFLE_QUEUE_WINDOW + 1)
+        # Without Smart Shuffle the same request appends plainly.
+        core._save_hash(self.redis, core.SETTINGS_KEY, {"smart_shuffle_enabled": False})
+        result = core._add_queue_tracks(
+            {"album": "Exodus", "source_label": "Album: Exodus"},
+            origin={"person_id": "p1"},
+            client=self.redis,
+        )
+        self.assertEqual(result["added"], 0)  # already queued: no duplicates
+
+    # ---- Sleep timers ----
+
+    def test_sleep_timer_force_stops_at_zero_and_blocks_refills(self):
+        core = self.core
+        tracks = [_track_row(1, "One"), _track_row(2, "Two"), _track_row(3, "Three")]
+        player = self.seed_playing_queue("p1", tracks, index=0)
+        player["smart_pool"] = [dict(_track_row(9, "Pooled"))]
+        core._save_player(player, self.redis, "p1")
+        # Nothing happens before the countdown ends.
+        core._set_sleep_timer(30, person_id="p1", client=self.redis)
+        self.assertIsNone(core._sleep_timer_tick(self.redis, "p1"))
+        self.assertEqual(core._player(self.redis, "p1")["status"], "playing")
+        # At zero the stream is force-stopped and every refill path is closed.
+        player = core._player(self.redis, "p1")
+        player["sleep_timer_ends_at"] = time.time() - 1.0
+        core._save_player(player, self.redis, "p1")
+        stopped = core._sleep_timer_tick(self.redis, "p1")
+        self.assertIsNotNone(stopped)
+        updated = core._player(self.redis, "p1")
+        self.assertEqual(updated["status"], "stopped")
+        self.assertEqual(updated["sleep_timer_ends_at"], 0.0)
+        self.assertFalse(updated.get("continuous_radio"))
+        self.assertEqual(updated.get("smart_pool"), [])
+        # A continuation worker still holding the old session token cannot append.
+        stale_added = core._append_continuation_tracks(
+            "session-1",
+            [_track_row(5, "Late refill")],
+            station_name="Radio",
+            person_id="p1",
+            client=self.redis,
+        )
+        self.assertEqual(stale_added, 0)
+
+    def test_sleep_timer_cancel_and_voice_minutes(self):
+        core = self.core
+        core._set_sleep_timer(60, person_id="p1", client=self.redis)
+        player = core._player(self.redis, "p1")
+        self.assertTrue(core._sleep_timer_state(player)["active"])
+        self.assertEqual(player["sleep_timer_minutes"], 60)
+        core._set_sleep_timer(0, person_id="p1", client=self.redis)
+        self.assertFalse(core._sleep_timer_state(core._player(self.redis, "p1"))["active"])
+        # Requests above the cap clamp to 12 hours.
+        core._set_sleep_timer(100000, person_id="p1", client=self.redis)
+        self.assertEqual(core._player(self.redis, "p1")["sleep_timer_minutes"], core.SLEEP_TIMER_MAX_MINUTES)
+
+    # ---- Multiple sources per Person ----
+
+    def test_multi_source_link_resolution_and_merged_catalog(self):
+        core = self.core
+        core._save_person_link(
+            "p1",
+            {
+                "music_source": "emby",
+                "emby": {"server_url": "http://emby.local:8096", "username": "alex"},
+                "extra_source": "network_share",
+                "extra": {"root_path": "/mnt/music/alex-more"},
+            },
+            self.redis,
+        )
+        self.assertEqual(core._person_link_sources(core._person_link("p1", self.redis)), ["emby", "network_share"])
+        # The primary and extra providers build from their own configs.
+        primary = core._person_link_provider("p1", "emby", self.redis)
+        extra = core._person_link_provider("p1", "network_share", self.redis)
+        self.assertEqual(primary.server_url, "http://emby.local:8096")
+        self.assertEqual(extra.root_path, "/mnt/music/alex-more")
+        # The extra source streams (and syncs) under its own catalog slot.
+        self.assertEqual(core._person_extra_slot("p1", "network_share"), "p1+network_share")
+        # Merged catalog: both sources' tracks in one payload, per-track provider kept.
+        self.seed_person_catalog("p1", [_track_row(1, "Emby Song")])
+        core._save_json(
+            self.redis,
+            core._catalog_key(core._person_extra_slot("p1", "network_share")),
+            {
+                "provider": "network_share",
+                "tracks": [
+                    dict(_track_row(2, "Share Song"), provider="network_share"),
+                ],
+                "synced_at": time.time(),
+            },
+        )
+        merged = core._person_catalog(self.redis, "emby", "p1")
+        self.assertEqual(
+            [track["title"] for track in merged["tracks"]],
+            ["Emby Song", "Share Song"],
+        )
+        self.assertEqual([track["provider"] for track in merged["tracks"]], ["emby", "network_share"])
+        # Search spans both sources.
+        matches = core._search_tracks(query="share", client=self.redis, person_id="p1")
+        self.assertEqual([track["title"] for track in matches], ["Share Song"])
+
+    def test_single_source_persons_keep_their_catalog_semantics(self):
+        core = self.core
+        core._save_person_link(
+            "p1",
+            {"music_source": "network_share", "network_share": {"root_path": "/mnt/music/alex"}},
+            self.redis,
+        )
+        self.assertEqual(core._person_catalog_source_ids("p1", self.redis), ["network_share"])
+        self.assertEqual(core._person_catalog_source_ids("p2", self.redis), ["emby"])
+
+    def test_share_stream_ids_carry_their_root(self):
+        core = self.core
+        scoped = core._share_scoped_stream_id("song1.mp3", "/mnt/music/alex")
+        root, rel_path = core._share_root_and_relpath_from_id(scoped, "/mnt/global")
+        self.assertEqual(root, "/mnt/music/alex")
+        self.assertEqual(rel_path, "song1.mp3")
+        # Legacy (unscoped) ids keep resolving against the global root.
+        legacy = core._share_stream_id("song1.mp3")
+        root, rel_path = core._share_root_and_relpath_from_id(legacy, "/mnt/global")
+        self.assertEqual(root, "/mnt/global")
+        self.assertEqual(rel_path, "song1.mp3")
+        # Per-root artwork indexes stay separate from the household's.
+        self.core._save_hash(self.redis, core.SETTINGS_KEY, {"share_root_path": "/mnt/global"})
+        self.assertEqual(core._share_art_index_key("/mnt/global"), core.SHARE_ART_INDEX_KEY)
+        self.assertNotEqual(core._share_art_index_key("/mnt/music/alex"), core.SHARE_ART_INDEX_KEY)
+
+    def test_link_save_persists_the_second_source(self):
+        core = self.core
+        people = types.SimpleNamespace(
+            load_store=lambda _client=None: {
+                "people": [{"id": "person_zoe", "display_name": "Zoe"}]
+            }
+        )
+        original_people = core._PEOPLE_API_MODULE
+        core._PEOPLE_API_MODULE = people
+        core._save_hash(
+            self.redis,
+            core.SETTINGS_KEY,
+            {"emby_server_url": "http://emby.local:8096"},
+        )
+        try:
+            result = core._save_person_link_action(
+                {
+                    "person_link_person_id": "person_zoe",
+                    "person_link_source": "emby",
+                    "person_link_emby_server_url": "http://emby.local:8096",
+                    "person_link_emby_username": "alex",
+                    "person_link_extra_source": "network_share",
+                    "person_link_extra_share_root_path": "/mnt/music/alex-more",
+                },
+                self.redis,
+            )
+            self.assertTrue(result["ok"])
+            link = core._person_link("person_zoe", self.redis)
+            self.assertEqual(link.get("extra_source"), "network_share")
+            self.assertEqual(link.get("extra", {}).get("root_path"), "/mnt/music/alex-more")
+            # Clearing the second source removes both keys again.
+            core._save_person_link_action(
+                {
+                    "person_link_person_id": "person_zoe",
+                    "person_link_source": "emby",
+                    "person_link_emby_server_url": "http://emby.local:8096",
+                    "person_link_emby_username": "alex",
+                    "person_link_extra_source": "",
+                },
+                self.redis,
+            )
+            link = core._person_link("person_zoe", self.redis)
+            self.assertNotIn("extra_source", link)
+            self.assertNotIn("extra", link)
+        finally:
+            core._PEOPLE_API_MODULE = original_people
+
+
 if __name__ == "__main__":
     unittest.main()

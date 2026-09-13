@@ -80,12 +80,64 @@ Vorbis/Opus, MP4/M4A, WAV — no extra packages needed), reads embedded or
 that card; **Edit** on a linked Person's card reopens it). Each Person can get:
 
 - their own Emby user/library on a shared server, or
-- their own subfolder on a mounted share (e.g. `/mnt/music/<person>`).
+- their own subfolder on a mounted share (e.g. `/mnt/music/<person>`), or
+- **both at once** — a second linked source (another Emby account/library, or a
+  second share folder) merges into one catalog under the same card's
+  **Second Music Source** setting.
 
 A linked Person gets their own catalog, listening history, AI-named
 recommendations, and prompt-ready music profile, scoped under
 `personal_music_core:*:<person_id>` keys. Everyone else follows the global source.
 Voice requests resolve the speaking Person automatically.
+
+### Endless Playback
+
+When a Person's queue reaches its final track, the queue keeps playing. Pick how
+globally in the core settings, or per Person on their link card (**Their Endless
+Playback**):
+
+- **Automatic** — fetches similar tracks from a connected streaming provider and
+  falls back to an **Infinite Mix** drawn from the library.
+- **Basic Auto (LLM)** — the original behaviour: Tater's AI model picks similar
+  library tracks and names the radio station.
+- **Infinite Mix from your library** — works entirely offline: prioritises
+  least-played tracks, biases toward the genres the queue was just hearing, and
+  fills the gaps with varied random picks. No streaming provider needed.
+- **Similar to what you played** — relies purely on streaming providers; until
+  one is connected it falls back to the library mix so the music never stops.
+- **Tracks from a playlist** — continuously loops one chosen playlist (an AI-named
+  mix from the Recommendations tab; pick it globally or per Person).
+
+Streaming providers (Spotify, Apple Music, …) are not built in yet, but the
+core carries the provider scaffolding for them: the provider-backed modes call a
+provider registry (`STREAMING_PROVIDER_CLASSES`) that fans out to every
+connected streaming provider, so plugging one in later is an additive change.
+
+### Smart Shuffle
+
+Per Person (or globally) with the **Smart Shuffle** settings. Instead of a purely
+random shuffle, Smart Shuffle pushes recently played tracks to the back of the
+queue to keep things fresh, and it handles multiple sources at once: queue two
+albums and two playlists together (voice: *"add this album to the queue"* /
+`personal_music_control` with `action:"add"`) and Smart Shuffle mixes them on the
+fly — the on-screen queue stays a rolling window while a pool feeds tracks from
+all queued sources in turn, instead of building one enormous queue up front.
+
+### Sleep timers
+
+From a Person's card (**Sleep 30m / Sleep 60m / Cancel Timer**), from the Music
+Player card's **Sleep Timer (minutes)** field, or by voice (*"play my music for
+an hour"*). The countdown tracks the active player; when it hits zero the timer
+**force-stops the stream** — a hard override that bypasses Endless Playback,
+Smart Shuffle pools, and any in-flight radio refill, so nothing keeps streaming
+while you doze off.
+
+### Room-to-room transfer
+
+*"Transfer my music to the Master Bedroom"* (`personal_music_move`, or the
+control tool's `move`/`set_targets` action, or the Music Player card's
+**Play On / Set Player** destinations): the whole populated queue and the exact
+spot in the song move with you.
 
 For **Emby (own user/library)**, fill in the Person's card in **People**:
 
@@ -197,13 +249,25 @@ enable.
 | --- | --- | --- |
 | Stream Server Port | `8621` | Local HTTP port the core serves token-authenticated Emby streams and share files from. Must be reachable from your playback targets on the LAN. |
 | Stream Host | auto | Override only if the auto-detected LAN address is wrong (e.g. multiple NICs). |
-| Catalog Sync Interval | `900` s | Also drives per-person catalog refreshes. |
+| Catalog Sync Interval | `900` s | Also drives per-person catalog refreshes (each linked source gets its own). |
+| Endless Playback | `Basic Auto (LLM)` | How queues keep playing after their final track (see [Endless Playback](#endless-playback)); per-Person override on the link card. |
+| Endless Playback Playlist | blank | Playlist looped by the "Tracks from a playlist" mode. |
+| Smart Shuffle | off | History-aware shuffle with on-the-fly multi-source mixing; per-Person override on the link card. |
 | Follow-Me Presence | off | Master switch for following linked People's Home Assistant person entities (see [Follow-Me presence](#follow-me-presence)). |
 | Follow-Me Poll Interval | `15` s | How often HA is polled for each tracked Person (5–3600 s). |
 | Follow-Me Move Delay | `20` s | How long a new zone must hold before the music moves (prevents hallway flicker). |
 
 ## Limitations
 
+- **Smart fading (BPM-aware crossfade) is not implemented** — it needs changes
+  to the Tater host's playback engine (`media_playback`), so it is written up as
+  a feature request in
+  `docs/feature-requests/playback-engine-smart-bpm-crossfade.md` instead.
+- A Person can link **two** sources (one primary plus one second source, any
+  mix of Emby accounts and share folders); more would need a longer form.
+- Streaming providers (Spotify, Apple Music, …) are not built in; the
+  provider-backed Endless Playback modes fall back to the library until one is
+  added via the provider registry.
 - Little Spud client music is not switched over — the Tater host currently links
   client music to the stock `music_core` only, and this core's client music
   surface (`run_client_music_action`, `get_client_music_stream_source`) follows

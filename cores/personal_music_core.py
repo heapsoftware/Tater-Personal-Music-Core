@@ -53,13 +53,15 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "2.5.0"
+__version__ = "3.0.0"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
-    "Per-person music for Tater: link each Person to their own Emby user or network-share folder, browse and play "
-    "their library with voice control, and build AI-named recommendations from each Person's listening history "
-    "across clock-synchronized satellites, native Sonos groups, stereo pairs, and media players — with optional "
-    "Follow-Me presence that moves a Person's music to the room their Home Assistant person entity reports."
+    "Per-person music for Tater: link each Person to their own Emby user or network-share folder (or both), browse "
+    "and play their library with voice control, and build AI-named recommendations from each Person's listening "
+    "history across clock-synchronized satellites, native Sonos groups, stereo pairs, and media players — with "
+    "selectable Endless Playback modes (AI radio, offline Infinite Mix, or looping a chosen playlist), Smart "
+    "Shuffle that mixes several queued sources on the fly, per-Person sleep timers, and optional Follow-Me "
+    "presence that moves a Person's music to the room their Home Assistant person entity reports."
 )
 TAGS = [
     "music",
@@ -78,6 +80,25 @@ TAGS = [
 
 logger = logging.getLogger("personal_music_core")
 logger.setLevel(logging.INFO)
+
+# Endless Playback: how a queue keeps playing once it reaches its final track.
+# Modes that need a streaming provider (Spotify, Apple Music, …) fall back to
+# the library mix until one is connected, so music never stops.
+ENDLESS_PLAYBACK_MODES = (
+    "llm_auto",  # the original behaviour: AI (LLM) picks similar tracks from the library
+    "automatic",  # streaming providers first, then an Infinite Mix from the library
+    "library_mix",  # Infinite Mix drawn straight from the library (works fully offline)
+    "similar_played",  # streaming providers only (library fallback keeps music playing)
+    "playlist_loop",  # loop tracks from one chosen playlist
+)
+DEFAULT_ENDLESS_PLAYBACK_MODE = "llm_auto"
+# Listening-history window that counts as "recently played" for the library mix
+# and Smart Shuffle (events, not tracks).
+SMART_SHUFFLE_RECENT_EVENTS = 40
+# Smart Shuffle keeps the on-screen queue to a rolling window and holds the rest
+# of the selection in a pool it draws from as the queue drains (mixing sources
+# on the fly instead of building one enormous queue up front).
+SMART_SHUFFLE_QUEUE_WINDOW = 30
 
 CORE_SETTINGS = {
     "category": "Personal Music Core Settings",
@@ -273,6 +294,50 @@ CORE_SETTINGS = {
                 "speakers (a dead room) or outside the home. Music paused by Follow-Me resumes "
                 "automatically when they reappear in a room with speakers. Each Person can "
                 "override this on their link card."
+            ),
+        },
+        "endless_playback_mode": {
+            "label": "Endless Playback",
+            "type": "select",
+            "default": DEFAULT_ENDLESS_PLAYBACK_MODE,
+            "options": [
+                {"value": "automatic", "label": "Automatic"},
+                {"value": "llm_auto", "label": "Basic Auto (LLM)"},
+                {"value": "library_mix", "label": "Infinite Mix from your library"},
+                {"value": "similar_played", "label": "Similar to what you played"},
+                {"value": "playlist_loop", "label": "Tracks from a playlist"},
+            ],
+            "description": (
+                "How queues keep playing after their final track. Automatic fetches similar "
+                "tracks from a connected streaming provider and falls back to an Infinite Mix "
+                "from your library; Basic Auto (LLM) has the AI model pick similar library "
+                "tracks (the original behaviour); Infinite Mix draws from your library "
+                "prioritising least-played tracks in the genres you were just hearing; Similar "
+                "to what you played relies on streaming providers (until one is connected it "
+                "falls back to the library mix); Tracks from a playlist loops one chosen "
+                "playlist. Each Person can override this on their link card."
+            ),
+        },
+        "endless_playback_playlist": {
+            "label": "Endless Playback Playlist",
+            "type": "text",
+            "default": "",
+            "description": (
+                "Playlist name for the \"Tracks from a playlist\" Endless Playback mode — one of "
+                "the AI-named mixes on the Recommendations tab (matched by name, "
+                "case-insensitive). Leave blank to use the newest mix. Each Person can pick "
+                "their own on their link card."
+            ),
+        },
+        "smart_shuffle_enabled": {
+            "label": "Smart Shuffle",
+            "type": "checkbox",
+            "default": False,
+            "description": (
+                "History-aware shuffle: recently played tracks are pushed to the back of the "
+                "queue, and queueing several albums or playlists mixes them on the fly instead "
+                "of building one enormous queue up front. Each Person can override this on "
+                "their link card."
             ),
         },
     },
@@ -745,6 +810,9 @@ PERSON_LINK_TEST_FIELD_KEYS = (
     "person_link_recommendation_playlist_count",
     "person_link_recommendation_items_per_playlist",
     "person_link_prompt_context_enabled",
+    "person_link_endless_playback_mode",
+    "person_link_endless_playback_playlist",
+    "person_link_smart_shuffle_enabled",
     "person_link_follow_me_entity",
     "person_link_follow_me_room_overrides",
     "person_link_follow_me_takeover_mode",
@@ -757,6 +825,15 @@ PERSON_LINK_TEST_FIELD_KEYS = (
     "person_link_emby_library_name",
     "person_link_emby_library_folder",
     "person_link_share_root_path",
+    "person_link_extra_source",
+    "person_link_extra_emby_server_url",
+    "person_link_extra_emby_username",
+    "person_link_extra_emby_password",
+    "person_link_extra_emby_api_key",
+    "person_link_extra_emby_user_id",
+    "person_link_extra_emby_library_name",
+    "person_link_extra_emby_library_folder",
+    "person_link_extra_share_root_path",
 )
 
 
@@ -876,6 +953,51 @@ def _person_recommendation_int(
     return _as_int(_person_link(person_id, client).get(key), global_value, minimum, maximum)
 
 
+def _person_select_choice(
+    person_id: Any,
+    key: str,
+    cfg: Dict[str, Any],
+    allowed: "tuple[str, ...] | list[str]",
+    default: str,
+    client: Any = None,
+) -> str:
+    """One Person's select override; blank or invalid inherits the global value."""
+    global_value = _text(cfg.get(key)) if _text(cfg.get(key)) in allowed else default
+    chosen = _text(_person_link(person_id, client).get(key))
+    return chosen if chosen in allowed else global_value
+
+
+def _person_endless_mode(person_id: Any, cfg: Dict[str, Any], client: Any = None) -> str:
+    """One Person's Endless Playback mode; unlinked or blank follows the global setting."""
+    return _person_select_choice(
+        person_id,
+        "endless_playback_mode",
+        cfg,
+        ENDLESS_PLAYBACK_MODES,
+        DEFAULT_ENDLESS_PLAYBACK_MODE,
+        client,
+    )
+
+
+def _person_endless_playlist(person_id: Any, cfg: Dict[str, Any], client: Any = None) -> str:
+    """One Person's "Tracks from a playlist" pick; blank falls back to the global pick."""
+    return _text(_person_link(person_id, client).get("endless_playback_playlist")) or _text(
+        cfg.get("endless_playback_playlist")
+    )
+
+
+def _person_smart_shuffle_enabled(
+    person_id: Any,
+    cfg: Dict[str, Any],
+    client: Any = None,
+) -> bool:
+    """One Person's Smart Shuffle toggle; unlinked or "inherit" follows global."""
+    state = _person_tri_state(_person_link(person_id, client), "smart_shuffle_enabled")
+    if state:
+        return state == "on"
+    return _as_bool(cfg.get("smart_shuffle_enabled"), False)
+
+
 def _recommendations_possible(cfg: Dict[str, Any], client: Any = None) -> bool:
     """True when recommendation refresh should run for the household or any linked Person."""
     if _as_bool(cfg.get("recommendations_enabled"), True):
@@ -949,19 +1071,35 @@ def _profile_key(person_id: Any = "") -> str:
     return _scoped_key(PROMPT_PROFILE_KEY, person_id)
 
 
-def _person_link_provider(
-    person_id: Any,
-    provider_id: Any,
-    client: Any = None,
-) -> Optional[Any]:
-    """Build a provider from one Person's link settings, if they override the source."""
-    link = _person_link(person_id, client)
-    source = _person_link_source(link)
-    if not source:
-        return None
-    if provider_id and _provider_id(provider_id) != source:
-        return None
-    values = link.get(source) if isinstance(link.get(source), dict) else {}
+def _person_link_extra_source(link: Dict[str, Any]) -> str:
+    """A Person's second linked source id ("" = none). The same source type may
+    appear twice (e.g. their own Emby account plus a household Emby user)."""
+    return _provider_id(link.get("extra_source"), "")
+
+
+def _person_link_sources(link: Dict[str, Any]) -> List[str]:
+    """Every source id configured on one Person's link, in play order."""
+    sources: List[str] = []
+    primary = _person_link_source(link)
+    if primary in CATALOG_PROVIDER_IDS:
+        sources.append(primary)
+    extra = _person_link_extra_source(link)
+    if extra in CATALOG_PROVIDER_IDS:
+        sources.append(extra)
+    return sources
+
+
+def _person_extra_slot(person_id: Any, source: Any) -> str:
+    """Catalog/history slot id for one Person's second linked source."""
+    return f"{_text(person_id)}+{_text(source)}"
+
+
+def _build_person_provider(
+    source: str,
+    values: Dict[str, Any],
+    stream_scope: str,
+) -> Any:
+    """Instantiate one catalog provider from a Person link's stored values."""
     if source == "emby":
         return EmbyMusicProvider(
             server_url=_normalize_server_url(values.get("server_url")),
@@ -972,9 +1110,62 @@ def _person_link_provider(
             user_id=_text(values.get("user_id")),
             library_name=_text(values.get("library_name")),
             library_folder=_text(values.get("library_folder")),
-            stream_scope=_text(person_id),
+            stream_scope=stream_scope,
         )
     return NetworkShareMusicProvider(root_path=_text(values.get("root_path")))
+
+
+def _person_link_provider(
+    person_id: Any,
+    provider_id: Any,
+    client: Any = None,
+) -> Optional[Any]:
+    """Build a provider from one Person's link settings, if they override the source.
+
+    Answers the Person's primary source first, then their second linked source;
+    a scoped person id ("<person_id>+<source>") addresses the second source's
+    own credentials directly (the stream server uses that for per-Person Emby
+    tokens).
+    """
+    link = _person_link(person_id, client)
+    scope = _text(person_id)
+    base_person, sep, scope_suffix = scope.partition("+")
+    extra_source = _person_link_extra_source(link)
+    requested = _provider_id(provider_id, "") if _text(provider_id) else ""
+
+    # A scope like "<person>+emby" names the second source's slot explicitly.
+    if (
+        sep
+        and extra_source
+        and _provider_id(scope_suffix, "") == extra_source
+        and _person_extra_slot(base_person, extra_source) == scope
+    ):
+        values = link.get("extra") if isinstance(link.get("extra"), dict) else {}
+        return _build_person_provider(extra_source, values, scope)
+
+    source = _person_link_source(link)
+    if not source:
+        return None
+    values = link.get(source) if isinstance(link.get(source), dict) else {}
+    if not requested or requested == source:
+        return _build_person_provider(source, values, base_person or scope)
+    if requested == extra_source:
+        values = link.get("extra") if isinstance(link.get("extra"), dict) else {}
+        return _build_person_provider(
+            extra_source, values, _person_extra_slot(base_person, extra_source)
+        )
+    return None
+
+
+def _person_catalog_source_ids(person_id: Any, client: Any = None) -> List[str]:
+    """Every provider id one Person listens from (their link, or the global source)."""
+    wanted = _text(person_id)
+    if not wanted:
+        return []
+    sources = _person_link_sources(_person_link(wanted, client))
+    if sources:
+        return sources
+    return [_person_source_id(wanted, client)]
 
 
 def _provider_id(value: Any, default: str = "emby") -> str:
@@ -2345,6 +2536,46 @@ def _share_stream_id(rel_path: str) -> str:
     return base64.urlsafe_b64encode(rel_path.encode("utf-8")).decode("ascii").rstrip("=")
 
 
+def _share_root_scope(root: str) -> str:
+    """Stable short token for one share root (per-Person roots get their own)."""
+    return hashlib.sha1(_text(root).encode("utf-8")).hexdigest()[:12]
+
+
+def _share_scoped_stream_id(rel_path: str, root: str) -> str:
+    """Stream id that carries its share root, so per-Person roots stream correctly."""
+    return f"{_share_stream_id(root)}~{_share_stream_id(rel_path)}"
+
+
+def _share_root_and_relpath_from_id(
+    stream_id: str,
+    default_root: str,
+) -> "tuple[Optional[str], Optional[str]]":
+    """Decode a share stream id to (root, rel path).
+
+    Scoped ids ("<root b64>~<rel b64>") resolve against their own root; legacy
+    ids (no "~") keep resolving against the global share root.
+    """
+    scoped, sep, rel_token = _text(stream_id).partition("~")
+    if sep:
+        padding = "=" * (-len(scoped) % 4)
+        try:
+            root = base64.urlsafe_b64decode(scoped + padding).decode("utf-8")
+            rel_path = base64.urlsafe_b64decode(
+                rel_token + "=" * (-len(rel_token) % 4)
+            ).decode("utf-8")
+        except Exception:
+            return None, None
+        return root, rel_path
+    return _text(default_root), _share_relpath_from_id(stream_id)
+
+
+def _share_art_index_key(root: str) -> str:
+    """Redis key for one share root's artwork index (legacy key for the global root)."""
+    if not _text(root) or _text(root) == _text(_settings().get("share_root_path")):
+        return SHARE_ART_INDEX_KEY
+    return f"{SHARE_ART_INDEX_KEY}:{_share_root_scope(root)}"
+
+
 def _share_relpath_from_id(stream_id: str) -> Optional[str]:
     padding = "=" * (-len(stream_id) % 4)
     try:
@@ -2369,12 +2600,16 @@ def _share_store_art(
     source_path: str,
     version: str,
     image: Optional[Dict[str, Any]] = None,
+    scope: str = "",
 ) -> str:
     """Register one artwork source; embedded images are extracted to a cache file."""
-    art_id = hashlib.sha1(source_path.encode("utf-8")).hexdigest()[:20]
+    digest = hashlib.sha1(source_path.encode("utf-8")).hexdigest()[:20]
+    # Scoped ids carry their share root's scope so per-Person libraries keep
+    # artwork separate from the household's.
+    art_id = f"{scope}:{digest}" if scope else digest
     if image and isinstance(image.get("data"), bytes) and image["data"]:
         cache_path = os.path.join(
-            _share_art_cache_dir(), f"{art_id}.{_text(image.get('mime')) or 'jpg'}"
+            _share_art_cache_dir(), f"{digest}.{_text(image.get('mime')) or 'jpg'}"
         )
         if not os.path.isfile(cache_path):
             try:
@@ -2440,6 +2675,11 @@ class NetworkShareMusicProvider:
                 "Mount the network share on the Tater host and set its folder path before syncing."
             )
         catalog_id = "share:" + hashlib.sha1(root.encode("utf-8")).hexdigest()[:16]
+        # Per-Person share roots get their own artwork index and root-scoped
+        # stream ids so they can coexist with the household's share library.
+        art_scope = "" if not _text(root) else _share_root_scope(root)
+        if root == _text(_settings().get("share_root_path")):
+            art_scope = ""
         tracks: List[Dict[str, Any]] = []
         art_index: Dict[str, Dict[str, Any]] = {}
         for dirpath, dirnames, filenames in os.walk(root):
@@ -2450,7 +2690,7 @@ class NetworkShareMusicProvider:
                 if name.casefold() in SHARE_FOLDER_ARTWORK_NAMES:
                     source = os.path.join(dirpath, name)
                     folder_art_id = _share_store_art(
-                        art_index, source, str(int(os.path.getmtime(source)))
+                        art_index, source, str(int(os.path.getmtime(source))), scope=art_scope
                     )
                     break
             for name in sorted(filenames):
@@ -2472,15 +2712,19 @@ class NetworkShareMusicProvider:
                     artwork = {"id": folder_art_id, "version": version}
                 elif isinstance(embedded, dict) and embedded.get("data"):
                     art_id = _share_store_art(
-                        art_index, full_path, version, image=embedded
+                        art_index, full_path, version, image=embedded, scope=art_scope
                     )
                     if art_id:
                         artwork = {"id": art_id, "version": version}
                 genres = _genres(tags.get("genre"))
                 tracks.append(
                     {
-                        "id": _share_track_id(rel_path),
-                        "provider_track_id": _share_stream_id(rel_path),
+                        "id": (
+                            _share_track_id(rel_path)
+                            if not art_scope
+                            else "track:" + hashlib.sha256(f"{root}\x00{rel_path}".encode("utf-8")).hexdigest()[:24]
+                        ),
+                        "provider_track_id": _share_scoped_stream_id(rel_path, root),
                         "title": _text(tags.get("title")) or Path(name).stem,
                         "artist": _text(tags.get("artist")),
                         "album_artist": _text(tags.get("album_artist")),
@@ -2506,13 +2750,118 @@ class NetworkShareMusicProvider:
                 break
         store = globals().get("redis_client")
         if store is not None:
-            _save_json(store, SHARE_ART_INDEX_KEY, art_index)
+            _save_json(store, _share_art_index_key(root), art_index)
         return {
             "catalog_id": catalog_id,
             "tracks": tracks,
             "total": len(tracks),
             "libraries": {catalog_id: "Network Share"},
         }
+
+
+# --------------------------------------------------------------------------
+# Streaming providers (future)
+#
+# Catalog providers (Emby, network shares) index a library into this core's own
+# catalog. A *streaming* provider (Spotify, Apple Music, Tidal, …) would instead
+# surface recommendations and streams from its service, the way Music Assistant
+# does. The scaffolding below is deliberately open-ended: Endless Playback's
+# "Automatic" and "Similar to what you played" modes call
+# _streaming_similar_tracks(), which fans out to every connected streaming
+# provider. Today the registry is empty, so those modes fall back to the library
+# and nothing here changes behaviour.
+#
+# To add one later:
+#   1. Write a provider class that subclasses StreamingMusicProvider and
+#      implements catalog()/stream_url()/artwork_url()/connected (mirroring
+#      EmbyMusicProvider's surface) plus similar_tracks().
+#   2. Register it in STREAMING_PROVIDER_CLASSES under a stable provider id.
+#   3. Teach _provider_id() the new id, add it to PROVIDER_LABELS, and allow its
+#      tracks through the queue paths (they already play whatever
+#      track["provider"] names, because _play_track resolves the provider per
+#      track).
+# --------------------------------------------------------------------------
+
+
+class StreamingMusicProvider:
+    """Interface reference for future streaming providers (Spotify, …).
+
+    Subclasses must provide `provider_id`, `from_settings`, `connected`, the
+    catalog provider surface used by playback (catalog/stream_url/artwork_url),
+    and `similar_tracks` for the provider-backed Endless Playback modes.
+    """
+
+    provider_id = ""
+
+    @classmethod
+    def from_settings(cls, settings: Dict[str, Any]) -> "StreamingMusicProvider":
+        raise NotImplementedError("Streaming providers must implement from_settings().")
+
+    @property
+    def connected(self) -> bool:
+        return False
+
+    def similar_tracks(
+        self,
+        seed_tracks: List[Dict[str, Any]],
+        *,
+        count: int = CONTINUATION_BATCH_TRACKS,
+    ) -> List[Dict[str, Any]]:
+        """Tracks from this service similar to the seeds; [] when unsupported."""
+        return []
+
+
+# provider id -> provider class. Empty until a streaming provider is added;
+# keep ids stable (they end up in history events and queue state).
+STREAMING_PROVIDER_CLASSES: Dict[str, type] = {}
+
+
+def _streaming_providers(client: Any = None, person_id: Any = "") -> List[Any]:
+    """Every registered streaming provider that is currently connected."""
+    store = client or globals().get("redis_client")
+    settings: Dict[str, Any] = _settings(store)
+    providers: List[Any] = []
+    for provider_id, provider_class in STREAMING_PROVIDER_CLASSES.items():
+        try:
+            provider = provider_class.from_settings(settings)
+        except Exception:
+            continue
+        try:
+            if provider.connected:
+                providers.append(provider)
+        except Exception:
+            continue
+    del person_id  # person-scoped streaming credentials land here later
+    return providers
+
+
+def _streaming_similar_tracks(
+    seed_tracks: List[Dict[str, Any]],
+    *,
+    count: int = CONTINUATION_BATCH_TRACKS,
+    person_id: Any = "",
+    client: Any = None,
+) -> List[Dict[str, Any]]:
+    """Similar tracks from connected streaming providers (empty until one exists)."""
+    seeds = [dict(track) for track in (seed_tracks or []) if isinstance(track, dict)]
+    if not seeds:
+        return []
+    collected: List[Dict[str, Any]] = []
+    for provider in _streaming_providers(client, person_id):
+        try:
+            rows = provider.similar_tracks(seeds, count=count) or []
+        except Exception as exc:
+            logger.warning("[Music] %s similar-tracks lookup failed: %s", provider.provider_id, exc)
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            track = _normalize_track(dict(row))
+            track.setdefault("provider", provider.provider_id)
+            collected.append(track)
+            if len(collected) >= count:
+                return collected
+    return collected
 
 
 def _provider(client: Any = None, provider_id: Any = "", person_id: Any = "") -> Any:
@@ -2796,6 +3145,65 @@ def _catalog(client: Any = None, provider_id: Any = "", person_id: Any = "") -> 
         return payload
 
 
+def _person_catalog(
+    client: Any = None,
+    provider_id: Any = "",
+    person_id: Any = "",
+) -> Dict[str, Any]:
+    """One Person's catalog across every source they have linked.
+
+    Single-source People (and personless/household callers) behave exactly like
+    _catalog. A Person with two linked sources gets one merged payload: the
+    track lists are concatenated (each track keeps its own provider so playback,
+    history, and stream URLs stay per source) and the facets are rebuilt.
+    """
+    store = client or globals().get("redis_client")
+    wanted_person = _text(person_id)
+    sources = _person_catalog_source_ids(wanted_person, store)
+    if len(sources) <= 1:
+        # Single-source People keep the exact _catalog semantics (including an
+        # explicit provider hint narrowing or mismatching the payload).
+        return _catalog(store, sources[0] if sources else provider_id, wanted_person)
+    # Multi-source Person: merge every linked source. Any provider hint a
+    # caller derived from this Person's own link is a subset of the sources,
+    # so the merged payload is always the right answer here.
+    payloads = [_catalog(store, sources[0], wanted_person)]
+    for extra_source in sources[1:]:
+        payloads.append(
+            _catalog(store, extra_source, _person_extra_slot(wanted_person, extra_source))
+        )
+    tracks: List[Dict[str, Any]] = []
+    seen_ids: set = set()
+    for payload in payloads:
+        for track in payload.get("tracks") or []:
+            if not isinstance(track, dict):
+                continue
+            _normalize_cached_artwork(track)
+            genres = _genres(track.get("genres"), track.get("genre"))
+            track["genres"] = genres
+            track["genre"] = ", ".join(genres)
+            track_id = _text(track.get("id"))
+            if track_id and track_id in seen_ids:
+                continue
+            if track_id:
+                seen_ids.add(track_id)
+            tracks.append(track)
+    return {
+        "provider": sources[0],
+        "artwork_schema": CATALOG_ARTWORK_SCHEMA,
+        "tracks": tracks,
+        "artists": _facet_values(
+            [{"artist": _text(row.get("album_artist")) or _text(row.get("artist"))} for row in tracks],
+            "artist",
+        ),
+        "albums": _facet_values(tracks, "album"),
+        "genres": _facet_values(tracks, "genres"),
+        "synced_at": max(
+            (_as_float(payload.get("synced_at")) for payload in payloads), default=0.0
+        ),
+    }
+
+
 def _catalog_needs_artwork_refresh(
     client: Any = None,
     provider_id: Any = "",
@@ -3055,7 +3463,7 @@ def _search_tracks(
     provider_id: Any = "",
     person_id: Any = "",
 ) -> List[Dict[str, Any]]:
-    payload = _catalog(client, provider_id, person_id)
+    payload = _person_catalog(client, provider_id, person_id)
     tracks = payload.get("tracks") if isinstance(payload.get("tracks"), list) else []
     filters = {
         "query": _text(query),
@@ -4589,7 +4997,7 @@ def _generate_recommendations_impl(
     ]
     if not history:
         raise ValueError(f"Play at least one song before asking {assistant_name} for recommendations.")
-    catalog = _catalog(store, provider_id, person_id)
+    catalog = _person_catalog(store, provider_id, person_id)
     if not (catalog.get("tracks") or []):
         catalog = _sync_catalog(store, provider_id, person_id)
     candidates, candidate_map = _recommendation_candidates(catalog, history)
@@ -4891,7 +5299,7 @@ def _continuation_candidate_tracks(
         person_id if person_id is not None else player.get("queue_id")
     )
     provider_id = _provider_id(player.get("provider"), _provider_id(_settings(store).get("provider")))
-    catalog = _catalog(store, provider_id, queue_person)
+    catalog = _person_catalog(store, provider_id, queue_person)
     tracks = [dict(row) for row in catalog.get("tracks") or [] if isinstance(row, dict)]
     if not tracks:
         return [], {}, []
@@ -4921,10 +5329,14 @@ def _continuation_candidate_tracks(
         if _text(genre)
     }
 
+    # A multi-source Person's history spans every source they listen from.
+    person_sources = (
+        set(_person_catalog_source_ids(queue_person, store)) if queue_person else {provider_id}
+    )
     history = [
         row
         for row in _listening_history(store, queue_person)[-120:]
-        if _provider_id(row.get("provider")) == provider_id
+        if not person_sources or _provider_id(row.get("provider")) in person_sources
     ]
     history_artist_counts: Dict[str, int] = {}
     history_genre_counts: Dict[str, int] = {}
@@ -5070,14 +5482,503 @@ def _append_continuation_tracks(
         return len(incoming)
 
 
+def _endless_mode_for_queue(player: Dict[str, Any], client: Any = None) -> str:
+    """The Endless Playback mode that owns this queue's refills."""
+    store = client or globals().get("redis_client")
+    queue_person = _queue_id_for_person(player.get("queue_id"))
+    return _person_endless_mode(queue_person, _settings(store), store)
+
+
+def _history_play_stats(
+    store: Any,
+    person_id: Any,
+    *,
+    provider_id: Any = "",
+) -> tuple[Dict[str, int], Dict[str, int], set]:
+    """(per-track play counts, recent-history genre counts, recently played ids)."""
+    history = [
+        row
+        for row in _listening_history(store, person_id)
+        if not provider_id or _provider_id(row.get("provider")) == provider_id
+    ]
+    track_plays: Dict[str, int] = {}
+    for event in history:
+        track_id = _text(event.get("track_id"))
+        if track_id:
+            track_plays[track_id] = track_plays.get(track_id, 0) + 1
+    genre_counts: Dict[str, int] = {}
+    for event in history[-60:]:
+        for genre in event.get("genres") or []:
+            token = _genre_key(genre)
+            if token:
+                genre_counts[token] = genre_counts.get(token, 0) + 1
+    recent_ids = {
+        _text(event.get("track_id"))
+        for event in history[-SMART_SHUFFLE_RECENT_EVENTS:]
+        if _text(event.get("track_id"))
+    }
+    return track_plays, genre_counts, recent_ids
+
+
+def _queue_listen_context(player: Dict[str, Any]) -> tuple[set, set]:
+    """(genre keys, artist keys) the queue is currently listening to."""
+    queue = [dict(row) for row in player.get("queue") or [] if isinstance(row, dict)]
+    index = _as_int(player.get("index"), 0, 0, max(0, len(queue) - 1))
+    current = (
+        dict(player.get("current"))
+        if isinstance(player.get("current"), dict)
+        else (queue[index] if queue else {})
+    )
+    nearby = queue[max(0, index - 2) : min(len(queue), index + 4)]
+    rows = [current, *nearby]
+    genre_keys = {
+        _genre_key(genre)
+        for row in rows
+        for genre in row.get("genres") or []
+        if _genre_key(genre)
+    }
+    artist_keys = {
+        _text(row.get("album_artist") or row.get("artist")).casefold()
+        for row in rows
+        if _text(row.get("album_artist") or row.get("artist"))
+    }
+    return genre_keys, artist_keys
+
+
+def _library_mix_tracks(
+    player: Dict[str, Any],
+    store: Any = None,
+    *,
+    count: int = CONTINUATION_BATCH_TRACKS,
+    person_id: Any = None,
+    allow_repeats: bool = False,
+) -> List[Dict[str, Any]]:
+    """Infinite Mix from the library: least-played first, biased to the genres the
+    queue was just hearing, with the remaining gaps filled by varied random picks."""
+    store = store or globals().get("redis_client")
+    queue_person = _queue_id_for_person(
+        person_id if person_id is not None else player.get("queue_id")
+    )
+    provider_id = _provider_id(player.get("provider"), _provider_id(_settings(store).get("provider")))
+    catalog = _person_catalog(store, provider_id, queue_person)
+    tracks = [dict(row) for row in catalog.get("tracks") or [] if isinstance(row, dict)]
+    if not tracks:
+        return []
+    queue_ids = {
+        _text(track.get("id"))
+        for track in player.get("queue") or []
+        if isinstance(track, dict) and _text(track.get("id"))
+    }
+    pool = [track for track in tracks if allow_repeats or _text(track.get("id")) not in queue_ids]
+    if not pool:
+        pool = list(tracks)
+    track_plays, history_genre_counts, recent_ids = _history_play_stats(
+        store,
+        queue_person,
+        provider_id=provider_id,
+    )
+    context_genres, _context_artists = _queue_listen_context(player)
+    context_genres = set(context_genres) | set(history_genre_counts)
+
+    session_token = _radio_session_token(player)
+
+    def dispersion(track: Dict[str, Any]) -> str:
+        token = _text(track.get("id")) or _text(track.get("title"))
+        return hashlib.sha256(f"{session_token}\x00{token}".encode("utf-8")).hexdigest()
+
+    def orders(track: Dict[str, Any]) -> tuple[Any, ...]:
+        track_id = _text(track.get("id"))
+        track_genres = {_genre_key(genre) for genre in track.get("genres") or []}
+        # Least-played first (0 plays leads), recently played last within a tier,
+        # then a stable per-session dispersion so each refill sounds fresh.
+        return (
+            not bool(track_genres & context_genres),
+            track_plays.get(track_id, 0) // 3,
+            track_id in recent_ids,
+            dispersion(track),
+        )
+
+    ordered = sorted(pool, key=orders)
+    selected: List[Dict[str, Any]] = []
+    artist_counts: Dict[str, int] = {}
+    # Walk in order but cap per-artist runs so one prolific artist cannot own the mix.
+    for _ in range(3):
+        remaining: List[Dict[str, Any]] = []
+        for track in ordered:
+            if len(selected) >= count:
+                remaining.append(track)
+                continue
+            artist = _text(track.get("album_artist") or track.get("artist")).casefold()
+            if artist and artist_counts.get(artist, 0) >= 3:
+                remaining.append(track)
+                continue
+            artist_counts[artist] = artist_counts.get(artist, 0) + 1
+            selected.append(track)
+        ordered = remaining
+        if len(selected) >= count or not ordered:
+            break
+    return [dict(track) for track in selected[:count]]
+
+
+def _endless_playlist_payload(store: Any, person_id: Any) -> Dict[str, Any]:
+    """The published recommendation payload to pick the endless playlist from."""
+    payload = _recommendations(store, person_id)
+    if not (payload.get("playlists") or []):
+        payload = _recommendations(store)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _resolve_playlist_tracks(
+    store: Any,
+    person_id: Any,
+    playlist: Dict[str, Any],
+    *,
+    provider_id: Any = "",
+) -> List[Dict[str, Any]]:
+    """Map a published mix's track ids back onto real catalog tracks."""
+    resolved: List[Dict[str, Any]] = []
+    for raw_track_id in playlist.get("track_ids") or []:
+        track_id = _text(raw_track_id)
+        if not track_id:
+            continue
+        track = _find_track_in_catalog(_person_catalog(store, provider_id, person_id), track_id)
+        if track is None:
+            track = _find_track_in_catalog(_person_catalog(store, "", person_id), track_id)
+        if track is not None:
+            resolved.append(dict(track))
+    return resolved
+
+
+def _playlist_loop_tracks(
+    player: Dict[str, Any],
+    store: Any = None,
+    *,
+    count: int = CONTINUATION_BATCH_TRACKS,
+    person_id: Any = None,
+) -> tuple[List[Dict[str, Any]], Dict[str, Any], int]:
+    """The endless playlist's tracks, looping from the stored rotation offset."""
+    store = store or globals().get("redis_client")
+    queue_person = _queue_id_for_person(
+        person_id if person_id is not None else player.get("queue_id")
+    )
+    cfg = _settings(store)
+    provider_id = _provider_id(player.get("provider"), _provider_id(cfg.get("provider")))
+    playlist_name = _person_endless_playlist(queue_person, cfg, store)
+    payload = _endless_playlist_payload(store, queue_person)
+    playlists = [row for row in payload.get("playlists") or [] if isinstance(row, dict)]
+    playlist: Dict[str, Any] = {}
+    if playlist_name:
+        wanted = playlist_name.casefold()
+        playlist = next(
+            (row for row in playlists if _text(row.get("name")).casefold() == wanted), {}
+        )
+    elif playlists:
+        playlist = playlists[0]
+    if not playlist:
+        return [], {}, 0
+    tracks = _resolve_playlist_tracks(store, queue_person, playlist, provider_id=provider_id)
+    if not tracks:
+        return [], playlist, 0
+    # Rotation offset advances only by tracks actually appended, so a slow
+    # refill or a restart keeps the loop continuous instead of skipping.
+    offset = _as_int(player.get("playlist_loop_offset"), 0, 0, len(tracks)) % len(tracks)
+    queued_ids = {
+        _text(track.get("id"))
+        for track in player.get("queue") or []
+        if isinstance(track, dict) and _text(track.get("id"))
+    }
+    batch: List[Dict[str, Any]] = []
+    consumed = 0
+    # Prefer tracks not already queued; a short playlist loops over itself
+    # rather than falling short.
+    for allow_queued in (False, True):
+        batch = []
+        scan = 0
+        while len(batch) < count and scan < len(tracks) * 2:
+            track = dict(tracks[(offset + scan) % len(tracks)])
+            scan += 1
+            track_id = _text(track.get("id"))
+            if not allow_queued and track_id in queued_ids:
+                continue
+            if any(_text(row.get("id")) == track_id for row in batch):
+                continue
+            batch.append(track)
+        consumed = scan
+        if len(batch) >= count:
+            break
+    return batch, playlist, (offset + consumed) % len(tracks)
+
+
+def _smart_pool_batch(
+    player: Dict[str, Any],
+    store: Any = None,
+    *,
+    count: int = CONTINUATION_BATCH_TRACKS,
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Draw the next Smart Shuffle batch from the pool, rotating across sources."""
+    pool = [dict(row) for row in player.get("smart_pool") or [] if isinstance(row, dict)]
+    if not pool:
+        return [], []
+    batch = [row for row in pool[:count]]
+    remaining = pool[len(batch):]
+    return batch, remaining
+
+
+def _save_smart_pool(queue_id: Any, remaining_pool: List[Dict[str, Any]], store: Any) -> None:
+    """Persist the pool left after a Smart Shuffle batch was appended."""
+    with _state_lock:
+        player = _player(store, queue_id)
+        player["smart_pool"] = [dict(row) for row in remaining_pool]
+        _save_player(player, store, queue_id)
+
+
+def _save_playlist_loop_offset(queue_id: Any, offset: int, store: Any) -> None:
+    """Persist the endless playlist's rotation position after a refill."""
+    with _state_lock:
+        player = _player(store, queue_id)
+        player["playlist_loop_offset"] = max(0, _as_int(offset, 0, 0, 100000))
+        _save_player(player, store, queue_id)
+
+
+def _smart_shuffle_order(
+    tracks: List[Dict[str, Any]],
+    recent_ids: set,
+) -> List[Dict[str, Any]]:
+    """Shuffled order with recently played tracks pushed to the back."""
+    shuffled = [dict(track) for track in tracks]
+    random.SystemRandom().shuffle(shuffled)
+    fresh = [track for track in shuffled if _text(track.get("id")) not in recent_ids]
+    recent = [track for track in shuffled if _text(track.get("id")) in recent_ids]
+    return [*fresh, *recent]
+
+
+def _smart_recent_ids(store: Any, person_id: Any) -> set:
+    """Track ids in this Person's recent listening window."""
+    _track_plays, _genre_counts, recent_ids = _history_play_stats(store, person_id)
+    return recent_ids
+
+
+def _smart_round_robin(
+    pool: List[Dict[str, Any]],
+    count: int,
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Take the next `count` pool tracks, rotating across queued sources.
+
+    The pool keeps insertion order but every source batch is tagged with
+    `source_label`, so each pass contributes one track per source in turn
+    (two albums plus two playlists alternate instead of playing in blocks).
+    """
+    if count <= 0 or not pool:
+        return [], [dict(row) for row in pool]
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    order: List[str] = []
+    for track in pool:
+        label = _text(track.get("source_label")) or "__queue"
+        if label not in groups:
+            groups[label] = []
+            order.append(label)
+        groups[label].append(track)
+    selected: List[Dict[str, Any]] = []
+    progress = 0
+    while len(selected) < count and any(groups[label] for label in order):
+        for label in order:
+            bucket = groups[label]
+            if bucket and len(selected) < count:
+                selected.append(bucket.pop(0))
+        progress += 1
+        if progress > len(pool):
+            break
+    remaining = [dict(track) for label in order for track in groups[label]]
+    return selected, remaining
+
+
+def _smart_window_tracks(
+    tracks: List[Dict[str, Any]],
+    *,
+    shuffle: bool,
+    recent_ids: set,
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Split a selection into the on-screen queue window and the Smart Shuffle pool."""
+    ordered = (
+        _smart_shuffle_order(tracks, recent_ids)
+        if shuffle
+        else [dict(track) for track in tracks]
+    )
+    window = [dict(track) for track in ordered[:SMART_SHUFFLE_QUEUE_WINDOW]]
+    pool = [dict(track) for track in ordered[SMART_SHUFFLE_QUEUE_WINDOW:]]
+    return window, pool
+
+
+def _smart_top_up_queue(player: Dict[str, Any], store: Any, queue_id: Any) -> None:
+    """Top the remaining queue up to the Smart Shuffle window from the pool."""
+    queue = [dict(row) for row in player.get("queue") or [] if isinstance(row, dict)]
+    index = _as_int(player.get("index"), 0, 0, max(0, max(0, len(queue) - 1)))
+    remaining_count = max(0, len(queue) - index - 1)
+    need = SMART_SHUFFLE_QUEUE_WINDOW - remaining_count
+    if need <= 0:
+        return
+    pool = [dict(row) for row in player.get("smart_pool") or [] if isinstance(row, dict)]
+    if not pool:
+        return
+    drawn, remaining_pool = _smart_round_robin(pool, need)
+    if not drawn:
+        return
+    maximum = max(
+        2,
+        _as_int(_settings(store).get("maximum_queue_tracks"), 200, 1, 1000),
+    )
+    # Trim played tracks from the head first so a long listen never exceeds the cap.
+    trim_count = min(index, max(0, len(queue) + len(drawn) - maximum))
+    if trim_count:
+        queue = queue[trim_count:]
+        index -= trim_count
+    capacity = max(0, maximum - len(queue))
+    drawn = drawn[:capacity]
+    if not drawn:
+        return
+    player["queue"] = [*queue, *drawn]
+    player["queue_original"] = [dict(track) for track in player["queue"]]
+    player["index"] = index
+    player["current"] = queue[index] if 0 <= index < len(queue) else (queue[0] if queue else {})
+    player["smart_pool"] = remaining_pool
+
+
+def _add_queue_tracks(
+    args: Dict[str, Any],
+    *,
+    origin: Optional[Dict[str, Any]] = None,
+    client: Any = None,
+) -> Dict[str, Any]:
+    """Queue more music on top of what's playing (albums, playlists, searches).
+
+    With Smart Shuffle on, the new tracks join a pool that feeds the queue
+    round-robin across every queued source, so two albums and two playlists
+    mix on the fly instead of stacking into one enormous queue.
+    """
+    store = client or globals().get("redis_client")
+    cfg = _settings(store)
+    speaking_person_id = _context_person_id(origin)
+    person_id = speaking_person_id or _text(cfg.get("prompt_person_id"))
+    queue_id = _queue_id_for_person(speaking_person_id)
+    selected_provider = _person_source_id(person_id, store)
+    maximum = _as_int(cfg.get("maximum_queue_tracks"), 200, 1, 1000)
+    source_label = _text(args.get("source_label"))
+    if not source_label:
+        source_label = (
+            _text(args.get("album"))
+            or _text(args.get("artist"))
+            or _text(args.get("genre"))
+            or _text(args.get("playlist"))
+            or _text(args.get("query"))
+            or "Added tracks"
+        )[:60]
+
+    playlist_name = _text(args.get("playlist"))
+    if playlist_name:
+        payload = _endless_playlist_payload(store, person_id)
+        playlists = [row for row in payload.get("playlists") or [] if isinstance(row, dict)]
+        wanted = playlist_name.casefold()
+        playlist = next(
+            (row for row in playlists if _text(row.get("name")).casefold() == wanted), {}
+        )
+        if not playlist:
+            raise ValueError(f'No mix named "{playlist_name}" is on the Recommendations tab.')
+        tracks = _resolve_playlist_tracks(store, person_id, playlist)
+        if not tracks:
+            raise ValueError(f'The mix "{_text(playlist.get("name"))}" has no playable tracks left.')
+    else:
+        tracks = _search_tracks(
+            query=_text(args.get("query") or args.get("music")),
+            title=_text(args.get("title") or args.get("track") or args.get("song")),
+            artist=_text(args.get("artist")),
+            album=_text(args.get("album")),
+            genre=_text(args.get("genre")),
+            limit=maximum,
+            client=store,
+            provider_id=selected_provider,
+            person_id=person_id,
+        )
+    if not tracks:
+        raise ValueError("No matching music was found to add to the queue.")
+    for track in tracks:
+        track["source_label"] = source_label
+
+    player = _player(store, queue_id)
+    queue = [dict(row) for row in player.get("queue") or [] if isinstance(row, dict)]
+    status = _text(player.get("status")).lower()
+    if not queue or status not in {"playing", "paused", "queued"}:
+        smart = _person_smart_shuffle_enabled(person_id, cfg, store)
+        return {
+            "player": _create_and_start_queue(
+                tracks,
+                targets=_list(player.get("targets") or player.get("target")),
+                shuffle=smart,
+                volume_percent=_as_int(player.get("volume_percent"), _as_int(cfg.get("default_volume_percent"), 75, 0, 100), 0, 100),
+                person_id=person_id,
+                client=store,
+            ),
+            "added": len(tracks),
+            "queued_directly": True,
+        }
+
+    with _state_lock:
+        player = _player(store, queue_id)
+        queue = [dict(row) for row in player.get("queue") or [] if isinstance(row, dict)]
+        index = _as_int(player.get("index"), 0, 0, max(0, len(queue) - 1))
+        existing_ids = {_text(row.get("id")) for row in queue if _text(row.get("id"))}
+        # Smart Shuffle pool tracks are already waiting to play — don't re-add them.
+        existing_ids.update(
+            _text(row.get("id"))
+            for row in player.get("smart_pool") or []
+            if isinstance(row, dict) and _text(row.get("id"))
+        )
+        added = [dict(track) for track in tracks if _text(track.get("id")) not in existing_ids]
+        if not added:
+            return {"player": player, "added": 0, "queued_directly": False}
+        if _person_smart_shuffle_enabled(person_id, cfg, store):
+            pool = [dict(row) for row in player.get("smart_pool") or [] if isinstance(row, dict)]
+            player["smart_pool"] = [*pool, *added]
+            _smart_top_up_queue(player, store, queue_id)
+        else:
+            remaining = queue[index + 1 :]
+            head = queue[: index + 1]
+            capacity = max(0, maximum - (len(head) + len(remaining) + len(added)))
+            player["queue"] = [*head, *remaining, *added][:maximum]
+            player["queue_original"] = [dict(track) for track in player["queue"]]
+            player["index"] = index
+            if capacity < 0:
+                del added[capacity:]
+        player["smart_shuffle"] = _person_smart_shuffle_enabled(person_id, cfg, store)
+        _save_player(player, store, queue_id)
+        return {
+            "player": _player(store, queue_id),
+            "added": len(added),
+            "queued_directly": False,
+        }
+
+
 def _fallback_continuation_tracks(
     player: Dict[str, Any],
     client: Any = None,
     *,
     count: int = CONTINUATION_BATCH_TRACKS,
 ) -> List[Dict[str, Any]]:
+    """Non-AI refill tracks, honouring the queue's Endless Playback mode."""
     store = client or globals().get("redis_client")
     queue_person = _queue_id_for_person(player.get("queue_id"))
+    # A Smart Shuffle pool always feeds the queue before any Endless Playback mode.
+    pool_batch, _remaining = _smart_pool_batch(player, store)
+    if pool_batch:
+        return pool_batch
+    mode = _endless_mode_for_queue(player, store)
+    if mode == "playlist_loop":
+        batch, _playlist, _offset = _playlist_loop_tracks(player, store, count=count)
+        if batch:
+            return batch
+    if mode in {"library_mix", "automatic", "similar_played"}:
+        batch = _library_mix_tracks(player, store, count=count, person_id=queue_person)
+        if batch:
+            return batch
     _candidates, _candidate_map, ordered = _continuation_candidate_tracks(
         player,
         store,
@@ -5087,7 +5988,7 @@ def _fallback_continuation_tracks(
     if ordered:
         return [dict(track) for track in ordered[: max(1, count)]]
     provider_id = _provider_id(player.get("provider"))
-    catalog = _catalog(store, provider_id, queue_person)
+    catalog = _person_catalog(store, provider_id, queue_person)
     tracks = [dict(row) for row in catalog.get("tracks") or [] if isinstance(row, dict)]
     return tracks[: max(1, count)]
 
@@ -5183,6 +6084,107 @@ def _generate_continuation_impl(
     session_token: str,
     client: Any = None,
 ) -> int:
+    store = client or globals().get("redis_client")
+    queue_id = _queue_id_for_person(player.get("queue_id"))
+    mode = _endless_mode_for_queue(player, store)
+
+    # Smart Shuffle first: an active pool always feeds the queue before any
+    # Endless Playback mode, so queued sources keep mixing as they drain.
+    batch, remaining_pool = _smart_pool_batch(player, store)
+    if batch:
+        added = _append_continuation_tracks(
+            session_token,
+            batch,
+            station_name=_text(player.get("radio_name")) or "Smart Shuffle",
+            source="smart_shuffle_pool",
+            person_id=queue_id,
+            client=store,
+        )
+        if added:
+            _save_smart_pool(queue_id, remaining_pool, store)
+        return added
+
+    if mode == "playlist_loop":
+        batch, playlist, next_offset = _playlist_loop_tracks(player, store)
+        if batch:
+            added = _append_continuation_tracks(
+                session_token,
+                batch,
+                station_name=f"Playlist: {_text(playlist.get('name')) or 'Chosen Playlist'}",
+                source="playlist_loop",
+                allow_repeats=True,
+                person_id=queue_id,
+                client=store,
+            )
+            if added:
+                _save_playlist_loop_offset(queue_id, next_offset, store)
+            return added
+        # No usable playlist (unset, renamed, or empty): keep music playing
+        # with the library mix rather than letting the queue die.
+        batch = _library_mix_tracks(player, store)
+        if batch:
+            return _append_continuation_tracks(
+                session_token,
+                batch,
+                station_name="Infinite Mix",
+                source="library_mix",
+                person_id=queue_id,
+                client=store,
+            )
+        raise ValueError("No endless playlist was found to keep this queue playing.")
+
+    if mode in {"automatic", "similar_played"}:
+        queue = [dict(row) for row in player.get("queue") or [] if isinstance(row, dict)]
+        index = _as_int(player.get("index"), 0, 0, max(0, len(queue) - 1))
+        seed = (
+            dict(player.get("current"))
+            if isinstance(player.get("current"), dict)
+            else (queue[index] if queue else {})
+        )
+        provider_tracks = _streaming_similar_tracks(
+            [seed] if seed else [],
+            person_id=queue_id,
+            client=store,
+        )
+        if provider_tracks:
+            return _append_continuation_tracks(
+                session_token,
+                provider_tracks,
+                station_name="Similar to what you played",
+                source="streaming_provider",
+                person_id=queue_id,
+                client=store,
+            )
+        if mode == "similar_played":
+            # No streaming provider is connected (yet); fall back to the
+            # library mix so the music never stops.
+            batch = _library_mix_tracks(player, store)
+            if batch:
+                return _append_continuation_tracks(
+                    session_token,
+                    batch,
+                    station_name="Infinite Mix",
+                    source="library_mix",
+                    person_id=queue_id,
+                    client=store,
+                )
+            raise ValueError("No streaming provider is connected for similar tracks.")
+        # "automatic": stream providers had nothing, so fall through to the
+        # library Infinite Mix below.
+
+    if mode == "library_mix":
+        batch = _library_mix_tracks(player, store)
+        if batch:
+            return _append_continuation_tracks(
+                session_token,
+                batch,
+                station_name="Infinite Mix",
+                source="library_mix",
+                person_id=queue_id,
+                client=store,
+            )
+        raise ValueError("The active music library has no tracks for an Infinite Mix.")
+
     selections, station_name = _select_continuation_tracks(
         loop,
         llm_client,
@@ -6475,6 +7477,16 @@ def _create_and_start_queue(
     queue = [dict(track) for track in original_queue]
     if shuffle and len(queue) > 1:
         random.SystemRandom().shuffle(queue)
+    # Smart Shuffle: keep only a rolling window in the queue and hold the rest
+    # in a pool that feeds it round-robin across sources as it drains.
+    smart_pool: List[Dict[str, Any]] = []
+    smart_shuffle = _person_smart_shuffle_enabled(selected_person_id, cfg, store)
+    if smart_shuffle:
+        recent_ids = _smart_recent_ids(store, selected_person_id)
+        window, smart_pool = _smart_window_tracks(queue, shuffle=shuffle, recent_ids=recent_ids)
+        if smart_pool:
+            original_queue = [dict(track) for track in window]
+            queue = [dict(track) for track in window]
     with _state_lock:
         if queue_id:
             _register_queue(queue_id, store)
@@ -6495,6 +7507,8 @@ def _create_and_start_queue(
             "targets": _list(targets),
             "person_id": selected_person_id,
             "shuffle": bool(shuffle),
+            "smart_shuffle": smart_shuffle,
+            "smart_pool": smart_pool,
             "repeat": _text(previous.get("repeat") or "off"),
             "volume_percent": volume_percent,
             "mixed_sync_adjustment_ms": _mixed_sync_adjustment(targets, cfg),
@@ -6581,9 +7595,15 @@ def _set_player_shuffle(
             if isinstance(track, dict)
         ]
         player["queue_original"] = original
+        player["smart_shuffle"] = _person_smart_shuffle_enabled(queue_id, _settings(store), store)
         if enabled:
             remaining = queue[index + 1 :]
-            random.SystemRandom().shuffle(remaining)
+            if player["smart_shuffle"]:
+                # Smart Shuffle: recently played tracks go to the back instead
+                # of a purely random order.
+                remaining = _smart_shuffle_order(remaining, _smart_recent_ids(store, queue_id))
+            else:
+                random.SystemRandom().shuffle(remaining)
         else:
             used = queue[: index + 1]
 
@@ -6692,6 +7712,93 @@ def _stop_player(*, person_id: Any = "", client: Any = None) -> Dict[str, Any]:
                 "started_at": 0.0,
                 "position_offset_seconds": 0.0,
                 "seek_position_pending": False,
+            }
+        )
+        if warnings:
+            player["warnings"] = warnings
+        _save_player(player, store, queue_id)
+        return player
+
+
+SLEEP_TIMER_MAX_MINUTES = 720
+
+
+def _sleep_timer_state(player: Dict[str, Any]) -> Dict[str, Any]:
+    """One queue's sleep-timer countdown, tracked against the active player."""
+    ends_at = _as_float(player.get("sleep_timer_ends_at"))
+    if ends_at <= 0:
+        return {"active": False, "expired": bool(player.get("sleep_timer_expired_at"))}
+    remaining = ends_at - time.time()
+    return {
+        "active": remaining > 0,
+        "expired": remaining <= 0,
+        "ends_at": ends_at,
+        "remaining_seconds": max(0.0, remaining),
+        "minutes": _as_int(player.get("sleep_timer_minutes"), 0, 0, SLEEP_TIMER_MAX_MINUTES),
+    }
+
+
+def _set_sleep_timer(
+    minutes: Any,
+    *,
+    person_id: Any = "",
+    client: Any = None,
+) -> Dict[str, Any]:
+    """Arm (minutes > 0) or cancel (0) one queue's sleep timer."""
+    store = client or globals().get("redis_client")
+    queue_id = _queue_id_for_person(person_id)
+    wanted = _as_int(minutes, 0, 0, SLEEP_TIMER_MAX_MINUTES)
+    with _state_lock:
+        player = _player(store, queue_id)
+        if wanted <= 0:
+            player.update({"sleep_timer_ends_at": 0.0, "sleep_timer_minutes": 0})
+        else:
+            player.update(
+                {
+                    "sleep_timer_ends_at": time.time() + wanted * 60.0,
+                    "sleep_timer_minutes": wanted,
+                    "sleep_timer_expired_at": 0.0,
+                }
+            )
+        _save_player(player, store, queue_id)
+        return player
+
+
+def _sleep_timer_tick(store: Any, queue_id: Any) -> Optional[Dict[str, Any]]:
+    """Force-stop a queue whose sleep timer just hit zero.
+
+    The timer is a hard override: Endless Playback, Smart Shuffle pools, and
+    any in-flight continuous-radio refill are all cancelled so nothing keeps
+    streaming after the countdown.
+    """
+    with _state_lock:
+        player = _player(store, queue_id)
+        ends_at = _as_float(player.get("sleep_timer_ends_at"))
+        if ends_at <= 0 or time.time() < ends_at:
+            return None
+        targets = _list(player.get("targets") or player.get("target"))
+        warnings = (
+            _stop_target(
+                targets,
+                expected_voice_core_sessions=_playback_voice_core_sessions(player),
+            )
+            if targets
+            else []
+        )
+        player.update(
+            {
+                "status": "stopped",
+                "started_at": 0.0,
+                "position_offset_seconds": 0.0,
+                "seek_position_pending": False,
+                "sleep_timer_ends_at": 0.0,
+                "sleep_timer_expired_at": time.time(),
+                "continuation_pending": False,
+                "continuous_radio": False,
+                "smart_pool": [],
+                # Invalidate any continuation worker still holding the old
+                # session token so a late refill can never append.
+                "queue_session_id": uuid.uuid4().hex,
             }
         )
         if warnings:
@@ -6837,7 +7944,7 @@ def _play_request(
     speaking_person_id = _context_person_id(origin)
     person_id = speaking_person_id or _text(cfg.get("prompt_person_id"))
     selected_provider = _person_source_id(person_id, client)
-    catalog = _catalog(client, selected_provider, person_id)
+    catalog = _person_catalog(client, selected_provider, person_id)
     if not isinstance(catalog.get("tracks"), list) or not catalog.get("tracks"):
         catalog = _sync_catalog(client, selected_provider, person_id)
     query = _text(args.get("query") or args.get("music"))
@@ -6907,6 +8014,18 @@ def _play_request(
         person_id=person_id,
         client=client,
     )
+    sleep_note = ""
+    sleep_raw = args.get("sleep_minutes")
+    if sleep_raw in (None, ""):
+        sleep_raw = args.get("sleep_timer_minutes")
+    if sleep_raw in (None, ""):
+        sleep_raw = args.get("sleep_timer")
+    if sleep_raw not in (None, ""):
+        sleep_minutes = _as_int(sleep_raw, 0, 0, SLEEP_TIMER_MAX_MINUTES)
+        if sleep_minutes > 0:
+            _set_sleep_timer(sleep_minutes, person_id=speaking_person_id, client=client)
+            sleep_note = f" The sleep timer stops it in {sleep_minutes} minute"
+            sleep_note += "" if sleep_minutes == 1 else "s"
     return {
         "ok": True,
         "provider": selected_provider,
@@ -6915,12 +8034,16 @@ def _play_request(
         "target_count": len(targets),
         "queue_count": len(player.get("queue") or []),
         "shuffle": bool(player.get("shuffle")),
+        "sleep_timer_minutes": _as_int(sleep_raw, 0, 0, SLEEP_TIMER_MAX_MINUTES)
+        if sleep_raw not in (None, "")
+        else 0,
         "warnings": list(player.get("warnings") or []),
         "now_playing": _public_track(player.get("current") or {}),
         "summary_for_user": (
             f"Playing {_track_label(player.get('current') or {})} on {_target_summary(targets)}. "
             f"The queue has {len(player.get('queue') or [])} track"
             f"{'' if len(player.get('queue') or []) == 1 else 's'}, and continuous radio will keep it playing."
+            + sleep_note
         ),
     }
 
@@ -6984,12 +8107,14 @@ def get_hydra_kernel_tools(*, platform: str = "", **_kwargs) -> List[Dict[str, A
                 "Use when the user asks to play music from their personal Emby or network-share library by "
                 "song, artist, album, genre, or description. Put user-named rooms in rooms, specific "
                 "user-named speakers in targets, and leave both empty when playback should follow the "
-                "speaking room."
+                "speaking room. When the user asks for music for a set amount of time (\"play my music "
+                "for an hour\"), also pass sleep_minutes; a sleep timer then stops playback and "
+                "overrides endless playback when it hits zero."
             ),
             "usage": (
                 '{"function":"personal_music_play","arguments":{"query":"reggae music","genre":"reggae",'
                 '"artist":"","album":"","title":"","targets":[],'
-                '"rooms":["Family Room"],"shuffle":true,"volume_percent":75}}'
+                '"rooms":["Family Room"],"shuffle":true,"volume_percent":75,"sleep_minutes":60}}'
             ),
         },
         {
@@ -7004,15 +8129,21 @@ def get_hydra_kernel_tools(*, platform: str = "", **_kwargs) -> List[Dict[str, A
             "id": "personal_music_control",
             "description": (
                 "Control the Personal Music queue: next, previous, stop, replay, shuffle, repeat, "
-                "set one or more playback destinations, or bind rooms to a Person. Each Person has "
-                "their own queue, and transport actions act on the music playing in the speaking "
-                "room first, then that Person's own queue."
+                "add more music to the queue, set a sleep timer, set one or more playback "
+                "destinations, or bind rooms to a Person. Each Person has their own queue, and "
+                "transport actions act on the music playing in the speaking room first, then that "
+                "Person's own queue. Use the add action to queue an extra album, playlist, artist, "
+                "or genre on top of what is playing — with Smart Shuffle on, several sources mix "
+                "together on the fly. Use the sleep_timer action (minutes, 0 cancels) when the user "
+                "asks for music to stop after a while, e.g. \"play my music for an hour\"; the timer "
+                "force-stops playback and overrides endless playback when it hits zero."
             ),
             "usage": (
                 '{"function":"personal_music_control","arguments":'
-                '{"action":"next|previous|stop|replay|pause|resume|shuffle|repeat|move|set_targets|'
+                '{"action":"next|previous|stop|replay|pause|resume|shuffle|repeat|add|sleep_timer|move|set_targets|'
                 'bind_room|unbind_room",'
                 '"targets":["Kitchen","Living Room"],"enabled":true,"mode":"off|all|one",'
+                '"minutes":60,"album":"","playlist":"","artist":"","genre":"","query":"",'
                 '"person":"person_id"}}'
             ),
         },
@@ -7024,9 +8155,10 @@ def get_hydra_kernel_tools(*, platform: str = "", **_kwargs) -> List[Dict[str, A
         {
             "id": "personal_music_move",
             "description": (
-                "Follow-me handoff: move the user's currently playing music to another room or "
-                "speaker, keeping the same track and position. Only use when music is already "
-                "playing; start a new queue with personal_music_play instead."
+                "Follow-me handoff: move or transfer the user's currently playing music to another "
+                "room or speaker (\"move/transfer my music to the Master Bedroom\"), keeping the "
+                "same track, position, and full queue. Only use when music is already playing; "
+                "start a new queue with personal_music_play instead."
             ),
             "usage": (
                 '{"function":"personal_music_move","arguments":{"rooms":["Kitchen"],"targets":[]}}'
@@ -7113,7 +8245,7 @@ async def run_hydra_kernel_tool(
     if tool_id == "personal_music_search":
         try:
             selected_provider = _person_source_id(active_person_id, store)
-            if not (_catalog(store, selected_provider, active_person_id).get("tracks") or []):
+            if not (_person_catalog(store, selected_provider, active_person_id).get("tracks") or []):
                 await asyncio.to_thread(_sync_catalog, store, selected_provider, active_person_id)
             matches = _search_tracks(
                 query=values.get("query"),
@@ -7277,7 +8409,13 @@ async def run_hydra_kernel_tool(
                 current = player.get("current") if isinstance(player.get("current"), dict) else {}
                 remaining = [row for row in queue if _text(row.get("id")) != _text(current.get("id"))]
                 if _as_bool(values.get("enabled"), True):
-                    random.SystemRandom().shuffle(remaining)
+                    if _person_smart_shuffle_enabled(control_queue_id, _settings(store), store):
+                        remaining = _smart_shuffle_order(
+                            remaining,
+                            _smart_recent_ids(store, control_queue_id),
+                        )
+                    else:
+                        random.SystemRandom().shuffle(remaining)
                 player["queue"] = ([current] if current else []) + remaining
                 player["index"] = 0 if current else -1
                 player["shuffle"] = _as_bool(values.get("enabled"), True)
@@ -7342,10 +8480,70 @@ async def run_hydra_kernel_tool(
                     person_id=move_queue_id,
                     client=store,
                 )
+            elif action == "sleep_timer":
+                raw_minutes = values.get("minutes")
+                if raw_minutes in (None, ""):
+                    raw_minutes = values.get("sleep_minutes")
+                if _text(raw_minutes).casefold() in {"off", "cancel", "stop", "clear"}:
+                    raw_minutes = 0
+                sleep_minutes = _as_int(raw_minutes, 0, 0, SLEEP_TIMER_MAX_MINUTES)
+                player = await asyncio.to_thread(
+                    _set_sleep_timer,
+                    sleep_minutes,
+                    person_id=control_queue_id,
+                    client=store,
+                )
+                targets = _list(player.get("targets") or player.get("target"))
+                return {
+                    "ok": True,
+                    "status": _text(player.get("status")),
+                    "sleep_timer_minutes": sleep_minutes,
+                    "sleep_timer_active": sleep_minutes > 0,
+                    "now_playing": _public_track(player.get("current") or {}),
+                    "queue_count": len(player.get("queue") or []),
+                    "summary_for_user": (
+                        f"Sleep timer set: the music on {_target_summary(targets)} stops in "
+                        f"{sleep_minutes} minute{'' if sleep_minutes == 1 else 's'} — endless "
+                        "playback will not keep it going."
+                        if sleep_minutes > 0
+                        else "Sleep timer cancelled; endless playback runs as usual."
+                    ),
+                }
+            elif action == "add":
+                add_result = await asyncio.to_thread(
+                    _add_queue_tracks,
+                    values,
+                    origin=origin,
+                    client=store,
+                )
+                player = add_result.get("player") if isinstance(add_result, dict) else None
+                if not isinstance(player, dict):
+                    player = _player(store, control_queue_id)
+                targets = _list(player.get("targets") or player.get("target"))
+                return {
+                    "ok": True,
+                    "status": _text(player.get("status")),
+                    "target": targets[0] if targets else "",
+                    "targets": targets,
+                    "target_count": len(targets),
+                    "added_count": _as_int(add_result.get("added"), 0, 0, 100000),
+                    "now_playing": _public_track(player.get("current") or {}),
+                    "queue_count": len(player.get("queue") or []),
+                    "smart_pool_count": len(player.get("smart_pool") or []),
+                    "summary_for_user": (
+                        f"Added {_as_int(add_result.get('added'), 0, 0, 100000)} tracks to "
+                        f"{_target_summary(targets)}"
+                        + (
+                            "; Smart Shuffle will mix them in as the queue plays."
+                            if add_result.get("queued_directly") is False
+                            else "."
+                        )
+                    ),
+                }
             else:
                 raise ValueError(
                     "Music control action must be next, previous, stop, replay, shuffle, repeat, "
-                    "set_targets, bind_room, or unbind_room."
+                    "add, sleep_timer, set_targets, bind_room, or unbind_room."
                 )
             targets = _list(player.get("targets") or player.get("target"))
             return {
@@ -7390,7 +8588,7 @@ async def run_hydra_kernel_tool(
         }
     if tool_id == "personal_music_browse":
         selected_provider = _person_source_id(active_person_id, store)
-        catalog = _catalog(store, selected_provider, active_person_id)
+        catalog = _person_catalog(store, selected_provider, active_person_id)
         if not (catalog.get("tracks") or []):
             catalog = await asyncio.to_thread(
                 _sync_catalog, store, selected_provider, active_person_id
@@ -7664,6 +8862,24 @@ def _player_item(
                 "step": 1,
                 "suffix": "%",
                 "action": "music_ui_set_volume",
+            },
+            {
+                "key": "sleep_timer_minutes",
+                "label": "Sleep Timer (minutes)",
+                "type": "number",
+                "value": (
+                    round(_as_float(_sleep_timer_state(player).get("remaining_seconds")) / 60.0)
+                    if _sleep_timer_state(player).get("active")
+                    else ""
+                ),
+                "min": 0,
+                "max": SLEEP_TIMER_MAX_MINUTES,
+                "step": 1,
+                "description": (
+                    "Stop the music automatically after this many minutes (blank = off). At "
+                    "zero the timer force-stops playback — endless playback and Smart Shuffle "
+                    "cannot keep it going."
+                ),
             },
         ],
         "track_list": track_list,
@@ -9004,6 +10220,23 @@ def _library_summary_value(
     """
     stats = _catalog_stats(person_id, store)
     status = _text(stats.get("status"))
+    # A Person with a second linked source sums both libraries into one line.
+    extra_source = _person_link_extra_source(_person_link(person_id, store))
+    if extra_source and status == "ok":
+        extra_stats = _catalog_stats(_person_extra_slot(person_id, extra_source), store)
+        if _text(extra_stats.get("status")) == "ok":
+            return (
+                f"{_as_int(stats.get('track_count'), 0, 0, 10**9) + _as_int(extra_stats.get('track_count'), 0, 0, 10**9)} tracks"
+                f" · {_as_int(stats.get('artist_count'), 0, 0, 10**9) + _as_int(extra_stats.get('artist_count'), 0, 0, 10**9)} artists"
+                f" · {_as_int(stats.get('album_count'), 0, 0, 10**9) + _as_int(extra_stats.get('album_count'), 0, 0, 10**9)} albums"
+                f" · {_as_int(stats.get('genre_count'), 0, 0, 10**9) + _as_int(extra_stats.get('genre_count'), 0, 0, 10**9)} genres"
+                f" · scanned {_format_time(max(_as_float(stats.get('synced_at')), _as_float(extra_stats.get('synced_at'))))}"
+            )
+        if _text(extra_stats.get("status")) == "error":
+            return (
+                f"{_library_summary_value(person_id, not_synced_hint=not_synced_hint, store=store)}"
+                f" · second source failed: {_text(extra_stats.get('error')) or 'unknown error'}"
+            )
     if status == "syncing":
         return "Syncing…"
     if status == "error":
@@ -9045,9 +10278,19 @@ def _person_link_personalization_fields(
     cfg: Dict[str, Any],
     link: Dict[str, Any],
     client: Any = None,
+    person_id: Any = "",
 ) -> List[Dict[str, Any]]:
     """Per-Person Personalization overrides; blank choices inherit the global settings."""
     assistant_name = _assistant_first_name(client)
+    playlist_payload = _endless_playlist_payload(client, _text(person_id))
+    playlist_options = [
+        {"value": "", "label": "Use the global Endless Playback playlist (or the newest mix)"}
+    ]
+    for row in playlist_payload.get("playlists") or []:
+        if isinstance(row, dict) and _text(row.get("name")):
+            playlist_options.append(
+                {"value": _text(row.get("name")), "label": _text(row.get("name"))}
+            )
     return [
         {
             "key": "person_link_recommendations_enabled",
@@ -9115,6 +10358,142 @@ def _person_link_personalization_fields(
                 "recent tracks) when they are speaking."
             ),
         },
+        {
+            "key": "person_link_endless_playback_mode",
+            "label": "Their Endless Playback",
+            "type": "select",
+            "value": _person_select_choice(
+                person_id,
+                "endless_playback_mode",
+                cfg,
+                ENDLESS_PLAYBACK_MODES,
+                "",
+                client,
+            )
+            if _text(person_id)
+            else "",
+            "options": [
+                {"value": "", "label": "Use the global Endless Playback setting"},
+                {"value": "automatic", "label": "Automatic"},
+                {"value": "llm_auto", "label": "Basic Auto (LLM)"},
+                {"value": "library_mix", "label": "Infinite Mix from your library"},
+                {"value": "similar_played", "label": "Similar to what you played"},
+                {"value": "playlist_loop", "label": "Tracks from a playlist"},
+            ],
+            "description": (
+                "How their queue keeps playing after its final track. Automatic tries a "
+                "connected streaming provider, then an Infinite Mix from the library; Basic "
+                "Auto (LLM) is the original AI-picked radio; Infinite Mix favours least-played "
+                "tracks in the genres just heard; Similar to what you played relies on "
+                "streaming providers; Tracks from a playlist loops one chosen mix."
+            ),
+        },
+        {
+            "key": "person_link_endless_playback_playlist",
+            "label": "Their Endless Playback Playlist",
+            "type": "select",
+            "value": _text(link.get("endless_playback_playlist")),
+            "options": playlist_options,
+            "description": (
+                "The playlist looped by their \"Tracks from a playlist\" Endless Playback mode "
+                "(one of their AI-named mixes, or the household's)."
+            ),
+        },
+        {
+            "key": "person_link_smart_shuffle_enabled",
+            "label": "Their Smart Shuffle",
+            "type": "select",
+            "value": _person_tri_state(link, "smart_shuffle_enabled"),
+            "options": [
+                {"value": "", "label": "Use the global Smart Shuffle setting"},
+                {"value": "on", "label": "On for this Person"},
+                {"value": "off", "label": "Off for this Person"},
+            ],
+            "description": (
+                "Smart Shuffle pushes recently played tracks to the back of their shuffled "
+                "queues and mixes several queued sources (albums, playlists, genres) on the "
+                "fly instead of building one enormous queue up front."
+            ),
+        },
+    ]
+
+
+def _person_link_extra_source_fields(
+    link: Dict[str, Any],
+    cfg: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Fields for a Person's optional second linked music source."""
+    extra_source = _person_link_extra_source(link)
+    values = link.get("extra") if isinstance(link.get("extra"), dict) else {}
+    return [
+        {
+            "key": "person_link_extra_source",
+            "label": "Second Music Source (optional)",
+            "type": "select",
+            "value": extra_source,
+            "options": [
+                {"value": "", "label": "None — one source is enough"},
+                {"value": "emby", "label": "Emby (a second account or library)"},
+                {"value": "network_share", "label": "Network share (a second folder)"},
+            ],
+            "description": (
+                "Also play from a second library — their own Emby account or another share "
+                "folder — merged into one catalog. It can even be a second Emby account on "
+                "the same server (fill in that account's fields below)."
+            ),
+        },
+        {
+            "key": "person_link_extra_emby_server_url",
+            "label": "Second Source — Emby Server URL",
+            "type": "text",
+            "value": _text(values.get("server_url")),
+            "placeholder": _text(cfg.get("emby_server_url") or cfg.get("server_url"))
+            or "http://emby.local:8096",
+        },
+        {
+            "key": "person_link_extra_emby_username",
+            "label": "Second Source — Emby Username",
+            "type": "text",
+            "value": _text(values.get("username")),
+        },
+        {
+            "key": "person_link_extra_emby_password",
+            "label": "Second Source — Emby Password",
+            "type": "password",
+            "value": "",
+            "description": "Leave blank to keep the saved password.",
+        },
+        {
+            "key": "person_link_extra_emby_api_key",
+            "label": "Second Source — Emby API Key",
+            "type": "password",
+            "value": _text(values.get("api_key")),
+        },
+        {
+            "key": "person_link_extra_emby_user_id",
+            "label": "Second Source — Emby User ID (optional)",
+            "type": "text",
+            "value": _text(values.get("user_id")),
+        },
+        {
+            "key": "person_link_extra_emby_library_name",
+            "label": "Second Source — Emby Library Name (optional)",
+            "type": "text",
+            "value": _text(values.get("library_name")),
+        },
+        {
+            "key": "person_link_extra_emby_library_folder",
+            "label": "Second Source — Emby Library Folder (optional)",
+            "type": "text",
+            "value": _text(values.get("library_folder")),
+        },
+        {
+            "key": "person_link_extra_share_root_path",
+            "label": "Second Source — Mounted Share Folder",
+            "type": "text",
+            "value": _text(values.get("root_path")),
+            "placeholder": "/mnt/music/<person>-more",
+        },
     ]
 
 
@@ -9146,6 +10525,15 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                 f"on {_target_summary(person_queue_targets)}"
             )
         follow_me_status = _follow_me_card_status(person_id, link, cfg, store)
+        sleep_state = _sleep_timer_state(person_queue)
+        if sleep_state.get("active"):
+            sleep_status = (
+                f"Sleep timer: {max(1, int(_as_float(sleep_state.get('remaining_seconds')) / 60.0))} min left"
+            )
+        elif sleep_state.get("expired"):
+            sleep_status = "Sleep timer stopped the music"
+        else:
+            sleep_status = ""
         library_hint = (
             "Their library has not been synced yet — press Edit, then Save Person Link to load it."
             if source
@@ -9157,10 +10545,20 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
             "group": "people",
             "title": name,
             "subtitle": (
-                f"Plays from {PROVIDER_LABELS[source]}" if source else "Uses the global music source"
+                (
+                    f"Plays from {PROVIDER_LABELS[source]}"
+                    + (
+                        f" + {PROVIDER_LABELS[extra]}"
+                        if (extra := _person_link_extra_source(link))
+                        else ""
+                    )
+                )
+                if source
+                else "Uses the global music source"
             )
             + queue_state
-            + (f" · {follow_me_status}" if follow_me_status else ""),
+            + (f" · {follow_me_status}" if follow_me_status else "")
+            + (f" · {sleep_status}" if sleep_status else ""),
             # The full sync state (and failure reason) lives on the detail
             # line: the host renders it full width, unlike summary rows.
             "detail": _library_summary_value(person_id, not_synced_hint=library_hint, store=store),
@@ -9181,6 +10579,18 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                 {
                     "action": "music_person_link_edit",
                     "label": "Edit",
+                },
+                {
+                    "action": "music_person_sleep_start_30",
+                    "label": "Sleep 30m",
+                },
+                {
+                    "action": "music_person_sleep_start_60",
+                    "label": "Sleep 60m",
+                },
+                {
+                    "action": "music_person_sleep_cancel",
+                    "label": "Cancel Timer",
                 },
                 {
                     "action": "music_person_link_remove",
@@ -9225,7 +10635,8 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                         ),
                     },
                     *_follow_me_link_fields(cfg, link),
-                    *_person_link_personalization_fields(cfg, link, store),
+                    *_person_link_personalization_fields(cfg, link, store, person_id),
+                    *_person_link_extra_source_fields(link, cfg),
                     {
                         "key": "person_link_emby_server_url",
                         "label": "Emby Server URL",
@@ -9369,6 +10780,7 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                     },
                     *_follow_me_link_fields(cfg, {}),
                     *_person_link_personalization_fields(cfg, {}, store),
+                    *_person_link_extra_source_fields({}, cfg),
                     {
                         "key": "person_link_emby_server_url",
                         "label": "Emby Server URL",
@@ -9481,7 +10893,7 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
     else:
         viewer_name = ""
     runtime = _runtime(store)
-    catalog = _catalog(store, active_provider, viewer_person_id)
+    catalog = _person_catalog(store, active_provider, viewer_person_id)
     player = _reconcile_native_playback(_player(store, viewer_person_id), store)
     if viewer_person_id:
         viewer_provider = _person_link_provider(viewer_person_id, active_provider, store)
@@ -9986,6 +11398,20 @@ def _save_person_link_action(values: Dict[str, Any], store: Any) -> Dict[str, An
     prompt_state = _text(values.get("person_link_prompt_context_enabled")).casefold()
     if prompt_state in {"on", "off"}:
         link["prompt_context_enabled"] = prompt_state
+    smart_shuffle_state = _text(values.get("person_link_smart_shuffle_enabled")).casefold()
+    if smart_shuffle_state in {"on", "off"}:
+        link["smart_shuffle_enabled"] = smart_shuffle_state
+    # Selects inherit the stored value when the payload carries an invalid one,
+    # so a stale form can never wipe a saved mode.
+    endless_mode = _text(values.get("person_link_endless_playback_mode")).casefold()
+    if endless_mode not in ENDLESS_PLAYBACK_MODES:
+        endless_mode = _text(existing.get("endless_playback_mode"))
+    if endless_mode in ENDLESS_PLAYBACK_MODES:
+        link["endless_playback_mode"] = endless_mode
+    if "person_link_endless_playback_playlist" in values:
+        link["endless_playback_playlist"] = _text(
+            values.get("person_link_endless_playback_playlist")
+        ).strip()
     for field_key, link_key, override_max in (
         ("person_link_recommendation_interval_hours", "recommendation_interval_hours", 168),
         ("person_link_recommendation_playlist_count", "recommendation_playlist_count", 6),
@@ -10044,6 +11470,40 @@ def _save_person_link_action(values: Dict[str, Any], store: Any) -> Dict[str, An
             link["network_share"] = {
                 "root_path": _text(values.get("person_link_share_root_path")),
             }
+    # Second linked source (optional): their own Emby account or share folder on
+    # top of the primary, so one Person can listen across both.
+    extra_source = _provider_id(values.get("person_link_extra_source"), "")
+    if extra_source:
+        existing_extra = (
+            existing.get("extra") if isinstance(existing.get("extra"), dict) else {}
+        )
+        if extra_source == "emby":
+            extra_password = _text(values.get("person_link_extra_emby_password")) or _text(
+                existing_extra.get("password")
+            )
+            link["extra"] = {
+                "server_url": _normalize_server_url(
+                    values.get("person_link_extra_emby_server_url")
+                ),
+                "auth_mode": "api_key"
+                if _text(values.get("person_link_extra_emby_api_key"))
+                and not _text(values.get("person_link_extra_emby_username"))
+                else "user_token",
+                "username": _text(values.get("person_link_extra_emby_username")),
+                "password": extra_password,
+                "api_key": _text(values.get("person_link_extra_emby_api_key")),
+                "user_id": _text(values.get("person_link_extra_emby_user_id")),
+                "library_name": _text(values.get("person_link_extra_emby_library_name")),
+                "library_folder": _text(values.get("person_link_extra_emby_library_folder")),
+            }
+        else:
+            link["extra"] = {
+                "root_path": _text(values.get("person_link_extra_share_root_path")),
+            }
+        link["extra_source"] = extra_source
+    else:
+        link.pop("extra_source", None)
+        link.pop("extra", None)
     _save_person_link(person_id, link, store)
     # The link now holds the real values; drop the test draft and its result,
     # and close the link editor (the card collapses back to its compact form).
@@ -10061,6 +11521,20 @@ def _save_person_link_action(values: Dict[str, Any], store: Any) -> Dict[str, An
             _record_catalog_stats(
                 store,
                 person_id,
+                {"status": "error", "error": _text(exc)[:200], "failed_at": time.time()},
+            )
+    if link.get("extra_source"):
+        extra_slot = _person_extra_slot(person_id, link["extra_source"])
+        try:
+            extra_catalog = _sync_catalog(store, link["extra_source"], extra_slot)
+            sync_note += (
+                f" Plus {len(extra_catalog.get('tracks') or [])} tracks from their second source."
+            )
+        except Exception as exc:
+            sync_note += f" Their second source did not load yet: {_text(exc)}"
+            _record_catalog_stats(
+                store,
+                extra_slot,
                 {"status": "error", "error": _text(exc)[:200], "failed_at": time.time()},
             )
     return {"ok": True, "message": f"Saved {name}'s music link.{sync_note}"}
@@ -10364,7 +11838,7 @@ def _play_recommendation(
     )
     if not isinstance(playlist, dict):
         raise ValueError("That Tater recommendation is no longer available.")
-    catalog = _catalog(store, provider_id, person_id)
+    catalog = _person_catalog(store, provider_id, person_id)
     track_by_id = {
         _text(track.get("id")): track
         for track in catalog.get("tracks") or []
@@ -10446,7 +11920,7 @@ def handle_htmlui_tab_action(
             # never synced (or their source changed), start one so the Browse
             # Library tabs fill in without re-saving the link.
             if not (
-                _catalog(store, _person_source_id(person_id, store), person_id).get("tracks")
+                _person_catalog(store, _person_source_id(person_id, store), person_id).get("tracks")
                 or []
             ):
                 message += (
@@ -10501,6 +11975,27 @@ def handle_htmlui_tab_action(
         _clear_person_link_edit_target(store)
         return {"ok": True, "message": "Closed the music link editor."}
 
+    if action_name in {
+        "music_person_sleep_start_30",
+        "music_person_sleep_start_60",
+        "music_person_sleep_cancel",
+    }:
+        person_id = _text(values.get("person_link_person_id")) or _text(body.get("id")).replace(
+            "person:", ""
+        )
+        name = _people_person_name(person_id, store) or person_id
+        minutes = {
+            "music_person_sleep_start_30": 30,
+            "music_person_sleep_start_60": 60,
+        }.get(action_name, 0)
+        _set_sleep_timer(minutes, person_id=person_id, client=store)
+        if minutes:
+            return {
+                "ok": True,
+                "message": f"Sleep timer set for {name}: their music stops in {minutes} minutes.",
+            }
+        return {"ok": True, "message": f"Cancelled {name}'s sleep timer."}
+
     if action_name == "music_person_link_test":
         return _test_person_link_emby_action(values, store)
 
@@ -10515,8 +12010,14 @@ def handle_htmlui_tab_action(
             _clear_person_link_edit_target(store)
         if _text(_settings(store).get("webui_view_as_person")) == person_id:
             _save_hash(store, SETTINGS_KEY, {"webui_view_as_person": ""})
+        removed_link = _person_link(person_id, store)
+        extra_clear_keys = [
+            _catalog_key(_person_extra_slot(person_id, source))
+            for source in _person_link_sources(removed_link)[1:]
+        ]
         for clear_key in (
             _catalog_key(person_id),
+            *extra_clear_keys,
             _history_key(person_id),
             _recommendations_key(person_id),
             _profile_key(person_id),
@@ -10811,6 +12312,14 @@ def handle_htmlui_tab_action(
         player["shuffle"] = _as_bool(values.get("shuffle"), bool(player.get("shuffle")))
         player["volume_percent"] = requested_volume
         _save_player(player, store, viewer_person_id)
+        # Sleep timer from the player card: a submitted number arms the
+        # countdown; blank/0 clears it.
+        if "sleep_timer_minutes" in values:
+            raw_sleep = values.get("sleep_timer_minutes")
+            sleep_minutes = (
+                0 if raw_sleep in (None, "") else _as_int(raw_sleep, 0, 0, SLEEP_TIMER_MAX_MINUTES)
+            )
+            _set_sleep_timer(sleep_minutes, person_id=viewer_person_id, client=store)
         targets_changed = old_targets != targets
         player = _route_player_targets(
             targets,
@@ -11655,18 +13164,29 @@ class _MusicStreamHandler(BaseHTTPRequestHandler):
     def _serve_share(self, kind: str, item_id: str) -> None:
         """Serve a mounted-share file or cached artwork directly from disk."""
         try:
-            root = _text(_settings().get("share_root_path"))
+            # Scoped ids carry the share root they were scanned from, so a
+            # Person's own share subfolder streams from their root, not the
+            # household's (legacy unscoped ids keep using the global root).
+            global_root = _text(_settings().get("share_root_path"))
             if kind == "share_art":
+                scope, sep, _bare = _text(item_id).partition(":")
+                index_key = (
+                    f"{SHARE_ART_INDEX_KEY}:{scope}"
+                    if sep
+                    else _share_art_index_key(global_root)
+                )
                 # Index entries are paths this core wrote itself, never client input.
-                entry = _load_json(globals().get("redis_client"), SHARE_ART_INDEX_KEY, {}).get(item_id)
+                entry = _load_json(globals().get("redis_client"), index_key, {}).get(item_id)
                 art_path = _text(entry.get("path")) if isinstance(entry, dict) else ""
                 if not art_path or not os.path.isfile(art_path):
                     self._send_error(404, "Artwork is not available.")
                     return
                 _share_send_file(self, art_path)
                 return
-            rel_path = _share_relpath_from_id(item_id)
-            file_path = _share_contained_path(root, rel_path or "") if rel_path else None
+            root, rel_path = _share_root_and_relpath_from_id(item_id, global_root)
+            file_path = (
+                _share_contained_path(root or "", rel_path or "") if rel_path else None
+            )
             if not file_path or not os.path.isfile(file_path):
                 self._send_error(404, "Share file is not available.")
                 return
@@ -11802,27 +13322,35 @@ def run(stop_event: Optional[object] = None) -> None:
                     runtime = _runtime()
                 # Linked People refresh their own catalogs on the same cadence.
                 for pid in linked_person_ids:
-                    try:
-                        person_payload = _catalog(person_id=pid)
-                        person_provider = _person_source_id(pid)
-                        person_synced = _as_float(person_payload.get("synced_at"))
-                        if (
-                            _provider_id(person_payload.get("provider"), "") != person_provider
-                            or not person_synced
-                            or now - person_synced >= interval
-                        ):
-                            _sync_catalog(provider_id=person_provider, person_id=pid)
-                    except Exception as exc:
-                        logger.warning(
-                            "[Music] library sync for %s failed: %s",
-                            _people_person_name(pid) or pid,
-                            exc,
-                        )
+                    for source_index, source_id in enumerate(
+                        _person_catalog_source_ids(pid, redis_client)
+                    ):
+                        # Each linked source keeps its own catalog slot; a
+                        # Person with two sources syncs and plays from both.
+                        try:
+                            slot_id = pid if source_index == 0 else _person_extra_slot(pid, source_id)
+                            slot_payload = _catalog(provider_id=source_id, person_id=slot_id)
+                            slot_synced = _as_float(slot_payload.get("synced_at"))
+                            if (
+                                _provider_id(slot_payload.get("provider"), "") != source_id
+                                or not slot_synced
+                                or now - slot_synced >= interval
+                            ):
+                                _sync_catalog(provider_id=source_id, person_id=slot_id)
+                        except Exception as exc:
+                            logger.warning(
+                                "[Music] library sync for %s failed: %s",
+                                _people_person_name(pid) or pid,
+                                exc,
+                            )
                 # Every queue slot (shared + each Person's) is advanced and
                 # kept topped up independently, so two People can listen to
                 # their own music in different rooms at the same time.
                 for queue_id in _active_queue_ids(store):
                     try:
+                        # Sleep timers first: an expired timer force-stops the
+                        # queue, so no maintenance (or refill) runs afterwards.
+                        _sleep_timer_tick(store, queue_id)
                         _advance_finished_player(store, person_id=queue_id)
                         _schedule_continuation_refresh(
                             person_id=queue_id,
