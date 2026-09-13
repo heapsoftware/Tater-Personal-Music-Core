@@ -1000,7 +1000,95 @@ class PerPersonLinkageTests(unittest.TestCase):
         finally:
             self.core._PEOPLE_API_MODULE = original_people
 
-    def test_view_as_switch_exit_and_validation(self):
+    def test_person_link_test_result_and_typed_values_survive_refetch(self):
+        # The tab UI refetches after every action and only toasts errors, so the
+        # core records the test outcome and the typed values for the cards to
+        # prefill — otherwise a passing test looks like nothing happened and
+        # the form empties itself.
+        people = types.SimpleNamespace(
+            load_store=lambda _client=None: {
+                "people": [
+                    {"id": "person_zoe", "display_name": "Zoe"},
+                    {"id": "person_ama", "display_name": "Ama"},
+                ]
+            }
+        )
+        original_people = self.core._PEOPLE_API_MODULE
+        original_provider = self.core.EmbyMusicProvider
+        self.core._PEOPLE_API_MODULE = people
+
+        class StubEmby:
+            def __init__(self, **_kwargs):
+                pass
+
+            @property
+            def connected(self):
+                return True
+
+            def authenticate(self, *_args, **_kwargs):
+                return "tok", "u-zoe"
+
+        self.core.EmbyMusicProvider = StubEmby
+        try:
+            self.link_person()
+            # A passing test is recorded and shown on the linked person's card,
+            # with the password left blank (blank still means keep the saved one).
+            draft = {
+                "person_link_person_id": "person_zoe",
+                "person_link_source": "emby",
+                "person_link_emby_server_url": "http://emby.local:8096",
+                "person_link_emby_username": "zoe",
+                "person_link_emby_password": "right-pw",
+                "person_link_emby_library_name": "Music",
+            }
+            result = self.core._test_person_link_emby_action(draft, self.redis)
+            state = self.core._person_link_test_state(self.redis)
+            self.assertEqual(state["status"], "ok")
+            self.assertIn("signed in", result["message"])
+            data = self.core.get_htmlui_tab_data(redis_client=self.redis)
+            cards = {item.get("id"): item for item in data["ui"]["item_forms"]}
+            linked_rows = {
+                row["label"]: row["value"]
+                for row in cards["person:person_zoe"].get("summary_rows") or []
+            }
+            self.assertIn("passed", list(linked_rows)[0])
+            linked_fields = {
+                field["key"]: field["value"]
+                for field in cards["person:person_zoe"]["fields"]
+            }
+            self.assertEqual(linked_fields["person_link_emby_server_url"], "http://emby.local:8096")
+            self.assertEqual(linked_fields["person_link_emby_username"], "zoe")
+            self.assertEqual(linked_fields["person_link_emby_password"], "")
+            # A failing test for a not-yet-linked person prefills the new-link
+            # card, including the chosen Person and the typed password.
+            with self.assertRaises(ValueError):
+                self.core._test_person_link_emby_action(
+                    {
+                        "person_link_person_id": "person_ama",
+                        "person_link_emby_server_url": "",
+                        "person_link_emby_username": "ama",
+                        "person_link_emby_password": "ama-pw",
+                    },
+                    self.redis,
+                )
+            data = self.core.get_htmlui_tab_data(redis_client=self.redis)
+            cards = {item.get("id"): item for item in data["ui"]["item_forms"]}
+            new_rows = {
+                row["label"]: row["value"]
+                for row in cards["person:new"].get("summary_rows") or []
+            }
+            self.assertIn("failed", list(new_rows)[0])
+            new_fields = {
+                field["key"]: field["value"] for field in cards["person:new"]["fields"]
+            }
+            self.assertEqual(new_fields["person_link_person_id"], "person_ama")
+            self.assertEqual(new_fields["person_link_emby_password"], "ama-pw")
+            # Saving or removing the link clears the recorded test state.
+            self.core._clear_person_link_test_state("person_ama", self.redis)
+            self.assertEqual(self.core._person_link_test_state(self.redis), {})
+        finally:
+            self.core._PEOPLE_API_MODULE = original_people
+            self.core.EmbyMusicProvider = original_provider
         original_people = self.core._PEOPLE_API_MODULE
         self.core._PEOPLE_API_MODULE = types.SimpleNamespace(
             load_store=lambda _client=None: {
