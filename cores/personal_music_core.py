@@ -3684,7 +3684,8 @@ def _plex_tv_request(
         body = response.json()
     except Exception as exc:
         raise RuntimeError(f"plex.tv returned an unparseable response for {path}.") from exc
-    return body if isinstance(body, dict) else {}
+    # /resources answers with a top-level JSON array; keep lists too.
+    return body if isinstance(body, (dict, list)) else {}
 
 
 def _plex_tv_signin(login: str, password: str) -> str:

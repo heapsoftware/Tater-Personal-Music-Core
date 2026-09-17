@@ -5584,5 +5584,570 @@ class JellyfinProviderTests(unittest.TestCase):
         self.assertIn("server URL", str(ctx.exception))
 
 
+class PlexProviderTests(unittest.TestCase):
+    """Plex auth modes, plex.tv discovery, catalog mapping, token handling."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.core = load_personal_music_core()
+        cls.helpers = sys.modules["helpers"]
+
+    def setUp(self):
+        self.redis = FakeRedis()
+        self.helpers.redis_client = self.redis
+        self.core.redis_client = self.redis
+        self.core._shutdown_stream_server()
+
+    def tearDown(self):
+        self.core._shutdown_stream_server()
+
+    def save_settings(self, mapping):
+        self.core._save_hash(self.redis, self.core.SETTINGS_KEY, mapping)
+
+    def _respond(self, body, status=200):
+        response = types.SimpleNamespace(
+            status_code=status,
+            ok=status < 400,
+            content=json.dumps(body).encode(),
+        )
+        response.json = lambda: json.loads(response.content)
+        return response
+
+    def _provider(self, **overrides):
+        values = {
+            "server_url": "http://plex.local:32400",
+            "token": "SEED",
+            "user_id": "",
+            "stream_scope": "",
+        }
+        values.update(overrides)
+        return self.core.PlexMusicProvider(**values)
+
+    def _mock_http(self, handler):
+        seen = []
+
+        def fake_request(method, url, **kwargs):
+            seen.append({"method": method.upper(), "url": url, "kwargs": kwargs})
+            return handler(method.upper(), url, kwargs)
+
+        original = self.core.requests.request
+        self.core.requests.request = fake_request
+        return seen, original
+
+    def _track_row(self, number):
+        return {
+            "ratingKey": f"t{number}",
+            "title": f"Song {number}",
+            "grandparentTitle": "Artist",
+            "parentTitle": "Album",
+            "parentRatingKey": "al1",
+            "duration": 180000,
+            "thumb": f"/library/metadata/{number}/thumb",
+            "index": number,
+            "Media": [
+                {
+                    "container": "mp3",
+                    "Part": [
+                        {
+                            "key": f"/library/parts/{number}/1/file.mp3",
+                            "file": f"/music/song{number}.mp3",
+                        }
+                    ],
+                }
+            ],
+        }
+
+    # ---- credential resolution: three auth modes ----
+
+    def test_own_account_signin_resolves_token_user_and_server(self):
+        def handler(method, url, _kwargs):
+            if url == "https://plex.tv/api/v2/users/signin":
+                return self._respond({"authToken": "OWNER"})
+            if url == "https://plex.tv/api/v2/user":
+                return self._respond({"uuid": "plex-u1"})
+            if url == "https://plex.tv/api/v2/resources":
+                return self._respond(
+                    [
+                        {
+                            "name": "Home",
+                            "owned": True,
+                            "product": "Plex Media Server",
+                            "connections": [{"uri": "http://plex.local:32400"}],
+                        },
+                        {
+                            "name": "Friend",
+                            "owned": False,
+                            "product": "Plex Media Server",
+                            "connections": [{"uri": "http://friend.local:32400"}],
+                        },
+                    ]
+                )
+            return self._respond({})
+
+        seen, original = self._mock_http(handler)
+        try:
+            resolved = self.core._plex_resolve_credentials(
+                {"plex_auth_mode": "own_account", "plex_username": "zoe", "plex_password": "pw"},
+                {},
+                store=self.redis,
+            )
+        finally:
+            self.core.requests.request = original
+        self.assertEqual(resolved["token"], "OWNER")
+        self.assertEqual(resolved["user_id"], "plex-u1")
+        # Discovery pre-fills the server from an owned server's first connection.
+        self.assertEqual(resolved["server_url"], "http://plex.local:32400")
+        self.assertEqual(resolved["auth_mode"], "own_account")
+        self.assertIn("from discovery", resolved["detail"])
+        self.assertEqual(
+            [entry["method"] for entry in seen],
+            ["POST", "GET", "GET"],
+        )
+
+    def test_home_user_mode_switches_into_the_member_with_a_pin(self):
+        def handler(method, url, kwargs):
+            if url == "https://plex.tv/api/v2/users/signin":
+                return self._respond({"authToken": "OWNER"})
+            if url == "https://plex.tv/api/v2/home/users":
+                return self._respond(
+                    {
+                        "users": [
+                            {"uuid": "uuid-sam", "title": "Sam"},
+                            {"uuid": "uuid-zoe", "title": "Zoe"},
+                        ]
+                    }
+                )
+            if "/home/users/" in url and url.endswith("/switch"):
+                self.assertEqual(kwargs.get("data"), {"pin": "4321"})
+                return self._respond({"authToken": "ZOE-TOK"})
+            return self._respond({})
+
+        seen, original = self._mock_http(handler)
+        try:
+            resolved = self.core._plex_resolve_credentials(
+                {
+                    "plex_auth_mode": "home_user",
+                    "plex_username": "owner",
+                    "plex_password": "pw",
+                    "plex_home_user": "zoe",
+                    "plex_home_user_pin": "4321",
+                    "plex_server_url": "http://plex.local:32400",
+                },
+                {},
+                store=self.redis,
+            )
+        finally:
+            self.core.requests.request = original
+        self.assertEqual(resolved["token"], "ZOE-TOK")
+        self.assertEqual(resolved["user_id"], "uuid-zoe")
+        self.assertIn("Zoe Home member", resolved["detail"])
+        switch_urls = [
+            entry["url"] for entry in seen if entry["url"].endswith("/switch")
+        ]
+        self.assertEqual(
+            switch_urls,
+            ["https://plex.tv/api/v2/home/users/uuid-zoe/switch"],
+        )
+
+    def test_home_user_mode_names_the_visible_members_when_missing(self):
+        def handler(method, url, _kwargs):
+            if url == "https://plex.tv/api/v2/users/signin":
+                return self._respond({"authToken": "OWNER"})
+            if url == "https://plex.tv/api/v2/home/users":
+                return self._respond(
+                    {
+                        "users": [
+                            {"uuid": "uuid-zoe", "title": "Zoe"},
+                            {"uuid": "uuid-sam", "title": "Sam"},
+                        ]
+                    }
+                )
+            return self._respond({})
+
+        _, original = self._mock_http(handler)
+        try:
+            with self.assertRaises(ValueError) as ctx:
+                self.core._plex_resolve_credentials(
+                    {
+                        "plex_auth_mode": "home_user",
+                        "plex_username": "owner",
+                        "plex_password": "pw",
+                        "plex_home_user": "nobody",
+                        "plex_server_url": "http://plex.local:32400",
+                    },
+                    {},
+                    store=self.redis,
+                )
+        finally:
+            self.core.requests.request = original
+        self.assertIn("nobody", str(ctx.exception))
+        self.assertIn("Zoe, Sam", str(ctx.exception))
+
+    def test_signin_modes_require_a_username_and_password(self):
+        with self.assertRaises(ValueError) as ctx:
+            self.core._plex_resolve_credentials(
+                {"plex_auth_mode": "own_account", "plex_username": "zoe"},
+                {},
+                store=self.redis,
+            )
+        self.assertIn("username and password", str(ctx.exception))
+        # An unknown mode falls back to the default, which needs credentials too.
+        with self.assertRaises(ValueError):
+            self.core._plex_resolve_credentials(
+                {"plex_auth_mode": "bogus"}, {}, store=self.redis
+            )
+
+    def test_plex_tv_rejection_becomes_a_value_error(self):
+        _, original = self._mock_http(
+            lambda method, url, _kwargs: self._respond({}, status=401)
+        )
+        try:
+            with self.assertRaises(ValueError) as ctx:
+                self.core._plex_resolve_credentials(
+                    {"plex_auth_mode": "own_account", "plex_username": "zoe", "plex_password": "pw"},
+                    {},
+                    store=self.redis,
+                )
+        finally:
+            self.core.requests.request = original
+        self.assertIn("Plex rejected the credentials", str(ctx.exception))
+
+    def test_manual_token_mode_needs_a_token_and_a_server(self):
+        with self.assertRaises(ValueError) as ctx:
+            self.core._plex_resolve_credentials(
+                {"plex_auth_mode": "manual_token"}, {}, store=self.redis
+            )
+        self.assertIn("Paste the Plex token", str(ctx.exception))
+        with self.assertRaises(ValueError) as ctx:
+            self.core._plex_resolve_credentials(
+                {"plex_auth_mode": "manual_token", "plex_token": "SEED"},
+                {},
+                store=self.redis,
+            )
+        self.assertIn("server URL", str(ctx.exception))
+
+    def test_manual_token_mode_never_contacts_plex_tv(self):
+        def fail(_method, _url, _kwargs):
+            raise AssertionError("plex.tv must not be contacted in manual-token mode")
+
+        original = self.core.requests.request
+        self.core.requests.request = fail
+        try:
+            resolved = self.core._plex_resolve_credentials(
+                {
+                    "plex_auth_mode": "manual_token",
+                    "plex_token": "SEED",
+                    "plex_server_url": "http://plex.local:32400",
+                },
+                {},
+                store=self.redis,
+            )
+        finally:
+            self.core.requests.request = original
+        self.assertEqual(resolved["token"], "SEED")
+        self.assertEqual(resolved["server_url"], "http://plex.local:32400")
+        self.assertIn("pasted token", resolved["detail"])
+
+    def test_resources_only_keeps_media_servers(self):
+        def handler(method, url, _kwargs):
+            if url == "https://plex.tv/api/v2/resources":
+                return self._respond(
+                    [
+                        {
+                            "name": "Home",
+                            "owned": True,
+                            "product": "Plex Media Server",
+                            "connections": [
+                                {"uri": "http://plex.local:32400"},
+                                {"uri": "https://plex-ssl.local:32400"},
+                            ],
+                        },
+                        {"name": "Plexamp box", "product": "Plexamp", "connections": []},
+                        "not-a-dict",
+                        {"name": "No product", "connections": [{"uri": "http://x.local"}]},
+                    ]
+                )
+            return self._respond({})
+
+        _, original = self._mock_http(handler)
+        try:
+            servers = self.core._plex_tv_resources("OWNER")
+        finally:
+            self.core.requests.request = original
+        self.assertEqual([server["name"] for server in servers], ["Home"])
+        self.assertTrue(servers[0]["owned"])
+        self.assertEqual(
+            servers[0]["connections"],
+            ["http://plex.local:32400", "https://plex-ssl.local:32400"],
+        )
+
+    # ---- track mapping ----
+
+    def test_track_row_maps_titles_duration_and_part_path(self):
+        row = self._track_row(3)
+        track = self.core._plex_track_row(row)
+        self.assertEqual(track["id"], "t3")
+        self.assertEqual(track["provider_track_id"], "t3")
+        self.assertEqual(track["stream_path"], "/library/parts/3/1/file.mp3")
+        self.assertEqual(track["title"], "Song 3")
+        self.assertEqual(track["artist"], "Artist")
+        self.assertEqual(track["album_artist"], "Artist")
+        self.assertEqual(track["album"], "Album")
+        self.assertEqual(track["albumId"], "al1")
+        self.assertEqual(track["track_number"], 3)
+        self.assertEqual(track["duration_seconds"], 180.0)
+        self.assertEqual(track["container"], "mp3")
+        self.assertEqual(track["artwork_path"], "/library/metadata/3/thumb")
+        self.assertEqual(track["provider"], "plex")
+
+    def test_track_row_converts_millisecond_durations_and_suffix_containers(self):
+        row = self._track_row(1)
+        row["duration"] = 210  # already seconds — must not be divided again
+        del row["Media"][0]["container"]
+        track = self.core._plex_track_row(row)
+        self.assertEqual(track["duration_seconds"], 210.0)
+        self.assertEqual(track["container"], "mp3")
+        self.assertEqual(track["path"], "/music/song1.mp3")
+
+    # ---- catalog & playlists ----
+
+    def test_catalog_walks_sections_with_container_pagination(self):
+        original_page_size = self.core.PLEX_PAGE_SIZE
+        self.core.PLEX_PAGE_SIZE = 2  # small pages so the walk really pages
+        try:
+
+            def handler(method, url, kwargs):
+                if url.endswith("/library/sections"):
+                    return self._respond(
+                        {
+                            "MediaContainer": {
+                                "Directory": [
+                                    {"key": "1", "type": "artist", "title": "Music"},
+                                    {"key": "2", "type": "movie", "title": "Films"},
+                                ]
+                            }
+                        }
+                    )
+                if "/library/sections/1/all" in url:
+                    headers = kwargs.get("headers") or {}
+                    offset = int(headers.get("X-Plex-Container-Start", 0))
+                    rows = [self._track_row(1), self._track_row(2)] if offset == 0 else [self._track_row(3)]
+                    return self._respond({"MediaContainer": {"Metadata": rows}})
+                if url.endswith("/playlists"):
+                    return self._respond({"MediaContainer": {"Metadata": []}})
+                return self._respond({})
+
+            seen, original = self._mock_http(handler)
+            try:
+                payload = self._provider().catalog()
+            finally:
+                self.core.requests.request = original
+            paged = [
+                entry["kwargs"]["headers"]["X-Plex-Container-Start"]
+                for entry in seen
+                if "/library/sections/1/all" in entry["url"]
+            ]
+            self.assertEqual(paged, [0, 2])
+            # Shared users only see shared sections — the movie section is never walked.
+            self.assertFalse(any("/library/sections/2/all" in entry["url"] for entry in seen))
+            self.assertEqual(len(payload["tracks"]), 3)
+            self.assertEqual(payload["tracks"][0]["id"], "t1")
+            self.assertEqual(payload["total"], 3)
+            self.assertTrue(payload["catalog_id"].startswith("plex:"))
+            self.assertEqual(list(payload["libraries"].values()), ["Music"])
+        finally:
+            self.core.PLEX_PAGE_SIZE = original_page_size
+
+    def test_user_playlists_collect_audio_playlist_tracks(self):
+        def handler(method, url, _kwargs):
+            if url.endswith("/playlists"):
+                return self._respond(
+                    {
+                        "MediaContainer": {
+                            "Metadata": [
+                                {
+                                    "ratingKey": "p1",
+                                    "title": "Chill",
+                                    "summary": "quiet",
+                                    "playlistType": "audio",
+                                },
+                                {"ratingKey": "p2", "title": "Movies", "playlistType": "video"},
+                            ]
+                        }
+                    }
+                )
+            if "/playlists/p1/items" in url:
+                return self._respond(
+                    {
+                        "MediaContainer": {
+                            "Metadata": [{"ratingKey": "t1"}, {"ratingKey": "t2"}]
+                        }
+                    }
+                )
+            return self._respond({})
+
+        _, original = self._mock_http(handler)
+        try:
+            playlists = self._provider().user_playlists()
+        finally:
+            self.core.requests.request = original
+        self.assertEqual(len(playlists), 1)
+        self.assertEqual(playlists[0]["id"], "plex_playlist:p1")
+        self.assertEqual(playlists[0]["name"], "Chill")
+        self.assertEqual(playlists[0]["description"], "quiet")
+        self.assertEqual(playlists[0]["track_ids"], ["t1", "t2"])
+
+    # ---- streams, artwork & the token boundary ----
+
+    def test_request_401_clears_the_cached_token(self):
+        provider = self._provider()
+        provider._save_cached_auth("SEED", "", self.redis)
+        key = provider._auth_cache_key()
+        self.assertTrue(self.redis.hgetall(key))
+
+        _, original = self._mock_http(
+            lambda method, url, _kwargs: self._respond({}, status=401)
+        )
+        try:
+            with self.assertRaises(PermissionError) as ctx:
+                provider.request("GET", "library/sections")
+        finally:
+            self.core.requests.request = original
+        self.assertIn("re-test the Plex connection", str(ctx.exception))
+        self.assertEqual(self.redis.hgetall(key), {})
+
+    def test_stream_and_artwork_urls_keep_the_token_server_side(self):
+        self.save_settings(
+            {"stream_token": "tok", "stream_host": "127.0.0.1", "stream_bind_port": "8905"}
+        )
+        track = {
+            "provider_track_id": "t1",
+            "stream_path": "/library/parts/1/1/file.flac",
+            "artwork_path": "/library/metadata/1/thumb",
+        }
+        provider = self._provider()
+        url = provider.stream_url(track)
+        self.assertIn("/stream/tok/plex/", url)
+        # The part path contains "/" — the proxy id arrives quoted.
+        self.assertIn("library%2Fparts", url)
+        self.assertNotIn("SEED", url)
+        self.assertIn("/stream/tok/plex_art/", provider.artwork_url(track))
+        scoped = self._provider(stream_scope="person_zoe")
+        self.assertIn("/stream/tok/plex:person_zoe/", scoped.stream_url(track))
+        self.assertIn("/stream/tok/plex_art:person_zoe/", scoped.artwork_url(track))
+
+    def test_proxy_request_attaches_the_token_to_the_url(self):
+        provider = self._provider()
+        url, headers = provider.proxy_request("/library/parts/1/1/file.flac")
+        self.assertTrue(
+            url.startswith("http://plex.local:32400/library/parts/1/1/file.flac")
+        )
+        self.assertIn("X-Plex-Token=SEED", url)
+        self.assertEqual(headers, {"Accept": "*/*"})
+        # A relative id is normalized to an absolute library path.
+        url_b, _headers = provider.proxy_request("library/parts/2/1/file.flac")
+        self.assertTrue(url_b.startswith("http://plex.local:32400/library/parts/"))
+
+    def test_proxy_kinds_resolve_per_person_scope(self):
+        self.save_settings(
+            {
+                "stream_token": "tok",
+                "stream_host": "127.0.0.1",
+                "stream_bind_port": "8906",
+                "plex_server_url": "http://house.local:32400",
+                "plex_token": "HOUSE",
+            }
+        )
+        self.redis.hset(
+            self.core.PERSON_LINKS_KEY,
+            mapping={
+                "person_zoe": json.dumps(
+                    {
+                        "music_source": "plex",
+                        "plex": {
+                            "server_url": "http://zoe.local:32400",
+                            "token": "ZOE-TOK",
+                        },
+                    }
+                )
+            },
+        )
+        url, _headers = self.core._upstream_request(
+            "plex:person_zoe", "/library/parts/1/1/file.flac"
+        )
+        self.assertTrue(url.startswith("http://zoe.local:32400/library/parts/1/1/file.flac"))
+        self.assertIn("X-Plex-Token=ZOE-TOK", url)
+        # The unscoped kind serves the household server.
+        url_house, _headers = self.core._upstream_request(
+            "plex", "/library/parts/2/1/file.flac"
+        )
+        self.assertTrue(url_house.startswith("http://house.local:32400/"))
+        self.assertIn("X-Plex-Token=HOUSE", url_house)
+
+    # ---- connect & person-link test flows ----
+
+    def test_connect_action_saves_settings_and_syncs(self):
+        def handler(method, url, _kwargs):
+            if url.endswith("/library/sections"):
+                return self._respond(
+                    {
+                        "MediaContainer": {
+                            "Directory": [{"key": "1", "type": "artist", "title": "Music"}]
+                        }
+                    }
+                )
+            if "/library/sections/1/all" in url:
+                return self._respond({"MediaContainer": {"Metadata": [self._track_row(1)]}})
+            if url.endswith("/playlists"):
+                return self._respond({"MediaContainer": {"Metadata": []}})
+            return self._respond({})
+
+        _, original = self._mock_http(handler)
+        try:
+            result = self.core.handle_htmlui_tab_action(
+                action="music_provider_connect",
+                payload={
+                    "id": "provider:plex",
+                    "values": {
+                        "plex_auth_mode": "manual_token",
+                        "plex_server_url": "http://plex.local:32400",
+                        "plex_token": "SEED",
+                    },
+                },
+                redis_client=self.redis,
+            )
+            self.assertTrue(result["ok"])
+            cfg = self.core._settings(self.redis)
+            self.assertEqual(cfg["plex_server_url"], "http://plex.local:32400")
+            self.assertEqual(cfg["plex_token"], "SEED")
+            self.assertEqual(cfg["provider"], "plex")
+            self.assertTrue(self.core._paired(cfg, "plex"))
+        finally:
+            self.core.requests.request = original
+
+    def test_person_link_test_action(self):
+        def handler(method, url, _kwargs):
+            if url.endswith("/library/sections"):
+                return self._respond({"MediaContainer": {"Directory": []}})
+            return self._respond({})
+
+        _, original = self._mock_http(handler)
+        try:
+            result = self.core._test_person_link_source_action(
+                {
+                    "person_link_person_id": "person_zoe",
+                    "person_link_source": "plex",
+                    "person_link_plex_auth_mode": "manual_token",
+                    "person_link_plex_server_url": "http://plex.local:32400",
+                    "person_link_plex_token": "SEED",
+                },
+                self.redis,
+            )
+        finally:
+            self.core.requests.request = original
+        self.assertTrue(result["ok"])
+        self.assertIn("Plex connection works", result["message"])
+
+
 if __name__ == "__main__":
     unittest.main()
