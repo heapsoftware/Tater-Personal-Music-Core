@@ -54,10 +54,11 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.4.0"
+__version__ = "3.5.0"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
-    "Per-person music for Tater: link each Person to their own Emby user or network-share folder (or both), browse "
+    "Per-person music for Tater: link each Person to their own Emby, Jellyfin, Subsonic, or Plex account or "
+    "network-share folder (or two sources at once), browse "
     "and play their library with voice control, and build AI-named recommendations from each Person's listening "
     "history across clock-synchronized satellites, native Sonos groups, stereo pairs, and media players — with "
     "selectable Endless Playback modes (AI radio, offline Infinite Mix, or looping a chosen playlist), Smart "
@@ -68,6 +69,9 @@ TAGS = [
     "music",
     "player",
     "emby",
+    "jellyfin",
+    "subsonic",
+    "plex",
     "network-share",
     "per-person",
     "satellite",

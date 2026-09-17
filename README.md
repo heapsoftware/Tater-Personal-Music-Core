@@ -1,7 +1,8 @@
 # Personal Music Core for Tater
 
 A standalone, unofficial [Tater](https://github.com/TaterTotterson/Tater) core that
-gives every Person their own music: link each Person to their own **Emby** user or
+gives every Person their own music: link each Person to their own **Emby**,
+**Jellyfin**, **Subsonic** (Navidrome/Airsonic/Gonic), or **Plex** account, or
 their own folder on a **network share** (SMB/CIFS or NFS), then browse and play
 their library with voice control, per-person recommendations, and multi-room
 playback across clock-synchronized satellites, native Sonos groups, stereo pairs,
@@ -28,11 +29,12 @@ yourself.
 
 Open Tater → **Personal Music** tab → **Sources**.
 
-**Sources is the single, global music source for the household** — one Emby
-login (or API key), or one mounted share folder. This is the library that
+**Sources is the single, global music source for the household** — one Emby,
+Jellyfin, Subsonic, or Plex login (or an Emby/Jellyfin API key), or one mounted
+share folder. This is the library that
 People *without* their own link hear, and what the dashboard player bar and
 client music use. It is **not** how each Person gets their own library: giving
-a Person their own Emby user or share folder is done per-Person in the
+a Person their own provider account or share folder is done per-Person in the
 **People** section (see [Per-person links](#per-person-links)), which
 overrides the global source for that Person only.
 
@@ -58,6 +60,63 @@ overrides the global source for that Person only.
 - **Test Emby Connection** (on Person link cards) signs in and verifies the
   Library Name and Library Folder resolve — a mismatch is reported there with
   the failing name, before anything is saved or synced.
+
+### Jellyfin
+
+Works like the Emby source against a Jellyfin server (10.8–10.10 tested header
+styles):
+
+- **Username & password** (recommended): the core signs in per user and honors
+  each Jellyfin user's library access, with streams proxied so the token never
+  appears in any URL a playback target fetches.
+- **Server API key**: streams directly from Jellyfin; set the Jellyfin User ID
+  when the server has more than one user.
+- **Library Name / Library Folder** (optional): the same optional library and
+  subfolder scoping as Emby (see above).
+
+### Subsonic (Navidrome, Airsonic, Gonic)
+
+- **Server URL, Username, Password**: the core speaks the Subsonic REST API
+  with its salted-token auth (the password is never sent as-is; each request
+  carries a fresh `md5(password + salt)` token). Navidrome, Airsonic, and
+  Gonic speak the same API — just point the core at whichever one you run.
+- The whole music library is synced (albums are walked page by page, capped at
+  the catalog limit); the server decides what the account can see.
+- **Test Subsonic Connection** pings the server with the credentials before
+  anything is saved.
+
+### Plex
+
+One music library on a Plex Media Server, with three sign-in styles (a
+**Sign-In Style** select on both the Sources card and each Person's link card;
+all of them converge on a server URL plus a token):
+
+- **Home user** (default): the owner signs in to plex.tv once, and the source
+  plays as one **named Plex Home member** (with that member's PIN when the
+  member is PIN-protected). The Server URL can be left blank — plex.tv
+  discovery fills in a reachable server (a manual entry always wins).
+- **Own account**: signs in with that account's **own** plex.tv username and
+  password — the route for shared or family accounts the owner cannot switch
+  into (access is naturally scoped to the libraries shared with that account).
+- **Manual token**: paste an `X-Plex-Token` and the server URL directly; the
+  escape hatch when the plex.tv sign-in flows misbehave.
+- The resolved token stays **server-side**: streams and artwork are proxied
+  through this core's stream server, so the token never appears in any URL a
+  playback target fetches. Only `artist`-type music sections are synced, and a
+  shared account sees only the sections shared with it.
+- **Test Plex Connection** resolves the credentials (including the plex.tv
+  sign-in and member switch) and checks the server answers before anything is
+  saved.
+
+### Supported audio formats
+
+Satellite speakers decode **WAV, MP3, and FLAC** natively (verified against the
+satellite firmware). **AAC, OGG, Opus, and M4A have no decoder** and will not
+play, so libraries are assumed to be WAV/MP3/FLAC. Where a server can
+transcode, the core asks it to: proxied Emby/Jellyfin streams request
+normalized WAV, and Subsonic streams request `format=wav` for non-decodable
+containers (Navidrome and friends transcode server-side). Plex and network
+shares serve original files, so those libraries must be WAV/MP3/FLAC.
 
 ### Network share (SMB/CIFS or NFS)
 
@@ -85,7 +144,8 @@ Three kinds of playlist can play by name (voice: *"play my Christmas Music
 playlist"*) and feed the **Tracks from a playlist** Endless Playback mode:
 
 - **AI-named mixes** — the dynamic playlists on the Recommendations tab.
-- **User-created playlists** — playlists you built in Emby, and `.m3u`/`.m3u8`
+- **User-created playlists** — playlists you built in Emby, Jellyfin, Subsonic,
+  or Plex, and `.m3u`/`.m3u8`
   files anywhere on the share (entries resolve relative to the playlist file's
   folder or the share root; remote URLs are skipped). Names are matched
   case-insensitively; a person's own source is searched.
@@ -111,11 +171,15 @@ time.
 **Personal Music** tab → **People** → **Add Person Link** (the form opens on
 that card; **Edit** on a linked Person's card reopens it). Each Person can get:
 
-- their own Emby user/library on a shared server, or
+- their own Emby or Jellyfin user/library on a shared server,
+- their own Subsonic account (Navidrome/Airsonic/Gonic included),
+- their own Plex account (three sign-in styles — see [Plex](#plex)),
 - their own subfolder on a mounted share (e.g. `/mnt/music/<person>`), or
-- **both at once** — a second linked source (another Emby account/library, or a
-  second share folder) merges into one catalog under the same card's
-  **Second Music Source** setting.
+- **two sources at once** — a second linked source (any mix of the above)
+  merges into one catalog under the same card's **Second Music Source**
+  setting. The two sources are **parallel, not master/backup**: a track plays
+  from wherever it lives, so "play Justin Timberlake" plays from whichever
+  linked source has the artist.
 
 A linked Person gets their own catalog, listening history, AI-named
 recommendations, and prompt-ready music profile, scoped under
@@ -138,7 +202,8 @@ Playback**):
 - **Similar to what you played** — relies purely on streaming providers; until
   one is connected it falls back to the library mix so the music never stops.
 - **Tracks from a playlist** — continuously loops one chosen playlist: an AI-named
-  mix from the Recommendations tab, a playlist you created in Emby, an `.m3u`
+  mix from the Recommendations tab, a playlist you created in Emby, Jellyfin,
+  Subsonic, or Plex, an `.m3u`
   file on the share, or a [Folder Playlists](#playlists) entry (pick it globally
   or per Person).
 
@@ -199,7 +264,7 @@ pressing play, pause, or stop in the meantime cancels the wait and acts
 immediately. Each Person can set their own delay on their link card (blank =
 use the global setting; 0 = resume immediately).
 
-### Filling in an Emby link on a Person's card
+### Filling in a provider link on a Person's card
 
 For **Emby (own user/library)**, fill in the Person's card in **People**:
 
@@ -224,6 +289,22 @@ For **Emby (own user/library)**, fill in the Person's card in **People**:
   Person's catalog (any failure shows on the card's sync line).
 - The **password field stays blank on the saved card** — re-enter it only when
   changing it; a blank field keeps the saved password.
+
+For **Jellyfin**, the card is the same as Emby's — Server URL, Username /
+Password (or an API key), Library Name, and Library Folder — against the
+Jellyfin server. **Test Jellyfin Connection** verifies the credentials and
+library scoping the same way.
+
+For **Subsonic**, fill in the Server URL, Username, and Password
+(Navidrome/Airsonic/Gonic included); **Test Subsonic Connection** pings the
+server with those credentials.
+
+For **Plex**, pick a **Sign-In Style** (see [Plex](#plex)): **Home user**
+(owner signs in, plus the Home member's name and PIN when protected), **own
+account** (that Person's own plex.tv username and password), or **manual
+token** (a pasted token plus server URL). The Server URL can be left blank for
+plex.tv discovery. Plex link cards never show a saved token — enter one only
+for manual mode; a blank field keeps the saved token.
 
 ### Per-person queues
 
@@ -337,11 +418,11 @@ enable.
 
 | Setting | Default | Notes |
 | --- | --- | --- |
-| Stream Server Port | `8621` | Local HTTP port the core serves token-authenticated Emby streams and share files from. Must be reachable from your playback targets on the LAN. |
+| Stream Server Port | `8621` | Local HTTP port the core serves token-authenticated provider streams and share files from. Must be reachable from your playback targets on the LAN. |
 | Stream Host | auto | Override only if the auto-detected LAN address is wrong (e.g. multiple NICs). |
 | Catalog Sync Interval | `900` s | Also drives per-person catalog refreshes (each linked source gets its own). |
 | Endless Playback | `Basic Auto (LLM)` | How queues keep playing after their final track (see [Endless Playback](#endless-playback)); per-Person override on the link card. |
-| Endless Playback Playlist | blank | Playlist looped by the "Tracks from a playlist" mode (AI mix, Emby playlist, share `.m3u`, or Folder Playlists entry). |
+| Endless Playback Playlist | blank | Playlist looped by the "Tracks from a playlist" mode (AI mix, server playlist, share `.m3u`, or Folder Playlists entry). |
 | Playlist Order | `Shuffle each play` | Fixed ordering for AI mixes and picked playlists (track number, title, artist, album; asc/desc) instead of shuffling every play. |
 | Folder Playlists | blank | `Name=Folder` pairs that turn library folders into always-current playlists (see [Playlists](#playlists)); per-Person override on the link card (blank inherits the global list). |
 | Smart Shuffle | off | History-aware shuffle with on-the-fly multi-source mixing; per-Person override on the link card. |
@@ -360,16 +441,25 @@ enable.
   a feature request in
   `docs/feature-requests/playback-engine-smart-bpm-crossfade.md` instead.
 - A Person can link **two** sources (one primary plus one second source, any
-  mix of Emby accounts and share folders); more would need a longer form.
+  mix of Emby/Jellyfin/Subsonic/Plex accounts and share folders); more would
+  need a longer form.
 - Streaming providers (Spotify, Apple Music, …) are not built in; the
   provider-backed Endless Playback modes fall back to the library until one is
   added via the provider registry.
+- **Audio formats:** satellite speakers decode WAV, MP3, and FLAC natively;
+  AAC, OGG, Opus, and M4A have no decoder and will not play — libraries are
+  assumed to be WAV/MP3/FLAC (see
+  [Supported audio formats](#supported-audio-formats)). There is no
+  core-side transcode stage; Emby/Jellyfin and Subsonic ask their servers to
+  transcode to WAV where the format is not natively decodable, while Plex and
+  network shares serve original files.
 - Little Spud client music is not switched over — the Tater host currently links
   client music to the stock `music_core` only, and this core's client music
   surface (`run_client_music_action`, `get_client_music_stream_source`) follows
   the shared household queue, not a Person queue.
 - Network-share playback serves original files; there is no on-the-fly transcode
-  for mixed sync groups (Emby username sign-in does transcode to WAV when needed).
+  for mixed sync groups (Emby/Jellyfin username sign-in does transcode to WAV
+  when needed).
 - Volume and per-target calibrations are shared per destination; two queues
   playing different rooms at once keep their own volume, but the same room's
   calibration is shared.
@@ -383,6 +473,19 @@ enable.
   Zones with no matching Tater room are dead zones (handled by the selected
   away action), and Follow-Me reuses Tater's Home Assistant credentials — it
   cannot track a second Home Assistant instance.
+
+## Future directions
+
+- **Routing by provider name** ("play Pandora", "play it from the Plex
+  library") — when several sources are linked, a request could pick the named
+  provider. That needs host-side voice/UI support in Tater, so it is noted
+  here, not built; every linked source is already independently addressable
+  by its provider id, and multi-source catalogs already play from wherever a
+  track lives.
+- **More providers.** The provider registry is data-driven, so a new catalog
+  provider joins as one class plus one form entry. A server-side-transcode
+  capability is expected of new providers; the core's ffmpeg stage is the
+  designated fallback for providers that cannot transcode on their own.
 
 ## Development
 
