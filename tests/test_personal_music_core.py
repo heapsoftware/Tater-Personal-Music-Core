@@ -4969,5 +4969,334 @@ class ProviderFoundationTests(unittest.TestCase):
             self.core._PEOPLE_API_MODULE = original_people
 
 
+class SubsonicProviderTests(unittest.TestCase):
+    """Subsonic auth, catalog walk, playlists, proxy kinds, aliasing."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.core = load_personal_music_core()
+        cls.helpers = sys.modules["helpers"]
+
+    def setUp(self):
+        self.redis = FakeRedis()
+        self.helpers.redis_client = self.redis
+        self.core.redis_client = self.redis
+        self.core._shutdown_stream_server()
+
+    def tearDown(self):
+        self.core._shutdown_stream_server()
+
+    def save_settings(self, mapping):
+        self.core._save_hash(self.redis, self.core.SETTINGS_KEY, mapping)
+
+    def _provider(self, **overrides):
+        values = {
+            "server_url": "https://music.example.com",
+            "username": "zoe",
+            "password": "pw",
+            "stream_scope": "",
+        }
+        values.update(overrides)
+        return self.core.SubsonicMusicProvider(**values)
+
+    # ---- auth ----
+
+    def test_salted_token_is_deterministic_per_salt(self):
+        import hashlib as hashlib_module
+
+        provider = self._provider()
+        original_uuid = self.core.uuid.uuid4
+        self.core.uuid.uuid4 = lambda: types.SimpleNamespace(hex="salthex")
+        try:
+            params = provider._request_params({"id": "song1"})
+        finally:
+            self.core.uuid.uuid4 = original_uuid
+        self.assertEqual(params["s"], "salthex")
+        self.assertEqual(
+            params["t"],
+            hashlib_module.md5(b"pw" + b"salthex").hexdigest(),
+        )
+        self.assertEqual(params["u"], "zoe")
+        self.assertEqual(params["v"], self.core.SUBSONIC_API_VERSION)
+        self.assertEqual(params["c"], self.core.SUBSONIC_CLIENT_NAME)
+        self.assertEqual(params["f"], "json")
+        self.assertEqual(params["id"], "song1")
+
+    def test_provider_id_aliases_navidrome(self):
+        self.assertEqual(self.core._provider_id("navidrome"), "subsonic")
+        self.assertEqual(self.core._provider_id("Airsonic", "subsonic"), "subsonic")
+        self.assertEqual(self.core._provider_id("Gonic"), "subsonic")
+        self.assertEqual(self.core._provider_id("subsonic"), "subsonic")
+
+    def test_ping_test_action(self):
+        class FakeResponse:
+            status_code = 200
+            ok = True
+            content = json.dumps(
+                {"subsonic-response": {"status": "ok"}}
+            ).encode()
+
+            def json(self):
+                return json.loads(self.content)
+
+        original_get = self.core.requests.get
+        seen = {}
+
+        def fake_get(url, **_kwargs):
+            seen["url"] = url
+            return FakeResponse()
+
+        self.core.requests.get = fake_get
+        try:
+            provider = self._provider()
+            provider.ping()
+            self.assertIn("/rest/ping", seen["url"])
+        finally:
+            self.core.requests.get = original_get
+
+    def test_ping_reports_bad_credentials(self):
+        class FakeResponse:
+            status_code = 200
+            ok = True
+            content = json.dumps(
+                {
+                    "subsonic-response": {
+                        "status": "failed",
+                        "error": {"code": 40, "text": "Wrong user or password"},
+                    }
+                }
+            ).encode()
+
+            def json(self):
+                return json.loads(self.content)
+
+        original_get = self.core.requests.get
+        self.core.requests.get = lambda *args, **kwargs: FakeResponse()
+        try:
+            with self.assertRaises(PermissionError):
+                self._provider().ping()
+        finally:
+            self.core.requests.get = original_get
+
+    def test_connected_requires_credentials_without_a_network_probe(self):
+        self.assertFalse(
+            self.core.SubsonicMusicProvider(server_url="", username="", password="").connected
+        )
+        self.assertTrue(self._provider().connected)
+
+    # ---- catalog ----
+
+    def _mock_catalog_server(self, requests_module, pages, album_songs, playlists=None):
+        calls = []
+
+        def fake_get(url, params=None, **kwargs):
+            calls.append((url, dict(params or {})))
+            path = url.rsplit("/rest/", 1)[1]
+            if path.startswith("getAlbumList2"):
+                offset = int(params.get("offset", 0))
+                rows = pages[offset // 2] if offset // 2 < len(pages) else []
+                body = {"albumList2": {"album": rows}}
+            elif path.startswith("getAlbum"):
+                body = {"album": {"song": album_songs}}
+            elif path.startswith("getPlaylists"):
+                body = {"playlists": {"playlist": playlists}}
+            elif path.startswith("getPlaylist"):
+                body = {"playlist": {"entry": [{"id": "s1"}]}}
+            else:
+                body = {}
+            response = types.SimpleNamespace(
+                status_code=200,
+                ok=True,
+                content=json.dumps({"subsonic-response": {"status": "ok", **body}}).encode(),
+            )
+            response.json = lambda: json.loads(response.content)
+            return response
+
+        original_get = requests_module.get
+        requests_module.get = fake_get
+        return calls, original_get
+
+    def test_catalog_walks_album_list_then_albums(self):
+        original_page_size = self.core.SUBSONIC_PAGE_SIZE
+        self.core.SUBSONIC_PAGE_SIZE = 2  # small pages so the walk really pages
+        pages = [
+            [
+                {"id": "a1", "name": "Alpha", "artist": "One", "artistId": "ar1", "coverArt": "al-a1"},
+                {"id": "a2", "name": "Beta", "artist": "Two"},
+            ],
+            [{"id": "a3", "name": "Gamma", "artist": "Three"}],
+        ]
+        album_songs = [
+            {
+                "id": "s1",
+                "title": "Song One",
+                "artist": "One",
+                "album": "Alpha",
+                "albumId": "a1",
+                "duration": 210,
+                "track": 3,
+                "discNumber": 1,
+                "year": 2020,
+                "genre": "Rock",
+                "suffix": "flac",
+                "coverArt": "al-a1",
+                "artistId": "ar1",
+            },
+            {"id": "s2", "title": "Song Two", "suffix": "mp3", "duration": 180},
+        ]
+        playlists = [{"id": "p1", "name": "Chill", "comment": "quiet"}]
+        try:
+            calls, original_get = self._mock_catalog_server(
+                self.core.requests, pages, album_songs, playlists
+            )
+            try:
+                provider = self._provider()
+                payload = provider.catalog()
+                tracks = [self.core._normalize_track(row) for row in payload["tracks"]]
+            finally:
+                self.core.requests.get = original_get
+            paths = [url.rsplit("/rest/", 1)[1].split("?")[0] for url, _params in calls]
+            self.assertEqual(paths.count("getAlbumList2"), 2)
+            self.assertEqual(paths.count("getAlbum"), 3)
+            self.assertEqual(paths.count("getPlaylists"), 1)
+            self.assertEqual(len(tracks), 6)
+            first = tracks[0]
+            self.assertEqual(first["id"], "s1")
+            self.assertEqual(first["provider_track_id"], "s1")
+            self.assertEqual(first["album_id"], "a1")
+            self.assertEqual(first["container"], "flac")
+            self.assertEqual(first["track_number"], 3)
+            self.assertEqual(first["duration_seconds"], 210.0)
+            self.assertEqual(first["genre"], "Rock")
+            self.assertTrue(first["has_artwork"])
+            playlists_payload = payload["playlists"]
+            self.assertEqual(playlists_payload[0]["id"], "subsonic_playlist:p1")
+            self.assertEqual(playlists_payload[0]["track_ids"], ["s1"])
+        finally:
+            self.core.SUBSONIC_PAGE_SIZE = original_page_size
+
+    # ---- streams & artwork ----
+
+    def test_stream_urls_route_through_the_proxy_and_mark_unsafe_containers(self):
+        provider = self._provider()
+        self.save_settings({"stream_token": "tok", "stream_host": "127.0.0.1", "stream_bind_port": "8901"})
+        flac_track = {"id": "s1", "provider_track_id": "s1", "container": "flac"}
+        mp3_track = {"id": "s2", "provider_track_id": "s2", "container": "mp3"}
+        aac_track = {"id": "s3", "provider_track_id": "s3", "container": "aac"}
+        flac_url = provider.stream_url(flac_track)
+        self.assertIn("/stream/tok/subsonic/s1", flac_url)
+        self.assertNotIn("~wav", flac_url)
+        self.assertIn("/stream/tok/subsonic/s2", provider.stream_url(mp3_track))
+        # Non-SAT-safe containers ask the server to transcode to WAV.
+        self.assertIn("/stream/tok/subsonic/s3~wav", provider.stream_url(aac_track))
+        # Person-scoped streams carry the scope in the proxy kind.
+        scoped = self._provider(stream_scope="person_zoe")
+        self.assertIn("/stream/tok/subsonic:person_zoe/s1", scoped.stream_url(flac_track))
+
+    def test_proxy_request_generates_a_fresh_token_and_format_hint(self):
+        provider = self._provider()
+        url, headers = provider.proxy_request("s1", art=False)
+        self.assertIn("/rest/stream?", url)
+        self.assertIn("id=s1", url)
+        self.assertIn("t=", url)
+        self.assertIn("s=", url)
+        # A fresh salt+token per request, generated server-side.
+        url_b, _headers = provider.proxy_request("s1", art=False)
+        self.assertNotEqual(url.split("t=")[1].split("&")[0], url_b.split("t=")[1].split("&")[0])
+        # The ~wav marker turns into a format=wav request.
+        url_c, _headers = provider.proxy_request("s3~wav")
+        self.assertIn("format=wav", url_c)
+        self.assertIn("id=s3", url_c)
+        # Cover art requests go through getCoverArt.
+        art_url, _headers = provider.proxy_request("al-a1", art=True)
+        self.assertIn("/rest/getCoverArt", art_url)
+
+    def test_artwork_urls_fall_back_to_the_album(self):
+        provider = self._provider()
+        self.save_settings({"stream_token": "tok", "stream_host": "127.0.0.1", "stream_bind_port": "8902"})
+        track = {"id": "s1", "album_id": "a1"}
+        self.assertIn("/stream/tok/subsonic_art/a1", provider.artwork_url(track))
+        self.assertEqual(provider.artwork_url({"id": "s1", "album_id": ""}), "")
+
+    # ---- global connect flow ----
+
+    def test_connect_action_saves_settings_and_syncs(self):
+        seen, original_get = self._mock_catalog_server(
+            self.core.requests, [[{"id": "a1", "name": "Alpha", "artist": "One"}]], [{"id": "s1", "title": "One"}], []
+        )
+        try:
+            result = self.core.handle_htmlui_tab_action(
+                action="music_provider_connect",
+                payload={
+                    "id": "provider:subsonic",
+                    "values": {
+                        "subsonic_server_url": "https://music.example.com",
+                        "subsonic_username": "zoe",
+                        "subsonic_password": "pw",
+                    },
+                },
+                redis_client=self.redis,
+            )
+            self.assertTrue(result["ok"])
+            cfg = self.core._settings(self.redis)
+            self.assertEqual(cfg["subsonic_server_url"], "https://music.example.com")
+            self.assertEqual(cfg["provider"], "subsonic")
+            self.assertTrue(self.core._paired(cfg, "subsonic"))
+        finally:
+            self.core.requests.get = original_get
+
+    def test_person_link_save_builds_a_subsonic_value_dict(self):
+        people = types.SimpleNamespace(
+            load_store=lambda _client=None: {
+                "people": [{"id": "person_zoe", "display_name": "Zoe"}]
+            }
+        )
+        original_people = self.core._PEOPLE_API_MODULE
+        original_get = self.core.requests.get
+
+        def fake_get(*_args, **_kwargs):
+            body = {"subsonic-response": {"status": "ok"}}
+            return types.SimpleNamespace(
+                status_code=200,
+                ok=True,
+                content=json.dumps(body).encode(),
+                json=lambda: body,
+            )
+
+        self.core._PEOPLE_API_MODULE = people
+        self.core.requests.get = fake_get
+        try:
+            result = self.core._save_person_link_action(
+                {
+                    "person_link_person_id": "person_zoe",
+                    "person_link_source": "subsonic",
+                    "person_link_subsonic_server_url": "https://music.example.com",
+                    "person_link_subsonic_username": "zoe",
+                    "person_link_subsonic_password": "pw",
+                },
+                self.redis,
+            )
+            self.assertTrue(result["ok"])
+            link = self.core._person_link("person_zoe", self.redis)
+            self.assertEqual(link["subsonic"]["server_url"], "https://music.example.com")
+            self.assertEqual(link["subsonic"]["password"], "pw")
+            self.assertEqual(link["music_source"], "subsonic")
+            # Blank password keeps the saved one.
+            self.core._save_person_link_action(
+                {
+                    "person_link_person_id": "person_zoe",
+                    "person_link_source": "subsonic",
+                    "person_link_subsonic_server_url": "https://music.example.com",
+                    "person_link_subsonic_username": "zoe",
+                },
+                self.redis,
+            )
+            link = self.core._person_link("person_zoe", self.redis)
+            self.assertEqual(link["subsonic"]["password"], "pw")
+        finally:
+            self.core._PEOPLE_API_MODULE = original_people
+            self.core.requests.get = original_get
+
+
 if __name__ == "__main__":
     unittest.main()
