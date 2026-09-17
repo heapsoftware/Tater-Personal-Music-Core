@@ -2385,6 +2385,12 @@ class JellyfinMusicProvider(EmbyMusicProvider):
     def artwork_url(self, track: Dict[str, Any]) -> str:
         item_id = _text(track.get("artwork_item_id")) or _text(track.get("provider_track_id")) or _text(track.get("id"))
         if item_id and self.auth_mode != "api_key":
+            # Cover art usually hangs off the album item; prefer it when the
+            # song carries no Primary image (mirrors the Emby fallback).
+            if not _text(track.get("artwork_version")):
+                album_id = _text(track.get("album_id"))
+                if album_id:
+                    item_id = album_id
             kind = f"jellyfin_art:{self.stream_scope}" if self.stream_scope else "jellyfin_art"
             return _stream_proxy_url(kind, item_id)
         return super().artwork_url(track)

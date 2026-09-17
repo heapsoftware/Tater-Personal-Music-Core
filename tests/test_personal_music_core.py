@@ -5298,5 +5298,291 @@ class SubsonicProviderTests(unittest.TestCase):
             self.core.requests.get = original_get
 
 
+class JellyfinProviderTests(unittest.TestCase):
+    """Jellyfin header shape, auth flow, stream/art URLs, proxy kinds."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.core = load_personal_music_core()
+        cls.helpers = sys.modules["helpers"]
+
+    def setUp(self):
+        self.redis = FakeRedis()
+        self.helpers.redis_client = self.redis
+        self.core.redis_client = self.redis
+        self.core._shutdown_stream_server()
+
+    def tearDown(self):
+        self.core._shutdown_stream_server()
+
+    def save_settings(self, mapping):
+        self.core._save_hash(self.redis, self.core.SETTINGS_KEY, mapping)
+
+    # ---- headers & auth ----
+
+    def test_authenticate_sends_both_authorization_forms(self):
+        seen = {}
+
+        class FakeResponse:
+            status_code = 200
+            ok = True
+            content = json.dumps({"AccessToken": "tok", "User": {"Id": "u1"}}).encode()
+
+            def json(self):
+                return json.loads(self.content)
+
+        def fake_post(url, headers=None, **_kwargs):
+            seen["url"] = url
+            seen["headers"] = dict(headers or {})
+            return FakeResponse()
+
+        original_post = self.core.requests.post
+        self.core.requests.post = fake_post
+        try:
+            provider = self.core.JellyfinMusicProvider(
+                server_url="http://jf.local:8096",
+                username="zoe",
+                password="pw",
+            )
+            token, user_id = provider.authenticate(force=True, client=self.redis)
+        finally:
+            self.core.requests.post = original_post
+        self.assertEqual(token, "tok")
+        self.assertEqual(user_id, "u1")
+        self.assertEqual(seen["url"], "http://jf.local:8096/Users/AuthenticateByName")
+        header = seen["headers"]["Authorization"]
+        self.assertIn("MediaBrowser", header)
+        self.assertIn("Personal Music Core", header)
+        self.assertEqual(seen["headers"]["X-Emby-Authorization"], header)
+
+    def test_request_sends_the_modern_authorization_header(self):
+        class FakeResponse:
+            status_code = 200
+            ok = True
+
+            def __init__(self, body):
+                self.content = json.dumps(body).encode()
+
+            def json(self):
+                return json.loads(self.content)
+
+        seen = {}
+
+        def fake_request(method, url, headers=None, **_kwargs):
+            seen["url"] = url
+            seen["headers"] = dict(headers or {})
+            return FakeResponse({"Items": []})
+
+        def fake_post(url, headers=None, **_kwargs):
+            seen["url"] = url
+            seen["headers"] = dict(headers or {})
+            return FakeResponse({"AccessToken": "tok", "User": {"Id": "u1"}})
+
+        original_request = self.core.requests.request
+        original_post = self.core.requests.post
+        self.core.requests.request = fake_request
+        self.core.requests.post = fake_post
+        try:
+            provider = self.core.JellyfinMusicProvider(
+                server_url="http://jf.local:8096",
+                username="zoe",
+                password="pw",
+            )
+            provider.authenticate(force=True, client=self.redis)
+            provider.request("GET", f"Users/u1/Views", client=self.redis)
+        finally:
+            self.core.requests.request = original_request
+            self.core.requests.post = original_post
+        headers = seen["headers"]
+        self.assertEqual(headers["X-Emby-Token"], "tok")
+        self.assertIn("Token=\"tok\"", headers["Authorization"])
+        self.assertEqual(headers["X-Emby-Authorization"], headers["Authorization"])
+
+    def test_auth_cache_is_per_identity(self):
+        household = self.core.JellyfinMusicProvider(
+            server_url="http://jf.local:8096", username="house", password="pw"
+        )
+        person = self.core.JellyfinMusicProvider(
+            server_url="http://jf.local:8096", username="zoe", password="pw"
+        )
+        self.assertNotEqual(household._auth_cache_key(), person._auth_cache_key())
+        self.assertTrue(household._auth_cache_key().startswith("personal_music_core:jellyfin:auth:"))
+
+    # ---- streams & artwork ----
+
+    def test_stream_and_artwork_urls_use_jellyfin_kinds(self):
+        self.save_settings({"stream_token": "tok", "stream_host": "127.0.0.1", "stream_bind_port": "8903"})
+        direct = self.core.JellyfinMusicProvider(
+            server_url="http://jf.local:8096",
+            auth_mode="api_key",
+            api_key="KEY",
+        )
+        track = {"id": "t1", "provider_track_id": "t1", "album_id": "al1"}
+        url = direct.stream_url(track)
+        self.assertTrue(url.startswith("http://jf.local:8096/Audio/t1/stream?"))
+        self.assertIn("api_key=KEY", url)
+        proxied = self.core.JellyfinMusicProvider(
+            server_url="http://jf.local:8096", username="zoe", password="pw"
+        )
+        proxy_url = proxied.stream_url(track)
+        self.assertIn("/stream/tok/jellyfin/t1", proxy_url)
+        synced = proxied.stream_url(track, audio_sync=True)
+        self.assertTrue(synced.endswith("sync=1"), synced)
+        art = proxied.artwork_url(track)
+        self.assertIn("/stream/tok/jellyfin_art/al1", art)
+        scoped = self.core.JellyfinMusicProvider(
+            server_url="http://jf.local:8096",
+            username="zoe",
+            password="pw",
+            stream_scope="person_zoe",
+        )
+        self.assertIn("/stream/tok/jellyfin:person_zoe/t1", scoped.stream_url(track))
+        self.assertIn("/stream/tok/jellyfin_art:person_zoe/al1", scoped.artwork_url(track))
+
+    def test_proxy_request_adds_the_authorization_headers(self):
+        provider = self.core.JellyfinMusicProvider(
+            server_url="http://jf.local:8096", username="zoe", password="pw"
+        )
+        self.core._save_hash(
+            self.redis,
+            provider._auth_cache_key(),
+            {"access_token": "tok", "user_id": "u1", "authenticated_at": 0},
+        )
+        url, headers = provider.proxy_request("t1")
+        self.assertTrue(url.startswith("http://jf.local:8096/Audio/t1/stream?"))
+        self.assertIn("Static=true", url)
+        self.assertEqual(headers["X-Emby-Token"], "tok")
+        self.assertIn("Token=\"tok\"", headers["Authorization"])
+        self.assertEqual(headers["X-Emby-Authorization"], headers["Authorization"])
+        # The sync path requests the normalized WAV source.
+        url_b, _headers = provider.proxy_request("t1", sync=True)
+        self.assertIn("AudioCodec=wav", url_b)
+        self.assertNotIn("Static", url_b)
+
+    def test_proxy_kinds_resolve_per_person_scope(self):
+        self.save_settings(
+            {
+                "stream_token": "tok",
+                "stream_host": "127.0.0.1",
+                "stream_bind_port": "8904",
+                "jellyfin_server_url": "http://house.local:8096",
+                "jellyfin_auth_mode": "api_key",
+                "jellyfin_api_key": "HOUSE",
+            }
+        )
+        self.redis.hset(
+            self.core.PERSON_LINKS_KEY,
+            mapping={
+                "person_zoe": json.dumps(
+                    {
+                        "music_source": "jellyfin",
+                        "jellyfin": {
+                            "server_url": "http://zoe.local:8096",
+                            "auth_mode": "api_key",
+                            "api_key": "ZOEKEY",
+                        },
+                    }
+                )
+            },
+        )
+        url, _headers = self.core._upstream_request("jellyfin:person_zoe", "t1")
+        self.assertTrue(url.startswith("http://zoe.local:8096/Audio/t1/stream?"))
+        self.assertIn("api_key=ZOEKEY", url)
+        # The unscoped kind serves the household server.
+        url_house, _headers = self.core._upstream_request("jellyfin", "t1")
+        self.assertTrue(url_house.startswith("http://house.local:8096/"))
+
+    # ---- settings & person links ----
+
+    def test_connect_action_saves_jellyfin_settings(self):
+        seen = {}
+
+        class FakeResponse:
+            def __init__(self, body):
+                self._body = body
+                self.status_code = 200
+                self.ok = True
+                self.content = json.dumps(body).encode()
+
+            def json(self):
+                return self._body
+
+        def fake_http(*args, **kwargs):
+            url = args[0] if args and _text_like_url(args[0]) else args[1]
+            return fake_route_http(url, **kwargs)
+
+        def _text_like_url(value):
+            return isinstance(value, str) and value.startswith("http")
+
+        def fake_route_http(url, headers=None, **_kwargs):
+            seen.setdefault("urls", []).append(url)
+            if url.endswith("/Users/AuthenticateByName"):
+                return FakeResponse({"AccessToken": "tok", "User": {"Id": "u1"}})
+            if url.endswith("/Views"):
+                return FakeResponse({"Items": [{"Id": "view1", "Name": "Music", "CollectionType": "music"}]})
+            if url.endswith("/Items"):
+                params = _kwargs.get("params") or {}
+                if params.get("ParentId") == "view1":
+                    return FakeResponse(
+                        {
+                            "Items": [
+                                {
+                                    "Id": "t1",
+                                    "Name": "Song",
+                                    "Artist": "A",
+                                    "Album": "Lp",
+                                    "AlbumId": "al1",
+                                    "RunTimeTicks": 2100000000,
+                                    "Container": "mp3",
+                                }
+                            ],
+                            "TotalRecordCount": 1,
+                        }
+                    )
+                return FakeResponse({"Items": [], "TotalRecordCount": 0})
+            return FakeResponse({})
+
+        original_request = self.core.requests.request
+        original_post = self.core.requests.post
+        self.core.requests.request = fake_http
+        self.core.requests.post = fake_http
+        try:
+            result = self.core.handle_htmlui_tab_action(
+                action="music_provider_connect",
+                payload={
+                    "id": "provider:jellyfin",
+                    "values": {
+                        "jellyfin_server_url": "http://jf.local:8096",
+                        "jellyfin_auth_mode": "user_token",
+                        "jellyfin_username": "zoe",
+                        "jellyfin_password": "pw",
+                    },
+                },
+                redis_client=self.redis,
+            )
+            self.assertTrue(result["ok"])
+            cfg = self.core._settings(self.redis)
+            self.assertEqual(cfg["jellyfin_server_url"], "http://jf.local:8096")
+            self.assertEqual(cfg["jellyfin_user_id"], "u1")
+            self.assertEqual(cfg["provider"], "jellyfin")
+            self.assertNotIn("server_url", cfg)  # no legacy emby key written
+            self.assertTrue(self.core._paired(cfg, "jellyfin"))
+        finally:
+            self.core.requests.request = original_request
+            self.core.requests.post = original_post
+
+    def test_jellyfin_test_link_form_reports_failures(self):
+        with self.assertRaises(ValueError) as ctx:
+            self.core._test_person_link_source_action(
+                {
+                    "person_link_person_id": "person_zoe",
+                    "person_link_source": "jellyfin",
+                    "person_link_jellyfin_server_url": "",
+                },
+                self.redis,
+            )
+        self.assertIn("server URL", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
