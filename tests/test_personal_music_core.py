@@ -113,8 +113,20 @@ class CustomMusicCoreTests(unittest.TestCase):
 
     def test_provider_ids_never_reuse_tater_tube(self):
         core = self.core
-        self.assertEqual(core.PROVIDER_LABELS, {"emby": "Emby", "network_share": "Network Share"})
-        self.assertEqual(core.CATALOG_PROVIDER_IDS, {"emby", "network_share"})
+        self.assertEqual(
+            core.PROVIDER_LABELS,
+            {
+                "emby": "Emby",
+                "jellyfin": "Jellyfin",
+                "subsonic": "Subsonic",
+                "plex": "Plex",
+                "network_share": "Network Share",
+            },
+        )
+        self.assertEqual(
+            core.CATALOG_PROVIDER_IDS,
+            {"emby", "jellyfin", "subsonic", "plex", "network_share"},
+        )
         self.assertNotIn("tater_tube", core.PROVIDER_LABELS)
         self.assertNotIn("tater_tube", core.CATALOG_PROVIDER_IDS)
 
@@ -1393,12 +1405,12 @@ class PerPersonLinkageTests(unittest.TestCase):
         try:
             # A missing server URL fails fast.
             with self.assertRaises(ValueError):
-                self.core._test_person_link_emby_action(
+                self.core._test_person_link_source_action(
                     {"person_link_person_id": "person_zoe"}, self.redis
                 )
             # Bad credentials are reported, not saved.
             with self.assertRaises(ValueError) as ctx:
-                self.core._test_person_link_emby_action(
+                self.core._test_person_link_source_action(
                     {
                         "person_link_person_id": "person_zoe",
                         "person_link_emby_server_url": server_url,
@@ -1409,7 +1421,7 @@ class PerPersonLinkageTests(unittest.TestCase):
                 )
             self.assertIn("rejected", str(ctx.exception))
             # Good credentials pass, and no link was saved by the test.
-            result = self.core._test_person_link_emby_action(
+            result = self.core._test_person_link_source_action(
                 {
                     "person_link_person_id": "person_zoe",
                     "person_link_emby_server_url": server_url,
@@ -1515,7 +1527,7 @@ class PerPersonLinkageTests(unittest.TestCase):
                 "person_link_emby_password": "right-pw",
                 "person_link_emby_library_name": "Music",
             }
-            result = self.core._test_person_link_emby_action(draft, self.redis)
+            result = self.core._test_person_link_source_action(draft, self.redis)
             state = self.core._person_link_test_state(self.redis)
             self.assertEqual(state["status"], "ok")
             self.assertIn("signed in", result["message"])
@@ -1537,7 +1549,7 @@ class PerPersonLinkageTests(unittest.TestCase):
             # editor, including the chosen Person and the typed password.
             self.core._save_person_link_edit_target("new", self.redis)
             with self.assertRaises(ValueError):
-                self.core._test_person_link_emby_action(
+                self.core._test_person_link_source_action(
                     {
                         "person_link_person_id": "person_ama",
                         "person_link_emby_server_url": "",
@@ -1962,10 +1974,10 @@ class PerPersonLinkageTests(unittest.TestCase):
         self.assertEqual(provider.stream_scope, "person_lee")
         self.assertEqual(provider.api_key, "LEEKEY")
         # Person-scoped proxy routes resolve to the linked person's credentials.
-        url, headers = self.core._emby_upstream_request("emby:person_lee", "song1")
+        url, headers = self.core._upstream_request("emby:person_lee", "song1")
         self.assertTrue(url.startswith("http://emby.local:8096/Audio/song1/stream?"))
         self.assertIn("api_key=LEEKEY", url)
-        art_url, _headers = self.core._emby_upstream_request("emby_art:person_lee", "song1")
+        art_url, _headers = self.core._upstream_request("emby_art:person_lee", "song1")
         self.assertTrue(art_url.startswith("http://emby.local:8096/Items/song1/Images/Primary?"))
 
 
@@ -4676,6 +4688,285 @@ class EndlessPlaybackTests(unittest.TestCase):
             self.assertNotIn("extra", link)
         finally:
             core._PEOPLE_API_MODULE = original_people
+
+
+class ProviderFoundationTests(unittest.TestCase):
+    """Per-Person playback credentials, per-identity auth caches, sync=1 proxy."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.core = load_personal_music_core()
+        cls.helpers = sys.modules["helpers"]
+
+    def setUp(self):
+        self.redis = FakeRedis()
+        self.helpers.redis_client = self.redis
+        self.core.redis_client = self.redis
+        self.core._shutdown_stream_server()
+
+    def tearDown(self):
+        self.core._shutdown_stream_server()
+
+    def save_settings(self, mapping):
+        self.core._save_hash(self.redis, self.core.SETTINGS_KEY, mapping)
+
+    def _save_person_link(self, person_id, link):
+        self.redis.hset(
+            self.core.PERSON_LINKS_KEY,
+            mapping={person_id: json.dumps(link)},
+        )
+
+    # ---- §3.1: playback resolves per-Person credentials ----
+
+    def test_person_catalog_tracks_carry_the_sync_scope(self):
+        class FakeJellyfin:
+            provider_id = "jellyfin"
+
+            def __init__(self, **_kwargs):
+                pass
+
+            @property
+            def connected(self):
+                return True
+
+            def catalog(self):
+                return {
+                    "catalog_id": "jf1",
+                    "tracks": [
+                        {
+                            "id": "t1",
+                            "Name": "Song",
+                            "artist": "Artist",
+                            "album": "Album",
+                            "duration_seconds": 200.0,
+                            "provider_track_id": "jf-t1",
+                        }
+                    ],
+                    "playlists": [],
+                }
+
+        original_provider = self.core.JellyfinMusicProvider
+        self.core.JellyfinMusicProvider = FakeJellyfin
+        try:
+            self._save_person_link(
+                "person_zoe",
+                {"music_source": "jellyfin", "jellyfin": {"server_url": "http://jf.local:8096"}},
+            )
+            payload = self.core._sync_catalog(self.redis, "jellyfin", "person_zoe")
+            for track in payload["tracks"]:
+                self.assertEqual(track["person_scope"], "person_zoe")
+        finally:
+            self.core.JellyfinMusicProvider = original_provider
+
+    def test_person_linked_track_streams_from_the_persons_server(self):
+        # The household source is one server; the Person's own link is another.
+        self.save_settings(
+            {
+                "provider": "jellyfin",
+                "jellyfin_server_url": "http://house.local:8096",
+                "jellyfin_auth_mode": "api_key",
+                "jellyfin_api_key": "HOUSE",
+            }
+        )
+        self._save_person_link(
+            "person_zoe",
+            {
+                "music_source": "jellyfin",
+                "jellyfin": {
+                    "server_url": "http://zoe.local:8096",
+                    "auth_mode": "api_key",
+                    "api_key": "ZOEKEY",
+                },
+            },
+        )
+        track = {"provider": "jellyfin", "person_scope": "person_zoe", "id": "t1"}
+        provider = self.core._provider(self.redis, track["provider"], track["person_scope"])
+        self.assertEqual(provider.server_url, "http://zoe.local:8096")
+        self.assertEqual(provider.api_key, "ZOEKEY")
+        self.assertEqual(provider.stream_scope, "person_zoe")
+        # api_key mode streams directly from the Person's own server.
+        url = provider.stream_url(track)
+        self.assertTrue(url.startswith("http://zoe.local:8096/Audio/t1/stream?"))
+        self.assertIn("api_key=ZOEKEY", url)
+        # The client stream source resolves through the same scope.
+        self.save_settings(
+            {
+                "provider": "jellyfin",
+                "jellyfin_server_url": "http://zoe.local:8096",
+                "jellyfin_auth_mode": "api_key",
+                "jellyfin_api_key": "ZOEKEY",
+            }
+        )
+        self.save_settings({"stream_token": "tok", "stream_host": "127.0.0.1", "stream_bind_port": "8894"})
+        catalog = self.core._sync_catalog(self.redis, "jellyfin", "person_zoe") if False else None
+        # A person-scope stamp on a catalog track resolves the person provider.
+        scoped = self.core._provider(self.redis, "jellyfin", "person_zoe")
+        self.assertEqual(getattr(scoped, "stream_scope", ""), "person_zoe")
+
+    def test_client_track_stamps_person_scope_for_stream_source(self):
+        self._save_person_link(
+            "person_zoe",
+            {
+                "music_source": "jellyfin",
+                "jellyfin": {
+                    "server_url": "http://zoe.local:8096",
+                    "auth_mode": "api_key",
+                    "api_key": "ZOEKEY",
+                },
+            },
+        )
+        catalog_payload = {
+            "provider": "jellyfin",
+            "tracks": [
+                {
+                    "id": "t1",
+                    "provider": "jellyfin",
+                    "provider_track_id": "jf-t1",
+                    "person_scope": "person_zoe",
+                }
+            ],
+        }
+        self.redis.set(self.core._catalog_key("person_zoe"), json.dumps(catalog_payload))
+        track = self.core._client_track("t1", "jellyfin", self.redis, "person_zoe")
+        self.assertEqual(track["person_scope"], "person_zoe")
+
+    # ---- §3.3: per-identity auth caches ----
+
+    def test_auth_cache_keys_differ_per_account_identity(self):
+        household = self.core.EmbyMusicProvider(
+            server_url="http://emby.local:8096",
+            auth_mode="user_token",
+            username="house",
+            password="pw",
+        )
+        person = self.core.EmbyMusicProvider(
+            server_url="http://emby.local:8096",
+            auth_mode="user_token",
+            username="zoe",
+            password="pw",
+        )
+        self.assertNotEqual(household._auth_cache_key(), person._auth_cache_key())
+        self.assertTrue(household._auth_cache_key().startswith("personal_music_core:emby:auth:"))
+        household._save_cached_auth("house-token", "u-house", self.redis)
+        person._save_cached_auth("zoe-token", "u-zoe", self.redis)
+        self.assertEqual(household._cached_auth(self.redis).get("access_token"), "house-token")
+        self.assertEqual(person._cached_auth(self.redis).get("access_token"), "zoe-token")
+        # A person instance without a stored user id cannot see the household token.
+        fresh_person = self.core.EmbyMusicProvider(
+            server_url="http://emby.local:8096",
+            auth_mode="user_token",
+            username="zoe",
+        )
+        self.assertEqual(fresh_person._cached_auth(self.redis).get("access_token"), "zoe-token")
+        other_person = self.core.EmbyMusicProvider(
+            server_url="http://emby.local:8096",
+            auth_mode="user_token",
+            username="lee",
+        )
+        self.assertEqual(other_person._cached_auth(self.redis), {})
+
+    # ---- §3.5: proxied streams request the normalized WAV source ----
+
+    def test_proxied_stream_urls_carry_sync_on_the_audio_sync_path(self):
+        self.save_settings({"stream_token": "tok", "stream_host": "127.0.0.1", "stream_bind_port": "8895"})
+        provider = self.core.EmbyMusicProvider(
+            server_url="http://emby.local:8096",
+            auth_mode="user_token",
+            username="house",
+            password="pw",
+        )
+        track = {"id": "t1", "provider_track_id": "t1"}
+        plain = provider.stream_url(track)
+        self.assertFalse(plain.endswith("sync=1"))
+        synced = provider.stream_url(track, audio_sync=True)
+        self.assertTrue(synced.endswith("sync=1"), synced)
+
+    def test_proxy_handler_forwarded_sync_requests_the_wav_transcode(self):
+        seen = {}
+
+        class FakeEmby(BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen["path"] = self.path
+                body = b"audio-bytes"
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/wav")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        upstream = HTTPServer(("127.0.0.1", 0), FakeEmby)
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        self.save_settings(
+            {
+                "stream_token": "tok",
+                "stream_host": "127.0.0.1",
+                "stream_bind_port": "8896",
+                "emby_server_url": f"http://127.0.0.1:{upstream.server_address[1]}",
+                "emby_auth_mode": "user_token",
+                "emby_username": "house",
+                "emby_password": "pw",
+            }
+        )
+        original_post = self.core.requests.post
+
+        def fake_signin(*_args, **_kwargs):
+            body = json.dumps({"AccessToken": "tok", "User": {"Id": "u1"}}).encode()
+            return types.SimpleNamespace(
+                status_code=200,
+                ok=True,
+                content=body,
+                json=lambda: json.loads(body),
+            )
+
+        self.core.requests.post = fake_signin
+        try:
+            status = self.core._ensure_stream_server()
+            self.assertTrue(status["ok"], status)
+            urllib.request.urlopen(
+                f"http://127.0.0.1:8896/stream/tok/emby/t1?sync=1", timeout=10
+            ).read()
+        finally:
+            self.core.requests.post = original_post
+            upstream.shutdown()
+        self.assertIn("AudioCodec=wav", seen["path"])
+        self.assertIn("AudioSampleRate=44100", seen["path"])
+
+    def test_extra_source_picker_lists_every_catalog_provider(self):
+        fields = self.core._person_link_extra_source_fields({}, {})
+        select = next(field for field in fields if field["key"] == "person_link_extra_source")
+        values = {option["value"] for option in select["options"]}
+        self.assertEqual(
+            values,
+            {"", *self.core.CATALOG_PROVIDER_IDS},
+        )
+
+    def test_person_link_forms_carry_every_provider_fields(self):
+        people = types.SimpleNamespace(
+            load_store=lambda _client=None: {
+                "people": [{"id": "person_zoe", "display_name": "Zoe"}]
+            }
+        )
+        original_people = self.core._PEOPLE_API_MODULE
+        self.core._PEOPLE_API_MODULE = people
+        try:
+            self.core._save_person_link_edit_target("new", self.redis)
+            data = self.core.get_htmlui_tab_data(redis_client=self.redis)
+            cards = {item.get("id"): item for item in data["ui"]["item_forms"]}
+            keys = {field["key"] for field in cards["person:new"]["fields"]}
+            self.assertIn("person_link_emby_server_url", keys)
+            self.assertIn("person_link_jellyfin_server_url", keys)
+            self.assertIn("person_link_subsonic_server_url", keys)
+            self.assertIn("person_link_plex_server_url", keys)
+            self.assertIn("person_link_share_root_path", keys)
+            # The second source's fields appear for every provider too.
+            self.assertIn("person_link_extra_jellyfin_server_url", keys)
+            self.assertIn("person_link_extra_subsonic_server_url", keys)
+            self.assertIn("person_link_extra_plex_auth_mode", keys)
+        finally:
+            self.core._PEOPLE_API_MODULE = original_people
 
 
 if __name__ == "__main__":

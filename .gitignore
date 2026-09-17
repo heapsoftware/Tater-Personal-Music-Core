@@ -3,3 +3,6 @@
 **/.DS_Store
 /__pycache__/
 **/__pycache__/
+
+# Local-only working docs (never commit or push)
+/docs/specs/

@@ -501,6 +501,9 @@ HISTORY_KEY = "personal_music_core:history:v1"
 RECOMMENDATIONS_KEY = "personal_music_core:recommendations:v1"
 PROMPT_PROFILE_KEY = "personal_music_core:profile:v1"
 ACTIVITY_KEY = "personal_music_core:activity_feed"
+# Legacy pre-3.5.0 shared Emby auth cache (household and person tokens used to
+# overwrite each other here). Auth caches are now keyed per account identity
+# (see _provider_auth_cache_key); this key is only cleared, never read.
 EMBY_AUTH_CACHE_KEY = "personal_music_core:emby:auth"
 MAX_ACTIVITY_EVENTS = 200
 REQUEST_TIMEOUT_SECONDS = 30
@@ -520,10 +523,29 @@ CATALOG_MEMORY_CACHE_TTL_SECONDS = 15.0
 CONTINUATION_TRIGGER_REMAINING_TRACKS = 2
 CONTINUATION_BATCH_TRACKS = 12
 MAX_CONTINUATION_CANDIDATES = 200
-PROVIDER_LABELS = {"emby": "Emby", "network_share": "Network Share"}
-CATALOG_PROVIDER_IDS = {"emby", "network_share"}
+PROVIDER_LABELS = {
+    "emby": "Emby",
+    "jellyfin": "Jellyfin",
+    "subsonic": "Subsonic",
+    "plex": "Plex",
+    "network_share": "Network Share",
+}
+CATALOG_PROVIDER_IDS = {"emby", "jellyfin", "subsonic", "plex", "network_share"}
+# Display/registration order for provider pickers and source cards (Emby first,
+# preserving today's card order; the share stays last as the offline option).
+CATALOG_PROVIDER_ORDER = ("emby", "jellyfin", "subsonic", "plex", "network_share")
+# Containers the Tater satellites decode natively (firmware playback.c); every
+# known provider is wired to send only these (or ask its server to transcode).
+SAT_SAFE_AUDIO_CONTAINERS = {"wav", "mp3", "flac"}
 EMBY_PAGE_SIZE = 500
 EMBY_ARTWORK_MAX_WIDTH = 1000
+SUBSONIC_API_VERSION = "1.16.1"
+SUBSONIC_CLIENT_NAME = "PersonalMusicCore"
+SUBSONIC_PAGE_SIZE = 500
+PLEX_PAGE_SIZE = 100
+PLEX_TV_API_BASE = "https://plex.tv/api/v2"
+PLEX_AUTH_MODES = ("home_user", "own_account", "manual_token")
+DEFAULT_PLEX_AUTH_MODE = "home_user"
 STREAM_DEFAULT_PORT = 8621
 STREAM_CHUNK_SIZE = 128 * 1024
 SHARE_AUDIO_EXTENSIONS = {".mp3", ".flac", ".ogg", ".oga", ".opus", ".m4a", ".mp4", ".wav", ".wma"}
@@ -897,11 +919,13 @@ def _delete_person_link(person_id: Any, client: Any = None) -> None:
         pass
 
 
-# Form fields the Emby link test remembers between the test click and the tab
-# refetch that follows it (see PERSON_LINK_TEST_KEY).
-PERSON_LINK_TEST_FIELD_KEYS = (
+# Form fields the link test remembers between the test click and the tab
+# refetch that follows it (see PERSON_LINK_TEST_KEY). The provider form fields
+# are appended from the registry after PROVIDER_FIELD_SPECS is built.
+_PERSON_LINK_TEST_CORE_FIELD_KEYS = (
     "person_link_person_id",
     "person_link_source",
+    "person_link_extra_source",
     "person_link_queue_conflict_mode",
     "person_link_recommendations_enabled",
     "person_link_recommendation_interval_hours",
@@ -920,23 +944,6 @@ PERSON_LINK_TEST_FIELD_KEYS = (
     "person_link_follow_me_move_resume_delay_seconds",
     "person_link_follow_me_resume_delay_seconds",
     "person_link_resume_room_mode",
-    "person_link_emby_server_url",
-    "person_link_emby_username",
-    "person_link_emby_password",
-    "person_link_emby_api_key",
-    "person_link_emby_user_id",
-    "person_link_emby_library_name",
-    "person_link_emby_library_folder",
-    "person_link_share_root_path",
-    "person_link_extra_source",
-    "person_link_extra_emby_server_url",
-    "person_link_extra_emby_username",
-    "person_link_extra_emby_password",
-    "person_link_extra_emby_api_key",
-    "person_link_extra_emby_user_id",
-    "person_link_extra_emby_library_name",
-    "person_link_extra_emby_library_folder",
-    "person_link_extra_share_root_path",
 )
 
 
@@ -1203,19 +1210,12 @@ def _build_person_provider(
     stream_scope: str,
 ) -> Any:
     """Instantiate one catalog provider from a Person link's stored values."""
-    if source == "emby":
-        return EmbyMusicProvider(
-            server_url=_normalize_server_url(values.get("server_url")),
-            auth_mode="api_key" if _text(values.get("auth_mode")).casefold() == "api_key" else "user_token",
-            username=_text(values.get("username")),
-            password=_text(values.get("password")),
-            api_key=_text(values.get("api_key")),
-            user_id=_text(values.get("user_id")),
-            library_name=_text(values.get("library_name")),
-            library_folder=_text(values.get("library_folder")),
-            stream_scope=stream_scope,
+    spec = PROVIDER_FIELD_SPECS.get(_provider_id(source, ""))
+    if spec is None:
+        raise ValueError(
+            f"{PROVIDER_LABELS.get(source, source)} support is not enabled in this build."
         )
-    return NetworkShareMusicProvider(root_path=_text(values.get("root_path")))
+    return spec.build_provider(values if isinstance(values, dict) else {}, stream_scope)
 
 
 def _person_link_provider(
@@ -1275,10 +1275,33 @@ def _provider_id(value: Any, default: str = "emby") -> str:
     token = _text(value).lower().replace("-", "_").replace(" ", "_")
     if token in {"emby"}:
         return "emby"
+    if token in {"jellyfin"}:
+        return "jellyfin"
+    # Navidrome / Airsonic / Gonic all speak the Subsonic REST API; the stored
+    # id is always the protocol name.
+    if token in {"subsonic", "navidrome", "airsonic", "gonic"}:
+        return "subsonic"
+    if token in {"plex"}:
+        return "plex"
     if token in {"network_share", "share", "network", "smb", "nfs"}:
         return "network_share"
     # An explicit empty default means "no fallback" for person-scoped lookups.
-    return _text(default) if _text(default) in {"", "emby", "network_share"} else "emby"
+    allowed = {"", "emby", "jellyfin", "subsonic", "plex", "network_share"}
+    return _text(default) if _text(default) in allowed else "emby"
+
+
+def _provider_auth_cache_key(provider_id: Any, server_url: Any, identity: Any) -> str:
+    """Per-account-identity auth cache key.
+
+    One shared key per provider used to let a Person's sign-in overwrite the
+    household's cached token (and, with an unset person user id, even sync the
+    household's library under the Person's name). Keying on the server URL plus
+    the account identity keeps every account's token separate.
+    """
+    digest = hashlib.sha1(
+        f"{_text(server_url).strip()}\x00{_text(identity).strip()}".encode("utf-8")
+    ).hexdigest()[:16]
+    return f"personal_music_core:{_provider_id(provider_id, '')}:auth:{digest}"
 
 
 def _decode_hash(raw: Any) -> Dict[str, str]:
@@ -1806,12 +1829,15 @@ class EmbyMusicProvider:
             parts.append(f'Token="{token}"')
         return ", ".join(parts)
 
+    def _auth_cache_key(self) -> str:
+        return _provider_auth_cache_key(self.provider_id, self.server_url, self.username)
+
     def _cached_auth(self, client: Any = None) -> Dict[str, str]:
         store = client or globals().get("redis_client")
         if store is None:
             return {}
         try:
-            return _decode_hash(store.hgetall(EMBY_AUTH_CACHE_KEY) or {})
+            return _decode_hash(store.hgetall(self._auth_cache_key()) or {})
         except Exception:
             return {}
 
@@ -1821,7 +1847,7 @@ class EmbyMusicProvider:
             return
         _save_hash(
             store,
-            EMBY_AUTH_CACHE_KEY,
+            self._auth_cache_key(),
             {
                 "access_token": token,
                 "user_id": user_id,
@@ -1833,7 +1859,7 @@ class EmbyMusicProvider:
         store = client or globals().get("redis_client")
         if store is not None:
             try:
-                store.delete(EMBY_AUTH_CACHE_KEY)
+                store.delete(self._auth_cache_key())
             except Exception:
                 pass
 
@@ -2025,7 +2051,7 @@ class EmbyMusicProvider:
             query = urlencode(values)
             return f"{self.server_url}/Audio/{quote(str(item_id), safe='')}/stream?{query}"
         kind = f"emby:{self.stream_scope}" if self.stream_scope else "emby"
-        return _stream_proxy_url(kind, item_id)
+        return _stream_proxy_url(kind, item_id, sync=audio_sync)
 
     def artwork_url(self, track: Dict[str, Any]) -> str:
         item_id = _text(track.get("artwork_item_id")) or _text(track.get("provider_track_id")) or _text(track.get("id"))
@@ -2050,6 +2076,38 @@ class EmbyMusicProvider:
             return f"{self.server_url}/Items/{quote(str(item_id), safe='')}/Images/Primary?{query}"
         kind = f"emby_art:{self.stream_scope}" if self.stream_scope else "emby_art"
         return _stream_proxy_url(kind, item_id)
+
+    def proxy_request(
+        self,
+        item_id: str,
+        *,
+        art: bool = False,
+        sync: bool = False,
+    ) -> "tuple[str, Dict[str, str]]":
+        """Build (url, headers) for one proxied Emby stream or artwork request.
+
+        The core stream server calls this server-side, so per-user tokens and
+        API keys never reach a playback target inside a stream URL.
+        """
+        item_id = _text(item_id)
+        if art:
+            params: Dict[str, Any] = {"MaxWidth": EMBY_ARTWORK_MAX_WIDTH, "Quality": 90}
+            path = f"Items/{quote(item_id, safe='')}/Images/Primary"
+        else:
+            params = {}
+            if sync:
+                # Mixed Tater satellite + Sonos/AirPlay groups share one
+                # normalized PCM source so every target can stay clock-aligned.
+                params.update({"AudioCodec": "wav", "AudioSampleRate": 44100, "AudioChannels": 2})
+            else:
+                params["Static"] = "true"
+            path = f"Audio/{quote(item_id, safe='')}/stream"
+        headers = {"Accept": "*/*"}
+        if self.auth_mode == "api_key":
+            params["api_key"] = self.api_key
+        else:
+            headers["X-Emby-Token"] = self._access_token()
+        return f"{self.server_url}/{path}?{urlencode(params)}", headers
 
     def catalog(self) -> Dict[str, Any]:
         view = self.music_view()
@@ -2193,6 +2251,191 @@ class EmbyMusicProvider:
             if not rows or (total and start_index >= total):
                 break
         return track_ids
+
+# --------------------------------------------------------------------------
+@dataclass
+class JellyfinMusicProvider(EmbyMusicProvider):
+    """One Jellyfin server music view.
+
+    Jellyfin forked Emby and kept the music surface path-identical, so this is a
+    near-straight subclass: same ``/Users/AuthenticateByName`` flow, same
+    ``Users/{uid}/Views`` + ``Users/{uid}/Items`` paging, same
+    ``Audio/{id}/stream`` and ``Items/{id}/Images/Primary`` routes. Differences:
+    Jellyfin 10.9+ wants the modern ``Authorization:`` MediaBrowser header (it
+    still accepts the legacy ``X-Emby-*`` forms, which this core sends too for
+    older servers), and it carries its own settings keys and auth cache.
+    """
+
+    provider_id = "jellyfin"
+
+    @classmethod
+    def from_settings(cls, settings: Dict[str, Any]) -> "JellyfinMusicProvider":
+        return cls(
+            server_url=_normalize_server_url(settings.get("jellyfin_server_url")),
+            auth_mode="api_key"
+            if _text(settings.get("jellyfin_auth_mode")).casefold() == "api_key"
+            else "user_token",
+            username=_text(settings.get("jellyfin_username")),
+            password=_text(settings.get("jellyfin_password")),
+            api_key=_text(settings.get("jellyfin_api_key")),
+            user_id=_text(settings.get("jellyfin_user_id")),
+            library_name=_text(settings.get("jellyfin_library_name")),
+            library_folder=_text(settings.get("jellyfin_library_folder")),
+        )
+
+    def authenticate(
+        self,
+        *,
+        force: bool = False,
+        client: Any = None,
+        timeout: int = REQUEST_TIMEOUT_SECONDS,
+    ) -> "tuple[str, str]":
+        """Return (access_token, user_id), authenticating against Jellyfin when needed."""
+        cached = {} if force else self._cached_auth(client)
+        token = _text(cached.get("access_token"))
+        user_id = _text(cached.get("user_id")) or self.user_id
+        if token and (not self.user_id or user_id == self.user_id):
+            return token, user_id
+        if not self.username or not self.password:
+            raise ValueError("Jellyfin username and password are required for user sign-in.")
+        header = self._emby_authorization_header()
+        response = requests.post(
+            f"{self.server_url}/Users/AuthenticateByName",
+            headers={
+                "Content-Type": "application/json",
+                # Modern servers want `Authorization:`, older ones the legacy
+                # X-Emby form; Jellyfin accepts either, so send both.
+                "Authorization": header,
+                "X-Emby-Authorization": header,
+                "Accept": "application/json",
+            },
+            json={"Username": self.username, "Pw": self.password},
+            timeout=max(5, int(timeout)),
+        )
+        if response.status_code in (401, 403):
+            raise PermissionError("Jellyfin rejected the username or password.")
+        if not response.ok:
+            raise RuntimeError(f"Jellyfin sign-in failed with HTTP {response.status_code}.")
+        body = response.json() if response.content else {}
+        token = _text(body.get("AccessToken"))
+        user = body.get("User") if isinstance(body.get("User"), dict) else {}
+        user_id = _text(user.get("Id")) or _text(body.get("UserId"))
+        if not token or not user_id:
+            raise RuntimeError("Jellyfin sign-in did not return an access token.")
+        self._save_cached_auth(token, user_id, client)
+        return token, user_id
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        payload: Optional[Dict[str, Any]] = None,
+        timeout: int = REQUEST_TIMEOUT_SECONDS,
+        authenticated: bool = True,
+        client: Any = None,
+    ) -> Any:
+        if not self.server_url:
+            raise ValueError("Jellyfin server URL is not configured.")
+        query: Dict[str, Any] = dict(params or {})
+        headers = {"Accept": "application/json"}
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+        if authenticated:
+            if self.auth_mode == "api_key":
+                query.setdefault("api_key", self.api_key)
+            else:
+                token = self._access_token(client=client)
+                # X-Emby-Token keeps older Jellyfin releases working; modern
+                # releases also accept the Authorization header forms.
+                headers["X-Emby-Token"] = token
+                auth_header = self._emby_authorization_header(token)
+                headers["Authorization"] = auth_header
+                headers["X-Emby-Authorization"] = auth_header
+        url = f"{self.server_url}/{path.lstrip('/')}"
+        response = requests.request(
+            method.upper(),
+            url,
+            params=query,
+            headers=headers,
+            json=payload,
+            timeout=max(5, int(timeout)),
+        )
+        if response.status_code == 401:
+            self.clear_cached_auth(client)
+            raise PermissionError("Jellyfin rejected this core's credentials.")
+        if not response.ok:
+            raise RuntimeError(f"Jellyfin returned HTTP {response.status_code} for {path}.")
+        try:
+            return response.json()
+        except Exception:
+            return {}
+
+    def stream_url(self, track: Dict[str, Any], *, audio_sync: bool = False) -> str:
+        # The api_key direct-stream URL is identical to Emby's; only the proxied
+        # proxy kinds differ (jellyfin / jellyfin_art instead of emby / emby_art).
+        if self.auth_mode != "api_key":
+            item_id = _text(track.get("provider_track_id")) or _text(track.get("id"))
+            if item_id:
+                kind = f"jellyfin:{self.stream_scope}" if self.stream_scope else "jellyfin"
+                return _stream_proxy_url(kind, item_id, sync=audio_sync)
+        return super().stream_url(track, audio_sync=audio_sync)
+
+    def artwork_url(self, track: Dict[str, Any]) -> str:
+        item_id = _text(track.get("artwork_item_id")) or _text(track.get("provider_track_id")) or _text(track.get("id"))
+        if item_id and self.auth_mode != "api_key":
+            kind = f"jellyfin_art:{self.stream_scope}" if self.stream_scope else "jellyfin_art"
+            return _stream_proxy_url(kind, item_id)
+        return super().artwork_url(track)
+
+    def proxy_request(
+        self,
+        item_id: str,
+        *,
+        art: bool = False,
+        sync: bool = False,
+    ) -> "tuple[str, Dict[str, str]]":
+        """Build (url, headers) for one proxied Jellyfin stream or artwork request."""
+        url, headers = super().proxy_request(item_id, art=art, sync=sync)
+        if self.auth_mode != "api_key":
+            token = self._access_token()
+            auth_header = self._emby_authorization_header(token)
+            headers["Authorization"] = auth_header
+            headers["X-Emby-Authorization"] = auth_header
+        return url, headers
+
+    def resolve_user_id(self, client: Any = None) -> str:
+        """Best-effort Jellyfin user id for this configuration."""
+        if self.user_id:
+            return self.user_id
+        if self.auth_mode == "user_token":
+            _token, user_id = self.authenticate(client=client)
+            return user_id
+        users = self.request("GET", "Users", client=client) or []
+        rows = users.get("Items") if isinstance(users, dict) else users
+        if isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict):
+            return _text(rows[0].get("Id"))
+        if self.username and isinstance(rows, list):
+            for row in rows:
+                if isinstance(row, dict) and _text(row.get("Name")).casefold() == self.username.casefold():
+                    return _text(row.get("Id"))
+        raise ValueError(
+            "Set the Jellyfin User ID in settings, or use one Jellyfin user account with username sign-in."
+        )
+
+    def music_view(self, client: Any = None) -> Dict[str, Any]:
+        try:
+            return super().music_view(client)
+        except ValueError as exc:
+            raise ValueError(_text(exc).replace("Emby", "Jellyfin")) from exc
+
+    def music_folder(self, view: Dict[str, Any], client: Any = None) -> Dict[str, Any]:
+        try:
+            return super().music_folder(view, client)
+        except ValueError as exc:
+            raise ValueError(_text(exc).replace("Emby", "Jellyfin")) from exc
+
 
 # --------------------------------------------------------------------------
 # Network Share tag reading (stdlib only — the Tater image has no mutagen).
@@ -3101,6 +3344,1781 @@ class NetworkShareMusicProvider:
         }
 
 
+@dataclass
+class SubsonicMusicProvider:
+    """One Subsonic-API music server (Navidrome, Airsonic, Gonic, Ampache, …).
+
+    Speaks the salted-token REST dialect (``u``/``t``/``s`` params) with a fresh
+    random salt per request, so nothing credential-like is ever stable or
+    reusable. Streams and artwork are proxied through this core's stream server
+    (the salted token *is* the credential and must never sit in a URL a playback
+    target fetches). Original MP3/FLAC/WAV bytes stream as-is — satellites
+    decode all three — and non-decodable containers ask the server to transcode
+    to WAV instead.
+    """
+
+    server_url: str
+    username: str
+    password: str
+    # Person id when this instance serves a linked Person's own server account.
+    stream_scope: str = ""
+    provider_id = "subsonic"
+
+    @classmethod
+    def from_settings(cls, settings: Dict[str, Any]) -> "SubsonicMusicProvider":
+        return cls(
+            server_url=_normalize_server_url(settings.get("subsonic_server_url")),
+            username=_text(settings.get("subsonic_username")),
+            password=_text(settings.get("subsonic_password")),
+        )
+
+    @property
+    def connected(self) -> bool:
+        # No network probe here: `connected` mirrors the other providers'
+        # settings-shape check, and the connect/test flow does the live ping.
+        return bool(self.server_url and self.username and self.password)
+
+    def _request_params(self, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Subsonic auth params with a fresh salted token for one request."""
+        salt = uuid.uuid4().hex
+        token = hashlib.md5(f"{self.password}{salt}".encode("utf-8")).hexdigest()
+        params: Dict[str, Any] = {
+            "u": self.username,
+            "t": token,
+            "s": salt,
+            "v": SUBSONIC_API_VERSION,
+            "c": SUBSONIC_CLIENT_NAME,
+            "f": "json",
+        }
+        params.update(extra or {})
+        return params
+
+    def request(
+        self,
+        path: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        timeout: int = REQUEST_TIMEOUT_SECONDS,
+    ) -> Dict[str, Any]:
+        """One GET against the REST endpoint, unwrapped to the response dict."""
+        if not self.server_url:
+            raise ValueError("Subsonic server URL is not configured.")
+        url = f"{self.server_url}/rest/{path}"
+        response = requests.get(
+            url,
+            params=self._request_params(params),
+            headers={"Accept": "application/json"},
+            timeout=max(5, int(timeout)),
+        )
+        if response.status_code in (401, 403):
+            raise PermissionError("Subsonic rejected this core's credentials.")
+        if not response.ok:
+            raise RuntimeError(f"Subsonic returned HTTP {response.status_code} for {path}.")
+        body = response.json() if response.content else {}
+        wrapper = body.get("subsonic-response") if isinstance(body, dict) else None
+        if not isinstance(wrapper, dict):
+            raise RuntimeError(f"Subsonic returned an unparseable response for {path}.")
+        if wrapper.get("status") != "ok":
+            error = wrapper.get("error") if isinstance(wrapper.get("error"), dict) else {}
+            code = _as_int(error.get("code"), 0, 0, 10**6)
+            message = _text(error.get("text")) or "Subsonic rejected the request."
+            # 40: wrong user/password, 41: token auth not supported for this
+            # account, 50: user lacks permission.
+            if code in (40, 41, 50):
+                raise PermissionError(message)
+            raise RuntimeError(message)
+        return wrapper
+
+    def ping(self) -> None:
+        """Connection check used by the test action (raises on failure)."""
+        self.request("ping", timeout=15)
+
+    def catalog(self) -> Dict[str, Any]:
+        albums: List[Dict[str, Any]] = []
+        offset = 0
+        while offset < MAX_CATALOG_TRACKS and len(albums) < MAX_CATALOG_TRACKS:
+            page = self.request(
+                "getAlbumList2",
+                params={
+                    "type": "alphabeticalByName",
+                    "size": SUBSONIC_PAGE_SIZE,
+                    "offset": offset,
+                },
+                timeout=180,
+            )
+            rows = page.get("albumList2", {}).get("album", [])
+            if not isinstance(rows, list):
+                break
+            for row in rows:
+                if isinstance(row, dict) and _text(row.get("id")):
+                    albums.append(row)
+            offset += len(rows)
+            if not rows or len(rows) < SUBSONIC_PAGE_SIZE:
+                break
+        tracks: List[Dict[str, Any]] = []
+        for album in albums:
+            if len(tracks) >= MAX_CATALOG_TRACKS:
+                break
+            detail = self.request("getAlbum", params={"id": _text(album.get("id"))}, timeout=120)
+            songs = detail.get("album", {}).get("song", [])
+            if not isinstance(songs, list):
+                continue
+            for song in songs:
+                if isinstance(song, dict) and _text(song.get("id")):
+                    tracks.append(_subsonic_track_row(song, album))
+        playlists = []
+        try:
+            playlists = self.user_playlists()
+        except Exception as exc:
+            # A playlist listing failure must never break the song sync.
+            logger.warning("[Music] Subsonic playlist listing failed: %s", exc)
+        catalog_id = f"subsonic:{hashlib.sha1(self.server_url.encode('utf-8')).hexdigest()[:16]}"
+        return {
+            "catalog_id": catalog_id,
+            "tracks": tracks[:MAX_CATALOG_TRACKS],
+            "total": len(tracks),
+            "playlists": playlists,
+            "libraries": {catalog_id: self.server_url},
+        }
+
+    def user_playlists(self) -> List[Dict[str, Any]]:
+        """The signed-in Subsonic user's playlists with their song ids."""
+        playlists: List[Dict[str, Any]] = []
+        wrapper = self.request("getPlaylists", timeout=60)
+        rows = wrapper.get("playlists", {}).get("playlist", [])
+        for row in rows if isinstance(rows, list) else []:
+            playlist_id = _text(row.get("id")) if isinstance(row, dict) else ""
+            name = _text(row.get("name")) if isinstance(row, dict) else ""
+            if not playlist_id or not name:
+                continue
+            track_ids: List[str] = []
+            try:
+                detail = self.request("getPlaylist", params={"id": playlist_id}, timeout=60)
+                entries = detail.get("playlist", {}).get("entry", [])
+                for entry in entries if isinstance(entries, list) else []:
+                    if isinstance(entry, dict) and _text(entry.get("id")):
+                        track_ids.append(_text(entry.get("id")))
+            except Exception as exc:
+                logger.warning("[Music] Subsonic playlist %s listing failed: %s", playlist_id, exc)
+            playlists.append(
+                {
+                    "id": f"subsonic_playlist:{playlist_id}",
+                    "name": name,
+                    "description": _text(row.get("comment")),
+                    "track_ids": track_ids,
+                }
+            )
+            if len(playlists) >= 200:
+                break
+        return playlists
+
+    def similar_tracks(
+        self,
+        seeds: List[Dict[str, Any]],
+        *,
+        count: int = CONTINUATION_BATCH_TRACKS,
+    ) -> List[Dict[str, Any]]:
+        """Server-suggested tracks after one seed; [] when unavailable.
+
+        Implementations vary widely (Navidrome uses last.fm scrobbles), so this
+        is best-effort: any failure or empty result just falls back to the
+        library mix.
+        """
+        for seed in seeds or []:
+            track_id = _text(seed.get("provider_track_id")) or _text(seed.get("id"))
+            if not track_id:
+                continue
+            try:
+                song = self.request("getSong", params={"id": track_id}, timeout=15)
+                artist_id = _text(song.get("song", {}).get("artistId"))
+                if not artist_id:
+                    continue
+                similar = self.request(
+                    "getSimilarSongs2",
+                    params={"id": artist_id, "count": max(1, int(count))},
+                    timeout=15,
+                )
+                rows = similar.get("similarSongs2", {}).get("song", [])
+            except Exception as exc:
+                logger.warning("[Music] Subsonic similar-tracks lookup failed: %s", exc)
+                continue
+            results: List[Dict[str, Any]] = []
+            for row in rows if isinstance(rows, list) else []:
+                if isinstance(row, dict) and _text(row.get("id")):
+                    results.append(_subsonic_track_row(row))
+                if len(results) >= count:
+                    break
+            return results
+        return []
+
+    def stream_url(self, track: Dict[str, Any], *, audio_sync: bool = False) -> str:
+        del audio_sync  # Original containers decode natively; offsets stay aligned.
+        item_id = _text(track.get("provider_track_id")) or _text(track.get("id"))
+        if not item_id:
+            return _text(track.get("stream_url"))
+        container = _text(track.get("container")).casefold()
+        if container and container not in SAT_SAFE_AUDIO_CONTAINERS:
+            # Satellites decode WAV/MP3/FLAC only; ask the server to transcode
+            # anything else instead of serving undecodable bytes.
+            item_id = f"{item_id}~wav"
+        kind = f"subsonic:{self.stream_scope}" if self.stream_scope else "subsonic"
+        return _stream_proxy_url(kind, item_id)
+
+    def artwork_url(self, track: Dict[str, Any]) -> str:
+        art_id = _text(track.get("artwork_item_id")) or _text(track.get("album_id"))
+        if not art_id:
+            return ""
+        kind = f"subsonic_art:{self.stream_scope}" if self.stream_scope else "subsonic_art"
+        return _stream_proxy_url(kind, art_id)
+
+    def proxy_request(
+        self,
+        item_id: str,
+        *,
+        art: bool = False,
+        sync: bool = False,
+    ) -> "tuple[str, Dict[str, str]]":
+        """Build (url, headers) for one proxied Subsonic stream or artwork request.
+
+        The salted auth token is generated fresh for every proxied request
+        server-side, so no credential ever lands in a playback target's URL.
+        """
+        item_id = _text(item_id)
+        params: Dict[str, Any] = {}
+        if item_id.endswith("~wav"):
+            item_id = item_id[: -len("~wav")]
+            params["format"] = "wav"
+        params["id"] = item_id
+        return (
+            f"{self.server_url}/rest/{'getCoverArt' if art else 'stream'}"
+            f"?{urlencode(self._request_params(params))}",
+            {"Accept": "*/*"},
+        )
+
+
+def _subsonic_track_row(song: Dict[str, Any], album: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """One Subsonic song as a generic provider track row (for _normalize_track)."""
+    album = album if isinstance(album, dict) else {}
+    cover_art = _text(song.get("coverArt")) or _text(album.get("coverArt"))
+    return {
+        "id": _text(song.get("id")),
+        "provider_track_id": _text(song.get("id")),
+        "title": _text(song.get("title")),
+        "artist": _text(song.get("artist")) or _text(album.get("artist")),
+        "album_artist": _text(album.get("artist")) or _text(song.get("albumArtist")),
+        "album": _text(album.get("name")) or _text(song.get("album")),
+        "albumId": _text(song.get("albumId")) or _text(album.get("id")),
+        "genres": [song.get("genre")] if _text(song.get("genre")) else [],
+        "genre": _text(song.get("genre")),
+        "year": _text(song.get("year")) or _text(album.get("year")),
+        "track_number": song.get("track"),
+        "disc_number": song.get("discNumber"),
+        "duration_seconds": song.get("duration"),
+        "container": _text(song.get("suffix")).lower(),
+        "artwork_item_id": _text(cover_art),
+        "artistId": _text(song.get("artistId")) or _text(album.get("artistId")),
+        "path": _text(song.get("path")),
+        "provider": "subsonic",
+    }
+
+
+# --------------------------------------------------------------------------
+# plex.tv authentication (isolated here so endpoint fixes stay local).
+# --------------------------------------------------------------------------
+
+
+def _plex_client_identifier(store: Any = None) -> str:
+    """Stable per-core uuid plex.tv expects on every request it sees."""
+    client = store or globals().get("redis_client")
+    if client is not None:
+        value = _text(_settings(client).get("plex_client_identifier"))
+        if value:
+            return value
+        value = uuid.uuid4().hex
+        _save_hash(client, SETTINGS_KEY, {"plex_client_identifier": value})
+        return value
+    return uuid.uuid4().hex
+
+
+def _plex_tv_headers(token: str = "") -> Dict[str, str]:
+    headers = {
+        "Accept": "application/json",
+        "X-Plex-Product": "Personal Music Core",
+        "X-Plex-Version": __version__,
+        "X-Plex-Client-Identifier": _plex_client_identifier(),
+    }
+    if token:
+        headers["X-Plex-Token"] = token
+    return headers
+
+
+def _plex_tv_request(
+    method: str,
+    path: str,
+    *,
+    token: str = "",
+    form: Optional[Dict[str, str]] = None,
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    """One plex.tv API call (every plex.tv endpoint lives behind this helper)."""
+    response = requests.request(
+        method.upper(),
+        f"{PLEX_TV_API_BASE}{path}",
+        headers=_plex_tv_headers(token),
+        data=form or None,
+        timeout=max(5, int(timeout)),
+    )
+    if response.status_code in (401, 403):
+        raise PermissionError("plex.tv rejected the credentials.")
+    if not response.ok:
+        raise RuntimeError(f"plex.tv returned HTTP {response.status_code} for {path}.")
+    if not response.content:
+        return {}
+    try:
+        body = response.json()
+    except Exception as exc:
+        raise RuntimeError(f"plex.tv returned an unparseable response for {path}.") from exc
+    return body if isinstance(body, dict) else {}
+
+
+def _plex_tv_signin(login: str, password: str) -> str:
+    """plex.tv sign-in with one account's own credentials → its plex.tv token."""
+    if not login or not password:
+        raise ValueError("Enter the Plex username and password to sign in with.")
+    body = _plex_tv_request(
+        "POST",
+        "/users/signin",
+        form={"login": login, "password": password},
+    )
+    token = _text(body.get("authToken"))
+    if not token:
+        raise RuntimeError("plex.tv sign-in did not return an auth token.")
+    return token
+
+
+def _plex_tv_home_users(token: str) -> List[Dict[str, str]]:
+    """Plex Home members visible to the owner token (uuid + title rows)."""
+    body = _plex_tv_request("GET", "/home/users", token=token)
+    users = body.get("users") if isinstance(body.get("users"), list) else []
+    rows: List[Dict[str, str]] = []
+    for row in users:
+        if not isinstance(row, dict):
+            continue
+        uuid_value = _text(row.get("uuid") or row.get("id"))
+        if uuid_value:
+            rows.append({"uuid": uuid_value, "title": _text(row.get("title"))})
+    return rows
+
+
+def _plex_tv_switch_home_user(token: str, home_uuid: str, pin: str = "") -> str:
+    """Switch into one Plex Home member's context → their per-user token."""
+    form = {"pin": pin} if pin else {}
+    body = _plex_tv_request(
+        "POST",
+        f"/home/users/{quote(str(home_uuid), safe='')}/switch",
+        token=token,
+        form=form,
+    )
+    new_token = _text(body.get("authToken"))
+    if not new_token:
+        raise RuntimeError("plex.tv did not return a token for that Home user.")
+    return new_token
+
+
+def _plex_tv_resources(token: str) -> List[Dict[str, Any]]:
+    """plex.tv-known servers (owned + shared) with their connection URIs."""
+    body = _plex_tv_request("GET", "/resources", token=token)
+    rows = body if isinstance(body, list) else []
+    servers: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict) or _text(row.get("product")).casefold() != "plex media server":
+            continue
+        connections = [conn for conn in row.get("connections") or [] if isinstance(conn, dict)]
+        uris = [_text(conn.get("uri")) for conn in connections if _text(conn.get("uri"))]
+        servers.append(
+            {
+                "name": _text(row.get("name")),
+                "owned": _as_bool(row.get("owned"), False),
+                "connections": uris,
+            }
+        )
+    return servers
+
+
+def _plex_tv_user_id(token: str) -> str:
+    """The signed-in account's own plex.tv user uuid."""
+    body = _plex_tv_request("GET", "/user", token=token)
+    return _text(body.get("uuid") or body.get("id"))
+
+
+@dataclass
+class PlexMusicProvider:
+    """One Plex Media Server music library, addressed with an X-Plex-Token.
+
+    The token travels server-side only: the core stream proxy attaches it to
+    every stream and artwork request, so per-user tokens never sit in URLs that
+    playback targets fetch. Plex.tv sign-ins (three auth modes, see
+    _plex_resolve_credentials) converge on the same provider state: a server
+    URL plus the resolved user's token.
+    """
+
+    server_url: str
+    token: str
+    # Person id when this instance serves a linked Person's own Plex account.
+    stream_scope: str = ""
+    # plex.tv user uuid of the resolved identity (drives the auth cache key).
+    user_id: str = ""
+    provider_id = "plex"
+
+    @classmethod
+    def from_settings(cls, settings: Dict[str, Any]) -> "PlexMusicProvider":
+        return cls(
+            server_url=_normalize_server_url(settings.get("plex_server_url")),
+            token=_text(settings.get("plex_token")),
+            user_id=_text(settings.get("plex_user_id")),
+        )
+
+    @classmethod
+    def from_link_values(
+        cls, values: Dict[str, Any], stream_scope: str = ""
+    ) -> "PlexMusicProvider":
+        return cls(
+            server_url=_normalize_server_url(values.get("server_url")),
+            token=_text(values.get("token")),
+            user_id=_text(values.get("user_id")),
+            stream_scope=stream_scope,
+        )
+
+    @property
+    def connected(self) -> bool:
+        return bool(self.server_url and self.token)
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, Any]] = None,
+        timeout: int = REQUEST_TIMEOUT_SECONDS,
+    ) -> Dict[str, Any]:
+        if not self.server_url:
+            raise ValueError("Plex server URL is not configured.")
+        query: Dict[str, Any] = dict(params or {})
+        query.setdefault("X-Plex-Token", self.token)
+        response = requests.request(
+            method.upper(),
+            f"{self.server_url}/{path.lstrip('/')}",
+            params=query,
+            headers={"Accept": "application/json", **(headers or {})},
+            timeout=max(5, int(timeout)),
+        )
+        if response.status_code in (401, 403):
+            self.clear_cached_auth()
+            raise PermissionError(
+                "Plex rejected this core's token — re-test the Plex connection."
+            )
+        if not response.ok:
+            raise RuntimeError(f"Plex returned HTTP {response.status_code} for {path}.")
+        try:
+            body = response.json() if response.content else {}
+        except Exception:
+            return {}
+        return body if isinstance(body, dict) else {}
+
+    def _metadata(self, body: Dict[str, Any]) -> List[Dict[str, Any]]:
+        holder = body.get("MediaContainer")
+        rows = holder.get("Metadata") if isinstance(holder, dict) else None
+        return [row for row in (rows or []) if isinstance(row, dict)] if isinstance(rows, list) else []
+
+    def catalog(self) -> Dict[str, Any]:
+        sections = self.request("GET", "library/sections")
+        holder = sections.get("MediaContainer") if isinstance(sections, dict) else {}
+        rows = holder.get("Directory") if isinstance(holder, dict) else []
+        sections_seen: Dict[str, str] = {}
+        tracks: List[Dict[str, Any]] = []
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict) or _text(row.get("type")) != "artist":
+                # Shared users only see the sections shared with them; skip the rest.
+                continue
+            section_key = _text(row.get("key"))
+            if not section_key:
+                continue
+            sections_seen[section_key] = _text(row.get("title")) or "Music"
+            offset = 0
+            while len(tracks) < MAX_CATALOG_TRACKS:
+                page = self.request(
+                    "GET",
+                    f"library/sections/{section_key}/all",
+                    params={"type": 10},
+                    headers={
+                        "X-Plex-Container-Start": offset,
+                        "X-Plex-Container-Size": PLEX_PAGE_SIZE,
+                    },
+                    timeout=180,
+                )
+                metadata = self._metadata(page)
+                for media_row in metadata:
+                    if len(tracks) >= MAX_CATALOG_TRACKS:
+                        break
+                    track_row = _plex_track_row(media_row)
+                    if _text(track_row.get("id")):
+                        tracks.append(track_row)
+                if len(metadata) < PLEX_PAGE_SIZE or len(tracks) >= MAX_CATALOG_TRACKS:
+                    break
+                offset += len(metadata)
+        playlists = []
+        try:
+            playlists = self.user_playlists()
+        except Exception as exc:
+            logger.warning("[Music] Plex playlist listing failed: %s", exc)
+        catalog_id = f"plex:{hashlib.sha1(self.server_url.encode('utf-8')).hexdigest()[:16]}"
+        return {
+            "catalog_id": catalog_id,
+            "tracks": tracks[:MAX_CATALOG_TRACKS],
+            "total": len(tracks),
+            "playlists": playlists,
+            "libraries": {
+                catalog_id: " · ".join(sections_seen.values()) or "Plex",
+            },
+        }
+
+    def user_playlists(self) -> List[Dict[str, Any]]:
+        """The signed-in Plex user's playlists with their song ids."""
+        playlists: List[Dict[str, Any]] = []
+        body = self.request("GET", "playlists", params={"playlistType": "audio"})
+        holder = body.get("MediaContainer") if isinstance(body, dict) else {}
+        rows = holder.get("Metadata") if isinstance(holder, dict) else []
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict) or _text(row.get("playlistType")) != "audio":
+                continue
+            playlist_id = _text(row.get("ratingKey"))
+            name = _text(row.get("title"))
+            if not playlist_id or not name:
+                continue
+            track_ids: List[str] = []
+            try:
+                items = self.request("GET", f"playlists/{quote(str(playlist_id), safe='')}/items")
+                for entry in self._metadata(items):
+                    if _text(entry.get("ratingKey")):
+                        track_ids.append(_text(entry.get("ratingKey")))
+            except Exception as exc:
+                logger.warning("[Music] Plex playlist %s listing failed: %s", playlist_id, exc)
+            playlists.append(
+                {
+                    "id": f"plex_playlist:{playlist_id}",
+                    "name": name,
+                    "description": _text(row.get("summary")),
+                    "track_ids": track_ids,
+                }
+            )
+            if len(playlists) >= 200:
+                break
+        return playlists
+
+    def stream_url(self, track: Dict[str, Any], *, audio_sync: bool = False) -> str:
+        del audio_sync  # Original containers decode natively; offsets stay aligned.
+        part_key = _text(track.get("stream_path")) or _text(track.get("provider_track_id"))
+        if not part_key:
+            return _text(track.get("stream_url"))
+        kind = f"plex:{self.stream_scope}" if self.stream_scope else "plex"
+        return _stream_proxy_url(kind, part_key)
+
+    def artwork_url(self, track: Dict[str, Any]) -> str:
+        art_path = _text(track.get("artwork_path"))
+        if not art_path:
+            return ""
+        kind = f"plex_art:{self.stream_scope}" if self.stream_scope else "plex_art"
+        return _stream_proxy_url(kind, art_path)
+
+    def proxy_request(
+        self,
+        item_id: str,
+        *,
+        art: bool = False,
+        sync: bool = False,
+    ) -> "tuple[str, Dict[str, str]]":
+        """Build (url, headers) for one proxied Plex stream or artwork request.
+
+        item_id is the Plex library path for the part or thumb; the token is
+        attached server-side so it never reaches a playback target.
+        """
+        item_id = _text(item_id)
+        if not item_id.startswith("/"):
+            item_id = f"/{item_id}"
+        separator = "&" if "?" in item_id else "?"
+        url = f"{self.server_url}{item_id}{separator}X-Plex-Token={quote(self.token, safe='')}"
+        return url, {"Accept": "*/*"}
+
+    def _auth_cache_identity(self) -> str:
+        return self.user_id or "plex"
+
+    def _auth_cache_key(self) -> str:
+        return _provider_auth_cache_key("plex", self.server_url, self._auth_cache_identity())
+
+    def _save_cached_auth(self, token: str, user_id: str, client: Any = None) -> None:
+        store = client or globals().get("redis_client")
+        if store is None:
+            return
+        _save_hash(
+            store,
+            self._auth_cache_key(),
+            {"access_token": token, "user_id": user_id, "authenticated_at": time.time()},
+        )
+
+    def clear_cached_auth(self, client: Any = None) -> None:
+        store = client or globals().get("redis_client")
+        if store is not None:
+            try:
+                store.delete(self._auth_cache_key())
+            except Exception:
+                pass
+
+
+def _plex_track_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """One Plex track (JSON) as a generic provider row (for _normalize_track)."""
+    media_rows = row.get("Media") if isinstance(row.get("Media"), list) else []
+    media = media_rows[0] if media_rows and isinstance(media_rows[0], dict) else {}
+    part_rows = media.get("Part") if isinstance(media.get("Part"), list) else []
+    part = part_rows[0] if part_rows and isinstance(part_rows[0], dict) else {}
+    container = _text(media.get("container")).casefold() or (
+        Path(_text(part.get("file"))).suffix.lstrip(".").casefold()
+    )
+    # Duration arrives in milliseconds; a >27h "song" is a ms value slipping through.
+    duration = _as_float(row.get("duration"))
+    if duration > 100000:
+        duration /= 1000.0
+    thumb = _text(row.get("thumb")) or _text(row.get("parentThumb"))
+    return {
+        "id": _text(row.get("ratingKey")),
+        "provider_track_id": _text(row.get("ratingKey")),
+        "stream_path": _text(part.get("key")),
+        "title": _text(row.get("title")),
+        "artist": _text(row.get("grandparentTitle")),
+        "album_artist": _text(row.get("originalTitle")) or _text(row.get("grandparentTitle")),
+        "album": _text(row.get("parentTitle")),
+        "albumId": _text(row.get("parentRatingKey")),
+        "genres": [row.get("genre")] if _text(row.get("genre")) else [],
+        "year": _text(row.get("year")),
+        "track_number": row.get("index"),
+        "duration_seconds": max(0.0, duration),
+        "container": container,
+        "artwork_path": thumb,
+        "path": _text(part.get("file")) or _text(part.get("key")),
+        "provider": "plex",
+    }
+
+
+# --------------------------------------------------------------------------
+# Provider field-spec registry — one table drives every provider form.
+#
+# The global source cards, a Person's primary-source fields, their second
+# source's fields, the value dicts saved on the link, provider instantiation,
+# and the connect/disconnect/test flows all read these specs. Adding a provider
+# means one class plus one spec entry, not edits across every form branch.
+# --------------------------------------------------------------------------
+
+
+class ProviderFieldSpec:
+    """Form + value plumbing for one catalog provider.
+
+    Subclasses supply `provider_id`, the link-field table, and `build_provider`;
+    `connect` (global card flow) and `test_link_form` (Person link test) default
+    to sensible implementations where the shapes line up.
+    """
+
+    provider_id = ""
+    # Token used in form field keys and settings keys ("share", not
+    # "network_share", keeps the share provider's long-standing keys stable).
+    form_token = ""
+    # Link-value field table: dicts with key/label/kind/placeholder/description.
+    # `kind` is "text" or "password"; password fields keep their saved value
+    # when a form submits them blank.
+    link_fields: Tuple[Dict[str, str], ...] = ()
+    primary_option_label = ""
+    extra_option_label = ""
+
+    def form_key(self, prefix: str, key: str) -> str:
+        return f"{prefix}_{self.form_token}_{key}"
+
+    # -- form generation -----------------------------------------------------
+
+    def person_fields(
+        self,
+        values: Dict[str, Any],
+        *,
+        prefix: str,
+        label_prefix: str = "",
+        with_descriptions: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """One provider's link form fields (primary source or second source)."""
+        rows: List[Dict[str, Any]] = []
+        for spec in self.link_fields:
+            key = _text(spec.get("key"))
+            kind = _text(spec.get("kind")) or "text"
+            row: Dict[str, Any] = {
+                "key": self.form_key(prefix, key),
+                "label": f"{label_prefix}{PROVIDER_LABELS[self.provider_id]} {spec.get('label', '')}".strip(),
+                "type": kind,
+                "value": "" if kind == "password" else _text(values.get(key)),
+            }
+            placeholder = _text(spec.get("placeholder"))
+            if placeholder:
+                row["placeholder"] = placeholder
+            if with_descriptions:
+                description = _text(spec.get("description"))
+                if description:
+                    row["description"] = description
+            rows.append(row)
+        return rows
+
+    def source_options(self, kind: str) -> List[Dict[str, str]]:
+        """The picker rows this provider offers (empty when not selectable)."""
+        label = self.primary_option_label if kind == "primary" else self.extra_option_label
+        return [{"value": self.provider_id, "label": label}] if label else []
+
+    def connection_detail(self, cfg: Dict[str, Any]) -> str:
+        return _text(cfg.get(f"{self.provider_id}_server_url")) or (
+            f"Point this core at your {PROVIDER_LABELS[self.provider_id]} server to begin."
+        )
+
+    # -- value + provider building -------------------------------------------
+
+    def build_values(
+        self,
+        prefix: str,
+        values: Dict[str, Any],
+        existing: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """One link value dict from the form values under `prefix`.
+
+        Password fields keep their saved value when submitted blank; fields the
+        form omitted entirely keep whatever was stored (the resolved caches,
+        e.g. a Plex user uuid, survive a re-save).
+        """
+        existing = existing if isinstance(existing, dict) else {}
+        link: Dict[str, Any] = {}
+        for spec in self.link_fields:
+            key = _text(spec.get("key"))
+            kind = _text(spec.get("kind")) or "text"
+            form_key = self.form_key(prefix, key)
+            if form_key in values:
+                if kind == "password":
+                    link[key] = _text(values.get(form_key)) or _text(existing.get(key))
+                else:
+                    link[key] = _text(values.get(form_key))
+            elif key in existing:
+                link[key] = _text(existing.get(key))
+        return link
+
+    def build_provider(
+        self, values: Dict[str, Any], stream_scope: str = ""
+    ) -> Any:
+        raise NotImplementedError
+
+    def connect(self, values: Dict[str, Any], cfg: Dict[str, Any], store: Any) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    def disconnect_keys(self) -> Tuple[str, ...]:
+        """Settings keys removed when this provider is disconnected."""
+        return tuple(f"{self.form_token}_{spec['key']}" for spec in self.link_fields)
+
+
+class _EmbyStyleProviderFieldSpec(ProviderFieldSpec):
+    """Shared plumbing for the Emby-fork family (Emby, Jellyfin).
+
+    Same link shape (server URL, username/password sign-in or an API key, an
+    optional user id, optional library name/folder), with the auth mode derived
+    from the submitted values exactly as the link form always did.
+    """
+
+    def build_values(
+        self,
+        prefix: str,
+        values: Dict[str, Any],
+        existing: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        link = super().build_values(prefix, values, existing)
+        link["auth_mode"] = (
+            "api_key"
+            if _text(link.get("api_key")) and not _text(link.get("username"))
+            else "user_token"
+        )
+        return link
+
+    def build_provider(self, values: Dict[str, Any], stream_scope: str = "") -> Any:
+        provider_class = _provider_class(self.provider_id)
+        if provider_class is None:
+            raise ValueError(f"{PROVIDER_LABELS.get(self.provider_id, self.provider_id)} support is not enabled in this build.")
+        return provider_class(
+            server_url=_normalize_server_url(values.get("server_url")),
+            auth_mode="api_key"
+            if _text(values.get("auth_mode")).casefold() == "api_key"
+            else "user_token",
+            username=_text(values.get("username")),
+            password=_text(values.get("password")),
+            api_key=_text(values.get("api_key")),
+            user_id=_text(values.get("user_id")),
+            library_name=_text(values.get("library_name")),
+            library_folder=_text(values.get("library_folder")),
+            stream_scope=stream_scope,
+        )
+
+    def global_fields(self, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+        label = PROVIDER_LABELS[self.provider_id]
+        settings_key = f"{self.provider_id}_server_url"
+        auth_mode = _text(cfg.get(f"{self.provider_id}_auth_mode")).casefold() or "user_token"
+        return [
+            {
+                "key": f"{self.provider_id}_server_url",
+                "label": f"{label} Server URL",
+                "type": "text",
+                "required": True,
+                "value": _text(cfg.get(f"{self.provider_id}_server_url"))
+                or (_text(cfg.get("server_url")) if self.provider_id == "emby" else ""),
+                "placeholder": "http://emby.local:8096"
+                if self.provider_id == "emby"
+                else "http://jellyfin.local:8096",
+            },
+            {
+                "key": f"{self.provider_id}_auth_mode",
+                "label": "Sign-In Style",
+                "type": "select",
+                "value": auth_mode,
+                "options": [
+                    {"value": "user_token", "label": f"{label} username & password"},
+                    {"value": "api_key", "label": "Server API key"},
+                ],
+                "description": (
+                    f"Username sign-in streams through Tater's built-in proxy and honors each "
+                    f"{label} user's library access. An API key streams directly from the server "
+                    f"and needs the User ID below."
+                ),
+            },
+            {
+                "key": f"{self.provider_id}_username",
+                "label": f"{label} Username",
+                "type": "text",
+                "value": _text(cfg.get(f"{self.provider_id}_username")),
+            },
+            {
+                "key": f"{self.provider_id}_password",
+                "label": f"{label} Password",
+                "type": "password",
+                "value": "",
+                "description": "Used for username sign-in. Leave blank to keep the saved password.",
+            },
+            {
+                "key": f"{self.provider_id}_api_key",
+                "label": f"{label} API Key",
+                "type": "password",
+                "value": _text(cfg.get(f"{self.provider_id}_api_key")),
+                "description": (
+                    f"Server API key from the {label} dashboard's security settings, for API-key sign-in."
+                ),
+            },
+            {
+                "key": f"{self.provider_id}_user_id",
+                "label": f"{label} User ID (optional)",
+                "type": "text",
+                "value": _text(cfg.get(f"{self.provider_id}_user_id")),
+                "description": (
+                    "Required for API-key sign-in when the server has more than one user."
+                ),
+            },
+            {
+                "key": f"{self.provider_id}_library_name",
+                "label": f"{label} Library Name (optional)",
+                "type": "text",
+                "value": _text(cfg.get(f"{self.provider_id}_library_name")),
+                "description": (
+                    "Only needed when this user can see several music libraries."
+                ),
+            },
+            {
+                "key": f"{self.provider_id}_library_folder",
+                "label": f"{label} Library Folder (optional)",
+                "type": "text",
+                "value": _text(cfg.get(f"{self.provider_id}_library_folder")),
+                "description": (
+                    "Subfolder of the library to sync (name or full server path). Leave blank to "
+                    "sync the whole library; useful for mixed-content libraries."
+                ),
+            },
+        ]
+
+
+_EMBY_LINK_FIELDS: Tuple[Dict[str, str], ...] = (
+    {"key": "server_url", "label": "Server URL", "placeholder": "http://emby.local:8096"},
+    {
+        "key": "password",
+        "label": "Password",
+        "kind": "password",
+        "description": "Leave blank to keep the saved password.",
+    },
+    {
+        "key": "api_key",
+        "label": "API Key",
+        "kind": "password",
+    },
+    {"key": "username", "label": "Username"},
+    {"key": "user_id", "label": "User ID (optional)"},
+    {"key": "library_name", "label": "Library Name (optional)"},
+    {
+        "key": "library_folder",
+        "label": "Library Folder (optional)",
+        "placeholder": "Music",
+        "description": (
+            "Subfolder of the library to sync (name or full server path). Leave blank to sync "
+            "the whole library; useful when one mixed-content library holds their music, TV, "
+            "and movies."
+        ),
+    },
+)
+
+
+class _EmbyProviderFieldSpec(_EmbyStyleProviderFieldSpec):
+    provider_id = "emby"
+    form_token = "emby"
+    link_fields = _EMBY_LINK_FIELDS
+    primary_option_label = "Emby (own user/library)"
+    extra_option_label = "Emby (a second account or library)"
+
+    def connection_detail(self, cfg: Dict[str, Any]) -> str:
+        return _text(
+            cfg.get("emby_server_url") or cfg.get("server_url")
+        ) or "Point this core at your Emby server to begin."
+
+    def connect(self, values: Dict[str, Any], cfg: Dict[str, Any], store: Any) -> Dict[str, Any]:
+        return _connect_emby_style(self.provider_id, values, store)
+
+    def disconnect(self, store: Any) -> Dict[str, Any]:
+        return _disconnect_emby_style(self.provider_id, store)
+
+    def test_link_form(
+        self, values: Dict[str, Any], existing: Dict[str, Any], store: Any
+    ) -> str:
+        return _test_emby_style_link_form(self.provider_id, values, existing, store)
+
+
+class _JellyfinProviderFieldSpec(_EmbyStyleProviderFieldSpec):
+    provider_id = "jellyfin"
+    form_token = "jellyfin"
+    link_fields = _EMBY_LINK_FIELDS
+    primary_option_label = "Jellyfin (own user/library)"
+    extra_option_label = "Jellyfin (a second account or library)"
+
+    def connection_detail(self, cfg: Dict[str, Any]) -> str:
+        return _text(cfg.get("jellyfin_server_url")) or (
+            "Point this core at your Jellyfin server (http://<host>:8096) to begin."
+        )
+
+    def connect(self, values: Dict[str, Any], cfg: Dict[str, Any], store: Any) -> Dict[str, Any]:
+        return _connect_emby_style(self.provider_id, values, store)
+
+    def disconnect(self, store: Any) -> Dict[str, Any]:
+        return _disconnect_emby_style(self.provider_id, store)
+
+    def test_link_form(
+        self, values: Dict[str, Any], existing: Dict[str, Any], store: Any
+    ) -> str:
+        return _test_emby_style_link_form(self.provider_id, values, existing, store)
+
+
+class _SubsonicProviderFieldSpec(ProviderFieldSpec):
+    provider_id = "subsonic"
+    form_token = "subsonic"
+    link_fields: Tuple[Dict[str, str], ...] = (
+        {
+            "key": "server_url",
+            "label": "Server URL",
+            "placeholder": "https://music.example.com",
+            "description": "Base URL of the Subsonic-compatible server (Navidrome, Airsonic, Gonic, …).",
+        },
+        {"key": "username", "label": "Username"},
+        {
+            "key": "password",
+            "label": "Password",
+            "kind": "password",
+            "description": "Leave blank to keep the saved password.",
+        },
+    )
+    primary_option_label = "Subsonic (own server account)"
+    extra_option_label = "Subsonic (a second server account)"
+
+    def build_provider(self, values: Dict[str, Any], stream_scope: str = "") -> Any:
+        return SubsonicMusicProvider(
+            server_url=_normalize_server_url(values.get("server_url")),
+            username=_text(values.get("username")),
+            password=_text(values.get("password")),
+            stream_scope=stream_scope,
+        )
+
+    def global_fields(self, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+        return [
+            {
+                "key": "subsonic_server_url",
+                "label": "Subsonic Server URL",
+                "type": "text",
+                "required": True,
+                "value": _text(cfg.get("subsonic_server_url")),
+                "placeholder": "https://music.example.com",
+                "description": (
+                    "Base URL of a Subsonic-compatible server — Navidrome, Airsonic, Gonic, "
+                    "Ampache with the Subsonic API, and friends."
+                ),
+            },
+            {
+                "key": "subsonic_username",
+                "label": "Subsonic Username",
+                "type": "text",
+                "value": _text(cfg.get("subsonic_username")),
+            },
+            {
+                "key": "subsonic_password",
+                "label": "Subsonic Password",
+                "type": "password",
+                "value": "",
+                "description": "Leave blank to keep the saved password.",
+            },
+        ]
+
+    def connection_detail(self, cfg: Dict[str, Any]) -> str:
+        return _text(cfg.get("subsonic_server_url")) or (
+            "Point this core at your Subsonic-compatible server to begin."
+        )
+
+    def connect(self, values: Dict[str, Any], cfg: Dict[str, Any], store: Any) -> Dict[str, Any]:
+        return _connect_subsonic(values, store)
+
+    def disconnect(self, store: Any) -> Dict[str, Any]:
+        return _disconnect_generic(self.provider_id, store)
+
+    def test_link_form(
+        self, values: Dict[str, Any], existing: Dict[str, Any], store: Any
+    ) -> str:
+        return _test_subsonic_link_form(values, existing, store)
+
+
+class _PlexProviderFieldSpec(ProviderFieldSpec):
+    provider_id = "plex"
+    form_token = "plex"
+    link_fields: Tuple[Dict[str, str], ...] = (
+        {
+            "key": "auth_mode",
+            "label": "Sign-In Style",
+            "kind": "select",
+            "description": (
+                "Home user: the owner signs in and this link uses one named Plex Home member. "
+                "Own account: signs in with this account's own plex.tv username and password. "
+                "Manual token: paste a server token directly."
+            ),
+        },
+        {
+            "key": "username",
+            "label": "Username",
+            "description": "plex.tv username for Home-user or own-account sign-in.",
+        },
+        {
+            "key": "password",
+            "label": "Password",
+            "kind": "password",
+            "description": "Leave blank to keep the saved password.",
+        },
+        {
+            "key": "home_user",
+            "label": "Plex Home User",
+            "description": "The Home member's name to play as (Home-user sign-in only).",
+        },
+        {
+            "key": "home_user_pin",
+            "label": "Plex Home User PIN",
+            "kind": "password",
+            "description": "Only needed when that Home member is PIN-protected. Leave blank to keep the saved PIN.",
+        },
+        {
+            "key": "server_url",
+            "label": "Server URL",
+            "placeholder": "http://plex.local:32400",
+            "description": "Leave blank and plex.tv discovery fills in the server this account can reach.",
+        },
+        {
+            "key": "token",
+            "label": "Plex Token",
+            "kind": "password",
+            "description": "Pasted token for manual sign-in, or the resolved token. Leave blank to keep the saved token.",
+        },
+    )
+    primary_option_label = "Plex (own account)"
+    extra_option_label = "Plex (a second account)"
+
+    def person_fields(
+        self,
+        values: Dict[str, Any],
+        *,
+        prefix: str,
+        label_prefix: str = "",
+        with_descriptions: bool = True,
+    ) -> List[Dict[str, Any]]:
+        rows = super().person_fields(
+            values, prefix=prefix, label_prefix=label_prefix, with_descriptions=with_descriptions
+        )
+        for row in rows:
+            if row["key"] == self.form_key(prefix, "auth_mode"):
+                row["options"] = _plex_auth_mode_options()
+                row["value"] = (
+                    _text(values.get("auth_mode")).casefold() or DEFAULT_PLEX_AUTH_MODE
+                )
+        return rows
+
+    def build_values(
+        self,
+        prefix: str,
+        values: Dict[str, Any],
+        existing: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        existing = existing if isinstance(existing, dict) else {}
+        link = super().build_values(prefix, values, existing)
+        mode = _text(link.get("auth_mode")).casefold()
+        if mode not in PLEX_AUTH_MODES:
+            mode = _text(existing.get("auth_mode")).casefold()
+        link["auth_mode"] = mode if mode in PLEX_AUTH_MODES else DEFAULT_PLEX_AUTH_MODE
+        return link
+
+    def build_provider(self, values: Dict[str, Any], stream_scope: str = "") -> Any:
+        return PlexMusicProvider.from_link_values(values, stream_scope)
+
+    def global_fields(self, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+        mode = _text(cfg.get("plex_auth_mode")).casefold() or DEFAULT_PLEX_AUTH_MODE
+        return [
+            {
+                "key": "plex_auth_mode",
+                "label": "Sign-In Style",
+                "type": "select",
+                "value": mode if mode in PLEX_AUTH_MODES else DEFAULT_PLEX_AUTH_MODE,
+                "options": _plex_auth_mode_options(),
+                "description": (
+                    "Home user: the owner signs in and picks one Plex Home member. Own account: "
+                    "signs in with that account's own plex.tv username and password. Manual "
+                    "token: paste a server token directly."
+                ),
+            },
+            {
+                "key": "plex_username",
+                "label": "Plex Username",
+                "type": "text",
+                "value": _text(cfg.get("plex_username")),
+            },
+            {
+                "key": "plex_password",
+                "label": "Plex Password",
+                "type": "password",
+                "value": "",
+                "description": "Used for Home-user and own-account sign-in. Leave blank to keep the saved password.",
+            },
+            {
+                "key": "plex_home_user",
+                "label": "Plex Home User",
+                "type": "text",
+                "value": _text(cfg.get("plex_home_user")),
+                "description": "The Plex Home member's name to play as (Home-user sign-in only).",
+            },
+            {
+                "key": "plex_home_user_pin",
+                "label": "Plex Home User PIN",
+                "type": "password",
+                "value": "",
+                "description": "Only when that Home member is PIN-protected. Leave blank to keep the saved PIN.",
+            },
+            {
+                "key": "plex_server_url",
+                "label": "Plex Server URL",
+                "type": "text",
+                "value": _text(cfg.get("plex_server_url")),
+                "placeholder": "http://plex.local:32400",
+                "description": (
+                    "Leave blank and plex.tv discovery pre-fills the server this account can "
+                    "reach; a manual entry always wins."
+                ),
+            },
+            {
+                "key": "plex_token",
+                "label": "Plex Token",
+                "type": "password",
+                "value": _text(cfg.get("plex_token")),
+                "description": (
+                    "Pasted X-Plex-Token for manual sign-in. Other modes resolve and store one automatically."
+                ),
+            },
+        ]
+
+    def connection_detail(self, cfg: Dict[str, Any]) -> str:
+        if _text(cfg.get("plex_server_url")):
+            return _text(cfg.get("plex_server_url"))
+        return "Sign in to plex.tv (or paste a token) and the server fills in from discovery."
+
+    def connect(self, values: Dict[str, Any], cfg: Dict[str, Any], store: Any) -> Dict[str, Any]:
+        return _connect_plex(values, store)
+
+    def disconnect(self, store: Any) -> Dict[str, Any]:
+        return _disconnect_generic(self.provider_id, store)
+
+    def test_link_form(
+        self, values: Dict[str, Any], existing: Dict[str, Any], store: Any
+    ) -> str:
+        return _test_plex_link_form(values, existing, store)
+
+
+class _ShareProviderFieldSpec(ProviderFieldSpec):
+    provider_id = "network_share"
+    form_token = "share"
+    link_fields: Tuple[Dict[str, str], ...] = (
+        {
+            "key": "root_path",
+            "label": "Mounted Share Folder",
+            "placeholder": "/mnt/music/<person>",
+            "description": (
+                "Folder path of this Person's own share subfolder as mounted on the Tater host."
+            ),
+        },
+    )
+    primary_option_label = "Network share (own folder)"
+    extra_option_label = "Network share (a second folder)"
+
+    def build_provider(self, values: Dict[str, Any], stream_scope: str = "") -> Any:
+        del stream_scope  # Share streams scope themselves via their root path.
+        return NetworkShareMusicProvider(root_path=_text(values.get("root_path")))
+
+    def global_fields(self, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+        return [
+            {
+                "key": "share_root_path",
+                "label": "Mounted Share Folder",
+                "type": "text",
+                "required": True,
+                "value": _text(cfg.get("share_root_path")),
+                "placeholder": "/mnt/music",
+                "description": (
+                    "Folder path of the SMB/CIFS or NFS share as mounted on the Tater host "
+                    "(for Docker, add the share as a bind-mount volume and use its container path)."
+                ),
+            }
+        ]
+
+    def connection_detail(self, cfg: Dict[str, Any]) -> str:
+        return _text(cfg.get("share_root_path")) or (
+            "Mount the SMB/NFS share on the Tater host, then point this core at the mounted folder."
+        )
+
+    def connect(self, values: Dict[str, Any], cfg: Dict[str, Any], store: Any) -> Dict[str, Any]:
+        root_path = _text(values.get("share_root_path")) or _text(cfg.get("share_root_path"))
+        provider = NetworkShareMusicProvider(root_path=root_path)
+        if not root_path:
+            raise ValueError("Enter the mounted network-share folder path first.")
+        if not provider.connected:
+            raise ValueError(
+                "That folder path is not readable from Tater. Mount the SMB/NFS share on the host "
+                "(or bind-mount it into the container) and try again."
+            )
+        _save_hash(store, SETTINGS_KEY, {"share_root_path": root_path, "provider": self.provider_id})
+        catalog = _sync_catalog(store, self.provider_id)
+        return {
+            "ok": True,
+            "message": (
+                f"{PROVIDER_LABELS[self.provider_id]} connected and loaded "
+                f"{len(catalog.get('tracks') or [])} tracks."
+            ),
+        }
+
+    def disconnect(self, store: Any) -> Dict[str, Any]:
+        return _disconnect_share(store)
+
+    def test_link_form(
+        self, values: Dict[str, Any], existing: Dict[str, Any], store: Any
+    ) -> str:
+        raise ValueError("Network shares are checked when the link is saved.")
+
+
+PROVIDER_FIELD_SPECS: Dict[str, ProviderFieldSpec] = {
+    "emby": _EmbyProviderFieldSpec(),
+    "jellyfin": _JellyfinProviderFieldSpec(),
+    "subsonic": _SubsonicProviderFieldSpec(),
+    "plex": _PlexProviderFieldSpec(),
+    "network_share": _ShareProviderFieldSpec(),
+}
+
+# Every provider form field (primary and second source), remembered across the
+# link test's tab refetch.
+PERSON_LINK_TEST_FIELD_KEYS = tuple(
+    [
+        *_PERSON_LINK_TEST_CORE_FIELD_KEYS,
+        *(
+            PROVIDER_FIELD_SPECS[provider_id].form_key(prefix, _text(field.get("key")))
+            for provider_id in CATALOG_PROVIDER_ORDER
+            for prefix in ("person_link", "person_link_extra")
+            for field in PROVIDER_FIELD_SPECS[provider_id].link_fields
+        ),
+    ]
+)
+
+
+def _plex_auth_mode_options() -> List[Dict[str, str]]:
+    return [
+        {
+            "value": "home_user",
+            "label": "Plex Home member (owner signs in)",
+        },
+        {
+            "value": "own_account",
+            "label": "Their own plex.tv account",
+        },
+        {
+            "value": "manual_token",
+            "label": "Manual token (paste it)",
+        },
+    ]
+
+
+def _connect_emby_style(provider_id: str, values: Dict[str, Any], store: Any) -> Dict[str, Any]:
+    """Global-card connect for the Emby-fork family (Emby and Jellyfin)."""
+    cfg = _settings(store)
+    spec = PROVIDER_FIELD_SPECS[provider_id]
+    auth_mode = (
+        "api_key"
+        if _text(values.get(f"{provider_id}_auth_mode")).casefold() == "api_key"
+        else "user_token"
+    )
+    server_url = _normalize_server_url(
+        values.get(f"{provider_id}_server_url")
+        or cfg.get(f"{provider_id}_server_url")
+        or (cfg.get("server_url") if provider_id == "emby" else "")
+    )
+    if not server_url:
+        raise ValueError(f"Enter the {PROVIDER_LABELS[provider_id]} server URL first.")
+    username = _text(values.get(f"{provider_id}_username") or cfg.get(f"{provider_id}_username"))
+    password = _text(values.get(f"{provider_id}_password")) or _text(cfg.get(f"{provider_id}_password"))
+    api_key = _text(values.get(f"{provider_id}_api_key")) or _text(cfg.get(f"{provider_id}_api_key"))
+    user_id = _text(values.get(f"{provider_id}_user_id") or cfg.get(f"{provider_id}_user_id"))
+    library_name = _text(values.get(f"{provider_id}_library_name") or cfg.get(f"{provider_id}_library_name"))
+    library_folder = _text(values.get(f"{provider_id}_library_folder") or cfg.get(f"{provider_id}_library_folder"))
+    provider = spec.build_provider(
+        {
+            "server_url": server_url,
+            "auth_mode": auth_mode,
+            "username": username,
+            "password": password,
+            "api_key": api_key,
+            "user_id": user_id,
+            "library_name": library_name,
+            "library_folder": library_folder,
+        }
+    )
+    if not provider.connected:
+        raise ValueError(
+            f"Enter the {PROVIDER_LABELS[provider_id]} server URL plus a username and password, "
+            "or an API key."
+        )
+    provider.clear_cached_auth(store)
+    resolved_user_id = user_id
+    try:
+        if auth_mode == "user_token":
+            _token, resolved_user_id = provider.authenticate(force=True, client=store)
+        else:
+            resolved_user_id = provider.resolve_user_id(store)
+    except PermissionError as exc:
+        raise ValueError(f"{PROVIDER_LABELS[provider_id]} rejected the credentials: {exc}") from exc
+    updates = {
+        f"{provider_id}_server_url": server_url,
+        f"{provider_id}_auth_mode": auth_mode,
+        f"{provider_id}_username": username,
+        f"{provider_id}_password": password,
+        f"{provider_id}_api_key": api_key,
+        f"{provider_id}_user_id": resolved_user_id,
+        f"{provider_id}_library_name": library_name,
+        f"{provider_id}_library_folder": library_folder,
+        "provider": provider_id,
+    }
+    if provider_id == "emby":
+        # Legacy key kept in sync for older readers.
+        updates["server_url"] = server_url
+    _save_hash(store, SETTINGS_KEY, updates)
+    catalog = _sync_catalog(store, provider_id)
+    return {
+        "ok": True,
+        "message": (
+            f"{PROVIDER_LABELS[provider_id]} connected and loaded "
+            f"{len(catalog.get('tracks') or [])} tracks."
+        ),
+    }
+
+
+def _disconnect_emby_style(provider_id: str, store: Any) -> Dict[str, Any]:
+    return _disconnect_generic(provider_id, store)
+
+
+def _disconnect_generic(provider_id: str, store: Any) -> Dict[str, Any]:
+    spec = PROVIDER_FIELD_SPECS.get(provider_id)
+    if spec is None:
+        raise ValueError(f"{PROVIDER_LABELS.get(provider_id, provider_id)} support is not enabled in this build.")
+    fields = list(spec.disconnect_keys())
+    if provider_id == "emby":
+        fields.append("server_url")
+    player = _player(store)
+    if _provider_id(player.get("provider")) == provider_id:
+        _stop_player(store=store)
+    if store is not None:
+        store.hdel(SETTINGS_KEY, *fields, "provider")
+        try:
+            # Legacy shared cache key plus any per-identity token caches.
+            keys_to_delete = [EMBY_AUTH_CACHE_KEY] if provider_id == "emby" else []
+            if hasattr(store, "keys"):
+                try:
+                    keys_to_delete.extend(
+                        key for key in store.keys(f"personal_music_core:{provider_id}:auth:*") or []
+                        if isinstance(key, str)
+                    )
+                except Exception:
+                    pass
+            if keys_to_delete:
+                store.delete(*keys_to_delete)
+        except Exception:
+            pass
+        cached = _load_json(store, CATALOG_KEY, {})
+        if _provider_id(cached.get("provider")) == provider_id:
+            store.delete(CATALOG_KEY)
+            with _catalog_memory_cache_lock:
+                _catalog_memory_cache.update(
+                    {"store": store, "loaded_at": time.monotonic(), "payload": {}}
+                )
+    _save_hash(store, RUNTIME_KEY, {"status": "disconnected", "last_error": ""})
+    return {"ok": True, "message": f"{PROVIDER_LABELS[provider_id]} disconnected locally."}
+
+
+def _disconnect_share(store: Any) -> Dict[str, Any]:
+    player = _player(store)
+    if _provider_id(player.get("provider")) == "network_share":
+        _stop_player(store=store)
+    if store is not None:
+        store.hdel(SETTINGS_KEY, "share_root_path", "provider")
+        try:
+            store.delete(SHARE_ART_INDEX_KEY)
+            try:
+                os.rmdir(_share_art_cache_dir())
+            except OSError:
+                pass
+        except Exception:
+            pass
+        cached = _load_json(store, CATALOG_KEY, {})
+        if _provider_id(cached.get("provider")) == "network_share":
+            store.delete(CATALOG_KEY)
+            with _catalog_memory_cache_lock:
+                _catalog_memory_cache.update(
+                    {"store": store, "loaded_at": time.monotonic(), "payload": {}}
+                )
+    _save_hash(store, RUNTIME_KEY, {"status": "disconnected", "last_error": ""})
+    return {"ok": True, "message": f"{PROVIDER_LABELS['network_share']} disconnected locally."}
+
+
+def _connect_subsonic(values: Dict[str, Any], store: Any) -> Dict[str, Any]:
+    cfg = _settings(store)
+    server_url = _normalize_server_url(
+        values.get("subsonic_server_url") or cfg.get("subsonic_server_url")
+    )
+    username = _text(values.get("subsonic_username") or cfg.get("subsonic_username"))
+    password = _text(values.get("subsonic_password")) or _text(cfg.get("subsonic_password"))
+    provider = SubsonicMusicProvider(
+        server_url=server_url,
+        username=username,
+        password=password,
+    )
+    if not provider.connected:
+        raise ValueError("Enter the Subsonic server URL plus a username and password.")
+    try:
+        provider.ping()
+    except PermissionError as exc:
+        raise ValueError(f"Subsonic rejected the credentials: {exc}") from exc
+    except RuntimeError as exc:
+        raise ValueError(f"Could not reach the Subsonic server: {exc}") from exc
+    _save_hash(
+        store,
+        SETTINGS_KEY,
+        {
+            "subsonic_server_url": server_url,
+            "subsonic_username": username,
+            "subsonic_password": password,
+            "provider": "subsonic",
+        },
+    )
+    catalog = _sync_catalog(store, "subsonic")
+    return {
+        "ok": True,
+        "message": (
+            f"{PROVIDER_LABELS['subsonic']} connected and loaded "
+            f"{len(catalog.get('tracks') or [])} tracks."
+        ),
+    }
+
+
+def _plex_resolve_credentials(
+    values: Dict[str, Any],
+    existing: Dict[str, Any],
+    *,
+    store: Any = None,
+) -> Dict[str, Any]:
+    """Resolve (server URL, token, user id) for one Plex configuration.
+
+    Three auth modes converge on that one state: `home_user` signs in as the
+    owner and switches into the named Home member (PIN form field when that
+    member is protected); `own_account` signs in with that account's own
+    plex.tv credentials (shared users cannot be switched into by the owner —
+    the plex.tv boundary); `manual_token` pastes a token plus server URL.
+    Server discovery pre-fills the URL; a manual entry always wins.
+    """
+    existing = existing if isinstance(existing, dict) else {}
+    mode = (
+        _text(values.get("plex_auth_mode")).casefold()
+        or _text(existing.get("auth_mode")).casefold()
+        or DEFAULT_PLEX_AUTH_MODE
+    )
+    if mode not in PLEX_AUTH_MODES:
+        mode = DEFAULT_PLEX_AUTH_MODE
+    username = _text(values.get("plex_username")) or _text(existing.get("username"))
+    password = _text(values.get("plex_password")) or _text(existing.get("password"))
+    home_user = _text(values.get("plex_home_user")) or _text(existing.get("home_user"))
+    home_pin = _text(values.get("plex_home_user_pin")) or _text(existing.get("home_user_pin"))
+    server_url = _normalize_server_url(
+        values.get("plex_server_url") or existing.get("server_url")
+    )
+    pasted_token = _text(values.get("plex_token")) or _text(existing.get("token"))
+
+    if mode == "manual_token":
+        if not pasted_token:
+            raise ValueError("Paste the Plex token to connect with.")
+        if not server_url:
+            raise ValueError("Enter the Plex server URL to connect with.")
+        return {
+            "auth_mode": mode,
+            "username": username,
+            "password": password,
+            "home_user": home_user,
+            "home_user_pin": home_pin,
+            "server_url": server_url,
+            "token": pasted_token,
+            "user_id": _text(existing.get("user_id")),
+            "detail": "the pasted token",
+        }
+
+    if not username or not password:
+        raise ValueError(
+            "Enter the Plex username and password to sign in with, or switch to a manual token."
+        )
+    try:
+        owner_token = _plex_tv_signin(username, password)
+        if mode == "home_user":
+            wanted = home_user.casefold()
+            members = _plex_tv_home_users(owner_token)
+            match = next(
+                (member for member in members if member["title"].casefold() == wanted),
+                None,
+            )
+            if match is None:
+                available = ", ".join(member["title"] for member in members) or "none listed"
+                raise ValueError(
+                    f"No Plex Home member named '{home_user}' (visible: {available})."
+                )
+            user_token = _plex_tv_switch_home_user(owner_token, match["uuid"], home_pin)
+            user_id = match["uuid"]
+            detail = f"switched into the {match['title']} Home member"
+        else:
+            user_token = owner_token
+            user_id = _plex_tv_user_id(owner_token)
+            detail = f"{username} signed in to plex.tv"
+        if not server_url:
+            servers = _plex_tv_resources(owner_token)
+            owned = [server for server in servers if server.get("owned")]
+            candidates = owned or servers
+            for server in candidates:
+                for uri in server.get("connections") or []:
+                    try:
+                        server_url = _normalize_server_url(uri)
+                        break
+                    except ValueError:
+                        continue
+                if server_url:
+                    break
+            if not server_url:
+                raise ValueError(
+                    "plex.tv discovery found no reachable server; enter the Plex server URL manually."
+                )
+    except PermissionError as exc:
+        raise ValueError(f"Plex rejected the credentials: {exc}") from exc
+    except RuntimeError as exc:
+        raise ValueError(f"Could not reach plex.tv: {exc}") from exc
+    return {
+        "auth_mode": mode,
+        "username": username,
+        "password": password,
+        "home_user": home_user,
+        "home_user_pin": home_pin,
+        "server_url": server_url,
+        "token": user_token,
+        "user_id": user_id,
+        "detail": f"{detail}; server {server_url} from discovery",
+    }
+
+
+def _plex_resolve_link_values(
+    link_values: Dict[str, Any],
+    existing: Dict[str, Any],
+    *,
+    store: Any = None,
+) -> Dict[str, Any]:
+    """Fill in a Plex link value dict's resolved token (per its auth mode)."""
+    if _text(link_values.get("token")):
+        return link_values
+    built = {
+        "plex_auth_mode": link_values.get("auth_mode"),
+        "plex_username": link_values.get("username"),
+        "plex_password": link_values.get("password"),
+        "plex_home_user": link_values.get("home_user"),
+        "plex_home_user_pin": link_values.get("home_user_pin"),
+        "plex_server_url": link_values.get("server_url"),
+        "plex_token": "",
+    }
+    resolved = _plex_resolve_credentials(built, existing, store=store)
+    merged = dict(link_values)
+    merged["token"] = resolved["token"]
+    merged["user_id"] = resolved.get("user_id", "")
+    merged["server_url"] = resolved["server_url"]
+    return merged
+
+
+def _connect_plex(values: Dict[str, Any], store: Any) -> Dict[str, Any]:
+    cfg = _settings(store)
+    resolved = _plex_resolve_credentials(values, cfg, store=store)
+    provider = PlexMusicProvider(
+        server_url=resolved["server_url"],
+        token=resolved["token"],
+        user_id=resolved.get("user_id", ""),
+    )
+    provider._save_cached_auth(resolved["token"], resolved.get("user_id", ""), store)
+    _save_hash(
+        store,
+        SETTINGS_KEY,
+        {
+            "plex_auth_mode": resolved["auth_mode"],
+            "plex_username": resolved["username"],
+            "plex_password": resolved["password"],
+            "plex_home_user": resolved["home_user"],
+            "plex_home_user_pin": resolved["home_user_pin"],
+            "plex_server_url": resolved["server_url"],
+            "plex_token": resolved["token"],
+            "plex_user_id": resolved.get("user_id", ""),
+            "provider": "plex",
+        },
+    )
+    catalog = _sync_catalog(store, "plex")
+    return {
+        "ok": True,
+        "message": (
+            f"{PROVIDER_LABELS['plex']} connected and loaded "
+            f"{len(catalog.get('tracks') or [])} tracks."
+        ),
+    }
+
+
+def _test_emby_style_link_form(
+    provider_id: str,
+    values: Dict[str, Any],
+    existing: Dict[str, Any],
+    store: Any,
+) -> str:
+    """Test one Person's Emby/Jellyfin link values without saving them."""
+    label = PROVIDER_LABELS[provider_id]
+    built = PROVIDER_FIELD_SPECS[provider_id].build_values("person_link", values, existing)
+    if not _normalize_server_url(built.get("server_url")):
+        raise ValueError(f"Enter the {label} server URL to test.")
+    provider = PROVIDER_FIELD_SPECS[provider_id].build_provider(built)
+    if not provider.connected:
+        raise ValueError(f"Enter a {label} server URL plus a username and password, or an API key.")
+    try:
+        if _text(built.get("auth_mode")) == "api_key":
+            provider.resolve_user_id(client=store)
+            detail = f"the API key works against {built.get('server_url')}"
+        else:
+            provider.authenticate(force=True, client=store)
+            detail = f"{built.get('username')} signed in to {built.get('server_url')}"
+        # Also resolve the library (and its configured subfolder) so a wrong
+        # Library Name or Library Folder surfaces in the test, not at sync.
+        view = provider.music_view(client=store)
+        folder = provider.music_folder(view, client=store)
+        folder_name = _text(folder.get("Name"))
+        if folder_name and _text(folder.get("Id")) != _text(view.get("Id")):
+            detail += f", scoped to the {folder_name} folder"
+    except PermissionError as exc:
+        raise ValueError(f"{label} rejected the credentials: {_text(exc)}") from exc
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"Could not reach {label}: {_text(exc)}") from exc
+    return f"{label} connection works — {detail}."
+
+
+def _test_subsonic_link_form(
+    values: Dict[str, Any],
+    existing: Dict[str, Any],
+    store: Any,
+) -> str:
+    """Test one Person's Subsonic link values without saving them."""
+    built = PROVIDER_FIELD_SPECS["subsonic"].build_values("person_link", values, existing)
+    provider = SubsonicMusicProvider(
+        server_url=_normalize_server_url(built.get("server_url")),
+        username=_text(built.get("username")),
+        password=_text(built.get("password")),
+    )
+    if not provider.connected:
+        raise ValueError("Enter the Subsonic server URL plus a username and password to test.")
+    try:
+        provider.ping()
+    except PermissionError as exc:
+        raise ValueError(f"Subsonic rejected the credentials: {exc}") from exc
+    except RuntimeError as exc:
+        raise ValueError(f"Could not reach the Subsonic server: {exc}") from exc
+    return f"Subsonic connection works — {built.get('username')} reached {built.get('server_url')}."
+
+
+def _test_plex_link_form(
+    values: Dict[str, Any],
+    existing: Dict[str, Any],
+    store: Any,
+) -> str:
+    """Test one Person's Plex link values without saving them."""
+    link_values = PROVIDER_FIELD_SPECS["plex"].build_values("person_link", values, existing)
+    built = {
+        "plex_auth_mode": link_values.get("auth_mode"),
+        "plex_username": link_values.get("username"),
+        "plex_password": link_values.get("password"),
+        "plex_home_user": link_values.get("home_user"),
+        "plex_home_user_pin": link_values.get("home_user_pin"),
+        "plex_server_url": link_values.get("server_url"),
+        "plex_token": link_values.get("token"),
+    }
+    resolved = _plex_resolve_credentials(built, {}, store=store)
+    provider = PlexMusicProvider(
+        server_url=resolved["server_url"],
+        token=resolved["token"],
+        user_id=resolved.get("user_id", ""),
+    )
+    try:
+        provider.request("GET", "library/sections", timeout=15)
+    except PermissionError as exc:
+        raise ValueError(f"Plex rejected the token at {resolved['server_url']}: {exc}") from exc
+    except RuntimeError as exc:
+        raise ValueError(f"Could not reach the Plex server: {exc}") from exc
+    provider._save_cached_auth(resolved["token"], resolved.get("user_id", ""), store)
+    return f"Plex connection works — {resolved['detail']}."
+
+
 # --------------------------------------------------------------------------
 # Streaming providers (future)
 #
@@ -3184,7 +5202,12 @@ def _streaming_similar_tracks(
     person_id: Any = "",
     client: Any = None,
 ) -> List[Dict[str, Any]]:
-    """Similar tracks from connected streaming providers (empty until one exists)."""
+    """Similar tracks from connected streaming providers (empty until one exists).
+
+    Catalog providers that implement similar_tracks (Subsonic, …) are consulted
+    for their own seeds too; a failure or empty result just falls back to the
+    library mix.
+    """
     seeds = [dict(track) for track in (seed_tracks or []) if isinstance(track, dict)]
     if not seeds:
         return []
@@ -3203,7 +5226,46 @@ def _streaming_similar_tracks(
             collected.append(track)
             if len(collected) >= count:
                 return collected
+    # The seed's own catalog provider (if it can suggest similar tracks).
+    tried: set = set()
+    for seed in seeds:
+        provider_id = _provider_id(seed.get("provider"), "")
+        if provider_id not in CATALOG_PROVIDER_IDS or provider_id in tried:
+            continue
+        tried.add(provider_id)
+        seed_scope = _text(seed.get("person_scope")) or _text(person_id)
+        try:
+            provider = _provider(client, provider_id, seed_scope)
+            similar = getattr(provider, "similar_tracks", None)
+            if not callable(similar):
+                continue
+            rows = similar([seed], count=count) or []
+        except Exception as exc:
+            logger.warning("[Music] %s similar-tracks lookup failed: %s", provider_id, exc)
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            track = _normalize_track(dict(row))
+            track["provider"] = provider_id
+            if _text(seed.get("person_scope")):
+                track["person_scope"] = _text(seed.get("person_scope"))
+            collected.append(track)
+            if len(collected) >= count:
+                return collected
     return collected
+
+
+def _provider_class(provider_id: Any) -> Optional[type]:
+    """The settings-built class for one catalog provider id (None if unknown)."""
+    classes = {
+        "emby": EmbyMusicProvider,
+        "jellyfin": JellyfinMusicProvider,
+        "subsonic": SubsonicMusicProvider,
+        "plex": PlexMusicProvider,
+        "network_share": NetworkShareMusicProvider,
+    }
+    return classes.get(_provider_id(provider_id, ""))
 
 
 def _provider(client: Any = None, provider_id: Any = "", person_id: Any = "") -> Any:
@@ -3212,13 +5274,12 @@ def _provider(client: Any = None, provider_id: Any = "", person_id: Any = "") ->
     if linked is not None:
         return linked
     selected = _provider_id(provider_id)
-    if selected == "emby":
-        return EmbyMusicProvider.from_settings(_settings(client))
-    if selected == "network_share":
-        return NetworkShareMusicProvider.from_settings(_settings(client))
-    raise ValueError(
-        f"{PROVIDER_LABELS.get(selected, selected)} support is not enabled in this build."
-    )
+    provider_class = _provider_class(selected)
+    if provider_class is None:
+        raise ValueError(
+            f"{PROVIDER_LABELS.get(selected, selected)} support is not enabled in this build."
+        )
+    return provider_class.from_settings(_settings(client))
 
 
 def _person_source_id(person_id: Any, client: Any = None) -> str:
@@ -3274,13 +5335,14 @@ def _stream_token(client: Any = None) -> str:
     return token
 
 
-def _stream_proxy_url(kind: str, item_id: Any) -> str:
+def _stream_proxy_url(kind: str, item_id: Any, *, sync: bool = False) -> str:
     item_id = _text(item_id)
     if not item_id:
         return ""
     return (
         f"{_stream_base_url()}/stream/{quote(_stream_token(), safe='')}"
         f"/{kind}/{quote(str(item_id), safe='')}"
+        + ("?sync=1" if sync else "")
     )
 
 
@@ -3582,10 +5644,16 @@ def _sync_catalog_impl(
         )
     raw = provider.catalog()
     tracks = []
+    sync_scope = _text(person_id)
     for row in (raw.get("tracks") if isinstance(raw, dict) else []) or []:
         if isinstance(row, dict):
             track = _normalize_track(row)
             track["provider"] = selected
+            if sync_scope:
+                # Stamp the sync scope so playback resolves this track against
+                # the credentials it was synced with (a Person's own server
+                # account streams with their credentials, not the household's).
+                track["person_scope"] = sync_scope
             tracks.append(track)
     artists = _facet_values(
         [
@@ -7511,7 +9579,7 @@ def _play_track(
     airplay_group_id: str = "",
     client: Any = None,
 ) -> Dict[str, Any]:
-    provider = _provider(client, track.get("provider"))
+    provider = _provider(client, track.get("provider"), track.get("person_scope"))
     target_ids = _list(targets)
     selected_player_settings = (
         player_settings if isinstance(player_settings, dict) else {}
@@ -10756,7 +12824,9 @@ def get_client_music_stream_source(
         _provider_id(_settings(store).get("provider")),
     )
     track = _client_track(track_id, selected_provider, store)
-    source_url = _provider(store, selected_provider).stream_url(track)
+    # A track from a Person's own catalog streams with their credentials
+    # (person_scope is stamped by _client_track; household tracks carry none).
+    source_url = _provider(store, selected_provider, track.get("person_scope")).stream_url(track)
     if not source_url:
         raise ValueError("That track does not have a playable stream.")
     return {
@@ -10772,102 +12842,18 @@ def _provider_connection_detail(
     cfg: Dict[str, Any],
     provider_id: str,
 ) -> str:
-    if _provider_id(provider_id) == "network_share":
-        return _text(cfg.get("share_root_path")) or (
-            "Mount the SMB/NFS share on the Tater host, then point this core at the mounted folder."
-        )
-    return _text(
-        cfg.get("emby_server_url") or cfg.get("server_url")
-    ) or "Point this core at your Emby server to begin."
+    spec = PROVIDER_FIELD_SPECS.get(_provider_id(provider_id, ""))
+    if spec is None:
+        return "This music source is not enabled in this build."
+    return spec.connection_detail(cfg)
 
 
 def _provider_fields(cfg: Dict[str, Any], provider_id: str) -> List[Dict[str, Any]]:
-    if _provider_id(provider_id) == "network_share":
-        return [
-            {
-                "key": "share_root_path",
-                "label": "Mounted Share Folder",
-                "type": "text",
-                "required": True,
-                "value": _text(cfg.get("share_root_path")),
-                "placeholder": "/mnt/music",
-                "description": (
-                    "Folder path of the SMB/CIFS or NFS share as mounted on the Tater host "
-                    "(for Docker, add the share as a bind-mount volume and use its container path)."
-                ),
-            },
-        ]
-    auth_mode = _text(cfg.get("emby_auth_mode")).casefold() or "user_token"
-    return [
-        {
-            "key": "emby_server_url",
-            "label": "Emby Server URL",
-            "type": "text",
-            "required": True,
-            "value": _text(
-                cfg.get("emby_server_url") or cfg.get("server_url")
-            ),
-            "placeholder": "http://emby.local:8096",
-        },
-        {
-            "key": "emby_auth_mode",
-            "label": "Sign-In Style",
-            "type": "select",
-            "value": auth_mode,
-            "options": [
-                {"value": "user_token", "label": "Emby username & password"},
-                {"value": "api_key", "label": "Server API key"},
-            ],
-            "description": (
-                "Username sign-in streams through Tater's built-in proxy and honors each Emby user's "
-                "library access. An API key streams directly from Emby and needs the User ID below."
-            ),
-        },
-        {
-            "key": "emby_username",
-            "label": "Emby Username",
-            "type": "text",
-            "value": _text(cfg.get("emby_username")),
-        },
-        {
-            "key": "emby_password",
-            "label": "Emby Password",
-            "type": "password",
-            "value": "",
-            "description": "Used for username sign-in. Leave blank to keep the saved password.",
-        },
-        {
-            "key": "emby_api_key",
-            "label": "Emby API Key",
-            "type": "password",
-            "value": _text(cfg.get("emby_api_key")),
-            "description": "Server API key from Emby Dashboard > Advanced > Security, for API-key sign-in.",
-        },
-        {
-            "key": "emby_user_id",
-            "label": "Emby User ID (optional)",
-            "type": "text",
-            "value": _text(cfg.get("emby_user_id")),
-            "description": "Required for API-key sign-in when the server has more than one user.",
-        },
-        {
-            "key": "emby_library_name",
-            "label": "Emby Library Name (optional)",
-            "type": "text",
-            "value": _text(cfg.get("emby_library_name")),
-            "description": "Only needed when this Emby user can see several music libraries.",
-        },
-        {
-            "key": "emby_library_folder",
-            "label": "Emby Library Folder (optional)",
-            "type": "text",
-            "value": _text(cfg.get("emby_library_folder")),
-            "description": (
-                "Subfolder of the library to sync (name or full server path). Leave blank to sync "
-                "the whole library; useful for mixed-content libraries."
-            ),
-        },
-    ]
+    spec = PROVIDER_FIELD_SPECS.get(_provider_id(provider_id, ""))
+    if spec is None:
+        return []
+    global_fields = getattr(spec, "global_fields", None)
+    return global_fields(cfg) if callable(global_fields) else []
 
 
 def _provider_cards(
@@ -10882,7 +12868,7 @@ def _provider_cards(
     """
     global_stats = _catalog_stats("", client)
     cards: List[Dict[str, Any]] = []
-    for provider_id in ("emby", "network_share"):
+    for provider_id in CATALOG_PROVIDER_ORDER:
         label = PROVIDER_LABELS[provider_id]
         connected = _paired(cfg, provider_id)
         actions: List[Dict[str, Any]] = [
@@ -11216,15 +13202,15 @@ def _apply_person_link_test_state(
         key = _text(field.get("key"))
         if key not in values:
             continue
-        # Existing links keep the blank-password-means-keep-saved convention.
-        if key == "person_link_emby_password" and not prefill_password:
+        # Existing links keep the blank-secret-means-keep-saved convention.
+        if not prefill_password and field.get("type") == "password":
             continue
         field["value"] = values[key]
     message = _text(state.get("message"))
     if message:
         passed = _text(state.get("status")) == "ok"
         card.setdefault("summary_rows", []).append(
-            {"label": f"Last Emby test: {'passed' if passed else 'failed'}", "value": message}
+            {"label": f"Last connection test: {'passed' if passed else 'failed'}", "value": message}
         )
 
 
@@ -11516,76 +13502,107 @@ def _person_link_extra_source_fields(
     """Fields for a Person's optional second linked music source."""
     extra_source = _person_link_extra_source(link)
     values = link.get("extra") if isinstance(link.get("extra"), dict) else {}
-    return [
+    options: List[Dict[str, str]] = [
+        {"value": "", "label": "None — one source is enough"}
+    ]
+    for provider_id in CATALOG_PROVIDER_ORDER:
+        spec = PROVIDER_FIELD_SPECS[provider_id]
+        options.extend(spec.source_options("extra"))
+    fields: List[Dict[str, Any]] = [
         {
             "key": "person_link_extra_source",
             "label": "Second Music Source (optional)",
             "type": "select",
             "value": extra_source,
-            "options": [
-                {"value": "", "label": "None — one source is enough"},
-                {"value": "emby", "label": "Emby (a second account or library)"},
-                {"value": "network_share", "label": "Network share (a second folder)"},
-            ],
+            "options": options,
             "description": (
-                "Also play from a second library — their own Emby account or another share "
-                "folder — merged into one catalog. It can even be a second Emby account on "
-                "the same server (fill in that account's fields below)."
+                "Also play from a second library — their own Emby/Jellyfin account, a Subsonic or "
+                "Plex server, or another share folder — merged into one catalog. It can even be a "
+                "second account on the same server (fill in that account's fields below)."
             ),
         },
-        {
-            "key": "person_link_extra_emby_server_url",
-            "label": "Second Source — Emby Server URL",
-            "type": "text",
-            "value": _text(values.get("server_url")),
-            "placeholder": _text(cfg.get("emby_server_url") or cfg.get("server_url"))
-            or "http://emby.local:8096",
-        },
-        {
-            "key": "person_link_extra_emby_username",
-            "label": "Second Source — Emby Username",
-            "type": "text",
-            "value": _text(values.get("username")),
-        },
-        {
-            "key": "person_link_extra_emby_password",
-            "label": "Second Source — Emby Password",
-            "type": "password",
-            "value": "",
-            "description": "Leave blank to keep the saved password.",
-        },
-        {
-            "key": "person_link_extra_emby_api_key",
-            "label": "Second Source — Emby API Key",
-            "type": "password",
-            "value": _text(values.get("api_key")),
-        },
-        {
-            "key": "person_link_extra_emby_user_id",
-            "label": "Second Source — Emby User ID (optional)",
-            "type": "text",
-            "value": _text(values.get("user_id")),
-        },
-        {
-            "key": "person_link_extra_emby_library_name",
-            "label": "Second Source — Emby Library Name (optional)",
-            "type": "text",
-            "value": _text(values.get("library_name")),
-        },
-        {
-            "key": "person_link_extra_emby_library_folder",
-            "label": "Second Source — Emby Library Folder (optional)",
-            "type": "text",
-            "value": _text(values.get("library_folder")),
-        },
-        {
-            "key": "person_link_extra_share_root_path",
-            "label": "Second Source — Mounted Share Folder",
-            "type": "text",
-            "value": _text(values.get("root_path")),
-            "placeholder": "/mnt/music/<person>-more",
-        },
     ]
+    for provider_id in CATALOG_PROVIDER_ORDER:
+        if provider_id == "network_share":
+            fields.extend(
+                [
+                    {
+                        "key": "person_link_extra_share_root_path",
+                        "label": "Second Source — Mounted Share Folder",
+                        "type": "text",
+                        "value": _text(values.get("root_path")),
+                        "placeholder": "/mnt/music/<person>-more",
+                    }
+                ]
+            )
+            continue
+        fields.extend(
+            PROVIDER_FIELD_SPECS[provider_id].person_fields(
+                values,
+                prefix="person_link_extra",
+                label_prefix="Second Source — ",
+                with_descriptions=False,
+            )
+        )
+        # The keep-blank hint still shows on the extra source's secrets.
+        for field in fields:
+            if field["type"] == "password" and "description" not in field:
+                field["description"] = "Leave blank to keep the saved value."
+    return fields
+
+
+def _person_link_source_options(
+    kind: str,
+    *,
+    allow_blank: bool = True,
+) -> List[Dict[str, str]]:
+    """Picker rows for a Person link's Music Source (or second source)."""
+    options: List[Dict[str, str]] = []
+    if allow_blank:
+        options.append(
+            {"value": "", "label": "Use the global music source"}
+            if kind == "primary"
+            else {"value": "", "label": "None — one source is enough"}
+        )
+    for provider_id in CATALOG_PROVIDER_ORDER:
+        options.extend(PROVIDER_FIELD_SPECS[provider_id].source_options(kind))
+    return options
+
+
+def _person_link_source_fields(
+    link: Dict[str, Any],
+    cfg: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Every provider's fields for a Person link form.
+
+    The form shows all providers' fields at once (the source select cannot
+    re-render the card in the host UI), with each provider's stored values —
+    so switching a link between sources never loses what was already saved.
+    """
+    fields: List[Dict[str, Any]] = []
+    link_values = link if isinstance(link, dict) else {}
+    for provider_id in CATALOG_PROVIDER_ORDER:
+        values = (
+            link_values.get(provider_id)
+            if isinstance(link_values.get(provider_id), dict)
+            else {}
+        )
+        # Pre-fill the Emby server URL with the household's, exactly as this
+        # editor always did.
+        if provider_id == "emby" and not values.get("server_url"):
+            values = {
+                **values,
+                "server_url": _text(cfg.get("emby_server_url") or cfg.get("server_url")),
+            }
+        spec = PROVIDER_FIELD_SPECS[provider_id]
+        fields.extend(spec.person_fields(values, prefix="person_link"))
+        if provider_id == "plex":
+            # The resolved Plex token is a link value, never a hand-typed form
+            # field, so the token box stays blank (keep-blank convention).
+            for field in fields:
+                if field["key"] == spec.form_key("person_link", "token"):
+                    field["value"] = ""
+    return fields
 
 
 def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
@@ -11704,11 +13721,7 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                         "label": "Music Source",
                         "type": "select",
                         "value": source,
-                        "options": [
-                            {"value": "", "label": "Use the global music source"},
-                            {"value": "emby", "label": "Emby (own user/library)"},
-                            {"value": "network_share", "label": "Network share (own folder)"},
-                        ],
+                        "options": _person_link_source_options("primary"),
                     },
                     {
                         "key": "person_link_queue_conflict_mode",
@@ -11728,66 +13741,7 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                     *_follow_me_link_fields(cfg, link),
                     *_person_link_personalization_fields(cfg, link, store, person_id),
                     *_person_link_extra_source_fields(link, cfg),
-                    {
-                        "key": "person_link_emby_server_url",
-                        "label": "Emby Server URL",
-                        "type": "text",
-                        "value": _text(values.get("server_url")),
-                        "placeholder": "http://emby.local:8096",
-                    },
-                    {
-                        "key": "person_link_emby_username",
-                        "label": "Emby Username",
-                        "type": "text",
-                        "value": _text(values.get("username")),
-                    },
-                    {
-                        "key": "person_link_emby_password",
-                        "label": "Emby Password",
-                        "type": "password",
-                        "value": "",
-                        "description": "Leave blank to keep the saved password.",
-                    },
-                    {
-                        "key": "person_link_emby_api_key",
-                        "label": "Emby API Key",
-                        "type": "password",
-                        "value": _text(values.get("api_key")),
-                    },
-                    {
-                        "key": "person_link_emby_user_id",
-                        "label": "Emby User ID (optional)",
-                        "type": "text",
-                        "value": _text(values.get("user_id")),
-                    },
-                    {
-                        "key": "person_link_emby_library_name",
-                        "label": "Emby Library Name (optional)",
-                        "type": "text",
-                        "value": _text(values.get("library_name")),
-                    },
-                    {
-                        "key": "person_link_emby_library_folder",
-                        "label": "Emby Library Folder (optional)",
-                        "type": "text",
-                        "value": _text(values.get("library_folder")),
-                        "placeholder": "Music",
-                        "description": (
-                            "Subfolder of the library to sync — its name (e.g. Music) or full server "
-                            "path. Leave blank to sync the whole library; useful when one mixed-content "
-                            "library holds their music, TV, and movies."
-                        ),
-                    },
-                    {
-                        "key": "person_link_share_root_path",
-                        "label": "Mounted Share Folder",
-                        "type": "text",
-                        "value": _text(values.get("root_path")),
-                        "placeholder": "/mnt/music/<person>",
-                        "description": (
-                            "Folder path of this Person's own share subfolder as mounted on the Tater host."
-                        ),
-                    },
+                    *_person_link_source_fields(link, cfg),
         ]
         card["save_action"] = "music_person_link_save"
         card["save_label"] = "Save Person Link"
@@ -11798,7 +13752,7 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
             },
             {
                 "action": "music_person_link_test",
-                "label": "Test Emby Connection",
+                "label": "Test Connection",
             },
             {
                 "action": "music_person_link_edit_cancel",
@@ -11825,7 +13779,7 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
             "subtitle": "Give one Person their own music source, library, and listening history.",
         }
         if editing != "new":
-            new_card["detail"] = "Add a Person's own Emby library or network-share folder."
+            new_card["detail"] = "Add a Person's own music source — their own server account or a share folder."
             new_card["hero_badges"] = [{"label": "NEW LINK", "tone": "muted"}]
             new_card["actions"] = [
                 {
@@ -11850,10 +13804,7 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                         "label": "Music Source",
                         "type": "select",
                         "value": "emby",
-                        "options": [
-                            {"value": "emby", "label": "Emby (own user/library)"},
-                            {"value": "network_share", "label": "Network share (own folder)"},
-                        ],
+                        "options": _person_link_source_options("primary", allow_blank=False),
                     },
                     {
                         "key": "person_link_queue_conflict_mode",
@@ -11872,68 +13823,14 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                     *_follow_me_link_fields(cfg, {}),
                     *_person_link_personalization_fields(cfg, {}, store),
                     *_person_link_extra_source_fields({}, cfg),
-                    {
-                        "key": "person_link_emby_server_url",
-                        "label": "Emby Server URL",
-                        "type": "text",
-                        "value": _text(cfg.get("emby_server_url") or cfg.get("server_url")),
-                        "placeholder": "http://emby.local:8096",
-                    },
-                    {
-                        "key": "person_link_emby_username",
-                        "label": "Emby Username",
-                        "type": "text",
-                        "value": "",
-                    },
-                    {
-                        "key": "person_link_emby_password",
-                        "label": "Emby Password",
-                        "type": "password",
-                        "value": "",
-                    },
-                    {
-                        "key": "person_link_emby_api_key",
-                        "label": "Emby API Key",
-                        "type": "password",
-                        "value": "",
-                    },
-                    {
-                        "key": "person_link_emby_user_id",
-                        "label": "Emby User ID (optional)",
-                        "type": "text",
-                        "value": "",
-                    },
-                    {
-                        "key": "person_link_emby_library_name",
-                        "label": "Emby Library Name (optional)",
-                        "type": "text",
-                        "value": "",
-                    },
-                    {
-                        "key": "person_link_emby_library_folder",
-                        "label": "Emby Library Folder (optional)",
-                        "type": "text",
-                        "value": "",
-                        "placeholder": "Music",
-                        "description": (
-                            "Subfolder of the library to sync (name or full server path). Leave blank "
-                            "to sync the whole library; useful for mixed-content libraries."
-                        ),
-                    },
-                    {
-                        "key": "person_link_share_root_path",
-                        "label": "Mounted Share Folder",
-                        "type": "text",
-                        "value": "",
-                        "placeholder": "/mnt/music/<person>",
-                    },
+                    *_person_link_source_fields({}, cfg),
             ]
             new_card["save_action"] = "music_person_link_save"
             new_card["save_label"] = "Link Person"
             new_card["actions"] = [
                 {
                     "action": "music_person_link_test",
-                    "label": "Test Emby Connection",
+                    "label": "Test Connection",
                 },
                 {
                     "action": "music_person_link_edit_cancel",
@@ -12571,57 +14468,55 @@ def _save_person_link_action(values: Dict[str, Any], store: Any) -> Dict[str, An
     if resume_room in RESUME_ROOM_MODES:
         link["resume_room_mode"] = resume_room
     if source:
-        if source == "emby":
-            password = _text(values.get("person_link_emby_password")) or _text(
-                existing_values.get("password")
-            )
-            link["emby"] = {
-                "server_url": _normalize_server_url(values.get("person_link_emby_server_url")),
-                "auth_mode": "api_key"
-                if _text(values.get("person_link_emby_api_key"))
-                and not _text(values.get("person_link_emby_username"))
-                else "user_token",
-                "username": _text(values.get("person_link_emby_username")),
-                "password": password,
-                "api_key": _text(values.get("person_link_emby_api_key")),
-                "user_id": _text(values.get("person_link_emby_user_id")),
-                "library_name": _text(values.get("person_link_emby_library_name")),
-                "library_folder": _text(values.get("person_link_emby_library_folder")),
-            }
-        else:
-            link["network_share"] = {
-                "root_path": _text(values.get("person_link_share_root_path")),
-            }
-    # Second linked source (optional): their own Emby account or share folder on
-    # top of the primary, so one Person can listen across both.
+        spec = PROVIDER_FIELD_SPECS[source]
+        built = spec.build_values("person_link", values, existing_values)
+        if source == "plex" and not _text(built.get("token")):
+            # Resolve (and cache) the Plex token now so the link holds a
+            # complete, immediately playable state; a plex.tv failure surfaces
+            # through the sync error below rather than blocking the save.
+            try:
+                built = _plex_resolve_link_values(built, existing_values, store=store)
+            except Exception as exc:
+                logger.warning("[Music] Plex link token resolution failed: %s", exc)
+        elif source in ("emby", "jellyfin") and built.get("auth_mode") == "user_token" and not _text(
+            built.get("user_id")
+        ):
+            # Store the user id defensively so identity-based caches and
+            # scopes stay stable even if a later save carries a stale form.
+            try:
+                provider = spec.build_provider(built)
+                _token, user_id = provider.authenticate(client=store)
+                built["user_id"] = user_id
+            except Exception as exc:
+                logger.warning("[Music] %s link user-id resolution failed: %s", source, exc)
+        link[source] = built
+    # Second linked source (optional): another provider account or share folder
+    # on top of the primary, so one Person can listen across both.
     extra_source = _provider_id(values.get("person_link_extra_source"), "")
     if extra_source:
         existing_extra = (
             existing.get("extra") if isinstance(existing.get("extra"), dict) else {}
         )
-        if extra_source == "emby":
-            extra_password = _text(values.get("person_link_extra_emby_password")) or _text(
-                existing_extra.get("password")
-            )
-            link["extra"] = {
-                "server_url": _normalize_server_url(
-                    values.get("person_link_extra_emby_server_url")
-                ),
-                "auth_mode": "api_key"
-                if _text(values.get("person_link_extra_emby_api_key"))
-                and not _text(values.get("person_link_extra_emby_username"))
-                else "user_token",
-                "username": _text(values.get("person_link_extra_emby_username")),
-                "password": extra_password,
-                "api_key": _text(values.get("person_link_extra_emby_api_key")),
-                "user_id": _text(values.get("person_link_extra_emby_user_id")),
-                "library_name": _text(values.get("person_link_extra_emby_library_name")),
-                "library_folder": _text(values.get("person_link_extra_emby_library_folder")),
-            }
-        else:
-            link["extra"] = {
-                "root_path": _text(values.get("person_link_extra_share_root_path")),
-            }
+        # Only keep secrets from a stored second source of the same kind.
+        existing_extra = existing_extra if _person_link_extra_source(existing) == extra_source else {}
+        built_extra = PROVIDER_FIELD_SPECS[extra_source].build_values(
+            "person_link_extra", values, existing_extra
+        )
+        if extra_source == "plex" and not _text(built_extra.get("token")):
+            try:
+                built_extra = _plex_resolve_link_values(built_extra, existing_extra, store=store)
+            except Exception as exc:
+                logger.warning("[Music] Plex extra-source token resolution failed: %s", exc)
+        elif extra_source in ("emby", "jellyfin") and built_extra.get(
+            "auth_mode"
+        ) == "user_token" and not _text(built_extra.get("user_id")):
+            try:
+                provider = PROVIDER_FIELD_SPECS[extra_source].build_provider(built_extra)
+                _token, user_id = provider.authenticate(client=store)
+                built_extra["user_id"] = user_id
+            except Exception as exc:
+                logger.warning("[Music] %s extra-source user-id resolution failed: %s", extra_source, exc)
+        link["extra"] = built_extra
         link["extra_source"] = extra_source
     else:
         link.pop("extra_source", None)
@@ -12662,67 +14557,38 @@ def _save_person_link_action(values: Dict[str, Any], store: Any) -> Dict[str, An
     return {"ok": True, "message": f"Saved {name}'s music link.{sync_note}"}
 
 
-def _test_person_link_emby_action(values: Dict[str, Any], store: Any) -> Dict[str, Any]:
-    """Test one Person's Emby credentials from the link form without saving them."""
+def _test_person_link_source_action(values: Dict[str, Any], store: Any) -> Dict[str, Any]:
+    """Test one Person's link credentials from the form without saving them.
+
+    Tests whatever music source the form currently selects; the tab UI refetches
+    after every action, which resets unsaved form edits and drops success
+    messages — so record what was typed and how the test went; the link cards
+    prefill from it (see _person_link_items).
+    """
     person_id = _text(values.get("person_link_person_id"))
     name = _people_person_name(person_id, store) if person_id else ""
     label = name or "This person"
-    existing = _person_link(person_id, store).get("emby") if person_id else {}
+    source = _person_link_source({"music_source": values.get("person_link_source")}) or "emby"
+    spec = PROVIDER_FIELD_SPECS.get(source)
+    if spec is None:
+        raise ValueError("Choose a music source to test first.")
+    existing = _person_link(person_id, store).get(source) if person_id else {}
     if not isinstance(existing, dict):
         existing = {}
-    # The tab UI refetches after every action, which resets unsaved form edits
-    # and drops this action's success message — so record what was typed and
-    # how the test went; the link cards prefill from it (see _person_link_items).
     draft = {key: _text(values.get(key)) for key in PERSON_LINK_TEST_FIELD_KEYS}
 
     def _record(status: str, message: str) -> None:
         _save_person_link_test_state(person_id, draft, status, message, store)
 
-    server_url = _normalize_server_url(values.get("person_link_emby_server_url"))
-    username = _text(values.get("person_link_emby_username"))
-    password = _text(values.get("person_link_emby_password")) or _text(existing.get("password"))
-    api_key = _text(values.get("person_link_emby_api_key"))
-    user_id = _text(values.get("person_link_emby_user_id"))
-    library_name = _text(values.get("person_link_emby_library_name"))
-    library_folder = _text(values.get("person_link_emby_library_folder"))
-    if not server_url:
-        _record("error", "Enter the Emby server URL to test.")
-        raise ValueError("Enter the Emby server URL to test.")
-    auth_mode = "api_key" if api_key and not username else "user_token"
-    provider = EmbyMusicProvider(
-        server_url=server_url,
-        auth_mode=auth_mode,
-        username=username,
-        api_key=api_key,
-        user_id=user_id,
-        password=password,
-        library_name=library_name,
-        library_folder=library_folder,
-    )
-    if not provider.connected:
-        _record("error", "Enter an Emby username and password, or an API key, to test.")
-        raise ValueError("Enter an Emby username and password, or an API key, to test.")
     try:
-        if auth_mode == "api_key":
-            provider.resolve_user_id(client=store)
-            detail = f"the API key works against {server_url}"
-        else:
-            provider.authenticate(force=True, client=store)
-            detail = f"{username} signed in to {server_url}"
-        # Also resolve the library (and its configured subfolder) so a wrong
-        # Library Name or Library Folder surfaces in the test, not at sync.
-        view = provider.music_view(client=store)
-        folder = provider.music_folder(view, client=store)
-        folder_name = _text(folder.get("Name"))
-        if folder_name and _text(folder.get("Id")) != _text(view.get("Id")):
-            detail += f", scoped to the {folder_name} folder"
-    except PermissionError as exc:
-        _record("error", f"Emby rejected the credentials for {label}: {_text(exc)}")
-        raise ValueError(f"Emby rejected the credentials for {label}: {_text(exc)}") from exc
+        message = f"{label}'s connection works — {spec.test_link_form(values, existing, store)}."
+    except ValueError as exc:
+        _record("error", _text(exc))
+        raise
     except Exception as exc:
-        _record("error", f"Could not reach Emby for {label}: {_text(exc)}")
-        raise ValueError(f"Could not reach Emby for {label}: {_text(exc)}") from exc
-    message = f"{label}'s Emby connection works — {detail}."
+        message = f"Could not reach {PROVIDER_LABELS[source]} for {label}: {_text(exc)}"
+        _record("error", message)
+        raise ValueError(message) from exc
     _record("ok", message)
     return {"ok": True, "message": message}
 
@@ -12732,135 +14598,22 @@ def _connect_provider(
     values: Dict[str, Any],
     client: Any,
 ) -> Dict[str, Any]:
-    cfg = _settings(client)
-    if provider_id == "network_share":
-        root_path = _text(values.get("share_root_path")) or _text(cfg.get("share_root_path"))
-        provider = NetworkShareMusicProvider(root_path=root_path)
-        if not root_path:
-            raise ValueError("Enter the mounted network-share folder path first.")
-        if not provider.connected:
-            raise ValueError(
-                "That folder path is not readable from Tater. Mount the SMB/NFS share on the host "
-                "(or bind-mount it into the container) and try again."
-            )
-        _save_hash(client, SETTINGS_KEY, {"share_root_path": root_path, "provider": provider_id})
-        catalog = _sync_catalog(client, provider_id)
-        return {
-            "ok": True,
-            "message": (
-                f"{PROVIDER_LABELS[provider_id]} connected and loaded "
-                f"{len(catalog.get('tracks') or [])} tracks."
-            ),
-        }
-    if provider_id != "emby":
+    provider_id = _provider_id(provider_id, "")
+    spec = PROVIDER_FIELD_SPECS.get(provider_id)
+    if spec is None:
         raise ValueError(f"{PROVIDER_LABELS.get(provider_id, provider_id)} support is not enabled in this build.")
-    auth_mode = (
-        "api_key"
-        if _text(values.get("emby_auth_mode")).casefold() == "api_key"
-        else "user_token"
-    )
-    server_url = _normalize_server_url(
-        values.get("emby_server_url")
-        or values.get("server_url")
-        or cfg.get("emby_server_url")
-        or cfg.get("server_url")
-    )
-    username = _text(values.get("emby_username") or cfg.get("emby_username"))
-    password = _text(values.get("emby_password")) or _text(cfg.get("emby_password"))
-    api_key = _text(values.get("emby_api_key")) or _text(cfg.get("emby_api_key"))
-    user_id = _text(values.get("emby_user_id") or cfg.get("emby_user_id"))
-    library_name = _text(values.get("emby_library_name") or cfg.get("emby_library_name"))
-    library_folder = _text(values.get("emby_library_folder") or cfg.get("emby_library_folder"))
-    provider = EmbyMusicProvider(
-        server_url=server_url,
-        auth_mode=auth_mode,
-        username=username,
-        password=password,
-        api_key=api_key,
-        user_id=user_id,
-        library_name=library_name,
-        library_folder=library_folder,
-    )
-    if not provider.connected:
-        raise ValueError("Enter the Emby server URL plus a username and password, or an API key.")
-    provider.clear_cached_auth(client)
-    resolved_user_id = user_id
-    try:
-        if auth_mode == "user_token":
-            _token, resolved_user_id = provider.authenticate(force=True, client=client)
-        else:
-            resolved_user_id = provider.resolve_user_id(client)
-    except PermissionError as exc:
-        raise ValueError(f"{PROVIDER_LABELS[provider_id]} rejected the credentials: {exc}") from exc
-
-    _save_hash(
-        client,
-        SETTINGS_KEY,
-        {
-            "emby_server_url": server_url,
-            "emby_auth_mode": auth_mode,
-            "emby_username": username,
-            "emby_password": password,
-            "emby_api_key": api_key,
-            "emby_user_id": resolved_user_id,
-            "emby_library_name": library_name,
-            "emby_library_folder": library_folder,
-            "server_url": server_url,
-            "provider": provider_id,
-        },
-    )
-    catalog = _sync_catalog(client, provider_id)
-    return {
-        "ok": True,
-        "message": (
-            f"{PROVIDER_LABELS[provider_id]} connected and loaded "
-            f"{len(catalog.get('tracks') or [])} tracks."
-        ),
-    }
+    return spec.connect(values, _settings(client), client)
 
 
 def _disconnect_provider(provider_id: str, client: Any) -> Dict[str, Any]:
-    if provider_id == "network_share":
-        fields = ("share_root_path",)
-    elif provider_id == "emby":
-        fields = (
-            "emby_server_url",
-            "emby_auth_mode",
-            "emby_username",
-            "emby_password",
-            "emby_api_key",
-            "emby_user_id",
-            "emby_library_name",
-            "emby_library_folder",
-            "server_url",
-        )
-    else:
+    provider_id = _provider_id(provider_id, "")
+    spec = PROVIDER_FIELD_SPECS.get(provider_id)
+    if spec is None:
         raise ValueError(f"{PROVIDER_LABELS.get(provider_id, provider_id)} support is not enabled in this build.")
-    player = _player(client)
-    if _provider_id(player.get("provider")) == provider_id:
-        _stop_player(client=client)
-    if client is not None:
-        client.hdel(SETTINGS_KEY, *fields, "provider")
-        try:
-            if provider_id == "emby":
-                client.delete(EMBY_AUTH_CACHE_KEY)
-            else:
-                client.delete(SHARE_ART_INDEX_KEY)
-                try:
-                    os.rmdir(_share_art_cache_dir())
-                except OSError:
-                    pass
-        except Exception:
-            pass
-        cached = _load_json(client, CATALOG_KEY, {})
-        if _provider_id(cached.get("provider")) == provider_id:
-            client.delete(CATALOG_KEY)
-            with _catalog_memory_cache_lock:
-                _catalog_memory_cache.update(
-                    {"store": client, "loaded_at": time.monotonic(), "payload": {}}
-                )
-    _save_hash(client, RUNTIME_KEY, {"status": "disconnected", "last_error": ""})
-    return {"ok": True, "message": f"{PROVIDER_LABELS[provider_id]} disconnected locally."}
+    disconnect = getattr(spec, "disconnect", None)
+    if not callable(disconnect):
+        return _disconnect_generic(provider_id, client)
+    return disconnect(client)
 
 
 def _webui_viewer_person_id(store: Any = None) -> str:
@@ -13122,7 +14875,7 @@ def handle_htmlui_tab_action(
         return {"ok": True, "message": f"Cancelled {name}'s sleep timer."}
 
     if action_name == "music_person_link_test":
-        return _test_person_link_emby_action(values, store)
+        return _test_person_link_source_action(values, store)
 
     if action_name == "music_person_link_remove":
         person_id = _text(values.get("person_link_person_id"))
@@ -14069,45 +15822,56 @@ def run_core_system_task(*, task_id: str, redis_client=None, **_kwargs) -> Dict[
     raise KeyError(f"Unknown Personal Music Core task: {task_id}")
 
 
-def _emby_upstream_request(
+def _upstream_provider(provider_id: str, scope: str) -> Any:
+    """Provider instance one proxied request resolves against.
+
+    A scoped kind ("<provider>:<person>") serves that Person's own credentials
+    (or their second linked source via the "<person>+<source>" slot id); an
+    unscoped kind serves the household's configured source.
+    """
+    provider_id = _provider_id(provider_id, "")
+    if provider_id == "network_share":
+        raise LookupError("Unknown stream request.")
+    provider = None
+    if scope:
+        provider = _person_link_provider(scope, provider_id)
+    if provider is None:
+        provider_class = _provider_class(provider_id)
+        builder = getattr(provider_class, "from_settings", None)
+        provider = builder(_settings()) if builder else None
+    if provider is None:
+        raise LookupError("Unknown stream request.")
+    return provider
+
+
+def _upstream_request(
     kind: str,
     item_id: str,
     *,
     sync: bool = False,
     person_id: Any = "",
-) -> tuple[str, Dict[str, str]]:
-    """Build (url, headers) for proxying one Emby stream or artwork request."""
+) -> "tuple[str, Dict[str, str]]":
+    """Build (url, headers) for proxying one provider stream or artwork request.
+
+    Kinds are "<provider>" / "<provider>_art" for the household source and
+    "<provider>:<scope>" / "<provider>_art:<scope>" for a Person's own linked
+    account. item_id is provider-specific (an Emby/Jellyfin item id, a Plex part
+    or thumb path, a Subsonic song or coverArt id).
+    """
     base_kind, _, scope = kind.partition(":")
-    if base_kind not in ("emby", "emby_art"):
+    if base_kind.endswith("_art"):
+        provider_id, art = base_kind[: -len("_art")], True
+    else:
+        provider_id, art = base_kind, False
+    if provider_id in ("share", "network_share") or not provider_id:
         raise LookupError("Unknown stream request.")
-    if not scope:
-        scope = _text(person_id)
-    if scope:
-        provider = _person_link_provider(scope, "emby")
-        if provider is None:
-            provider = EmbyMusicProvider.from_settings(_settings())
-    else:
-        provider = EmbyMusicProvider.from_settings(_settings())
-    if not provider.connected:
-        raise RuntimeError("Emby is not connected.")
-    params: Dict[str, Any] = {}
-    headers = {"Accept": "*/*"}
-    if base_kind == "emby":
-        if sync:
-            # Mixed Tater satellite + Sonos/AirPlay groups share one normalized
-            # PCM source so every target can stay clock-aligned.
-            params.update({"AudioCodec": "wav", "AudioSampleRate": 44100, "AudioChannels": 2})
-        else:
-            params["Static"] = "true"
-        path = f"Audio/{quote(str(item_id), safe='')}/stream"
-    else:
-        params.update({"MaxWidth": EMBY_ARTWORK_MAX_WIDTH, "Quality": 90})
-        path = f"Items/{quote(str(item_id), safe='')}/Images/Primary"
-    if provider.auth_mode == "api_key":
-        params["api_key"] = provider.api_key
-    else:
-        headers["X-Emby-Token"] = provider._access_token()
-    return f"{provider.server_url}/{path}?{urlencode(params)}", headers
+    provider = _upstream_provider(provider_id, _text(scope) or _text(person_id))
+    if not getattr(provider, "connected", False):
+        raise RuntimeError(f"{PROVIDER_LABELS.get(provider_id, provider_id)} is not connected.")
+    proxy_request = getattr(provider, "proxy_request", None)
+    if not callable(proxy_request):
+        raise LookupError("Unknown stream request.")
+    return proxy_request(_text(item_id), art=art, sync=sync)
 
 
 def _share_parse_range(value: str, size: int) -> Optional[tuple[int, int]]:
@@ -14183,8 +15947,8 @@ def _share_send_file(
 
 
 class _MusicStreamHandler(BaseHTTPRequestHandler):
-    """Range-capable local server that keeps Emby tokens out of stream URLs and
-    serves mounted-share files straight from disk."""
+    """Range-capable local server that keeps provider tokens out of stream URLs
+    and serves mounted-share files straight from disk."""
 
     server_version = "TaterCustomMusic/1.0"
     protocol_version = "HTTP/1.1"
@@ -14209,18 +15973,21 @@ class _MusicStreamHandler(BaseHTTPRequestHandler):
             if not hmac.compare_digest(token, _stream_token()):
                 self._send_error(403, "Invalid stream token.")
                 return
-            if kind in ("share", "share_art"):
+            base_kind = kind.partition(":")[0]
+            if base_kind in ("share", "share_art"):
                 self._serve_share(kind, item_id)
                 return
             sync = any(
                 key.casefold() == "sync" and _text(value) not in {"0", "false", "no"}
                 for key, value in parse_qsl(parsed.query)
             )
-            upstream_url, headers = _emby_upstream_request(
+            # Proxy kinds quote their item id (a Plex part path carries "/"s);
+            # decode it once for the upstream request builders.
+            upstream_url, headers = _upstream_request(
                 kind,
-                item_id,
+                unquote(item_id),
                 sync=sync,
-                person_id=kind.partition(":")[2],
+                person_id="",
             )
             forward_headers = {
                 key.title(): value
@@ -14242,7 +16009,7 @@ class _MusicStreamHandler(BaseHTTPRequestHandler):
                 upstream.close()
                 self._send_error(
                     502 if upstream.status_code >= 500 else upstream.status_code,
-                    "Emby rejected the stream request.",
+                    "The music source rejected the stream request.",
                 )
                 return
             response_headers = {"Cache-Control": "private, max-age=300"}
@@ -14399,6 +16166,12 @@ def _shutdown_stream_server() -> None:
 
 def run(stop_event: Optional[object] = None) -> None:
     logger.info("[Music] Core starting.")
+    # The pre-3.5.0 shared Emby auth cache is orphaned by the per-identity
+    # cache keys; drop it once so no stale household token survives a restart.
+    try:
+        redis_client.delete(EMBY_AUTH_CACHE_KEY)
+    except Exception:
+        pass
     try:
         while not (stop_event and getattr(stop_event, "is_set", lambda: False)()):
             cfg = _settings()
