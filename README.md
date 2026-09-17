@@ -112,11 +112,17 @@ all of them converge on a server URL plus a token):
 
 Satellite speakers decode **WAV, MP3, and FLAC** natively (verified against the
 satellite firmware). **AAC, OGG, Opus, and M4A have no decoder** and will not
-play, so libraries are assumed to be WAV/MP3/FLAC. Where a server can
-transcode, the core asks it to: proxied Emby/Jellyfin streams request
-normalized WAV, and Subsonic streams request `format=wav` for non-decodable
-containers (Navidrome and friends transcode server-side). Plex and network
-shares serve original files, so those libraries must be WAV/MP3/FLAC.
+play, so libraries are assumed to be WAV/MP3/FLAC. The core itself never
+transcodes and providers serve your files as they are: Subsonic, Plex, and
+network shares always serve the original bytes. Emby/Jellyfin are the one
+partial exception: Tater's clock-synchronized playback asks those servers for
+a normalized WAV source (`AudioCodec=wav&AudioSampleRate=44100&AudioChannels=2`)
+so grouped targets stay aligned — but the **server decides** whether to honor
+that. A server with transcoding disabled (or that declines the request) just
+serves the original MP3/FLAC, and the satellites decode it natively; either
+way the file's format never decides whether it plays. Subsonic additionally
+asks for `format=wav` on non-decodable containers only (Navidrome and friends
+transcode those server-side).
 
 ### Network share (SMB/CIFS or NFS)
 
@@ -449,17 +455,19 @@ enable.
 - **Audio formats:** satellite speakers decode WAV, MP3, and FLAC natively;
   AAC, OGG, Opus, and M4A have no decoder and will not play — libraries are
   assumed to be WAV/MP3/FLAC (see
-  [Supported audio formats](#supported-audio-formats)). There is no
-  core-side transcode stage; Emby/Jellyfin and Subsonic ask their servers to
-  transcode to WAV where the format is not natively decodable, while Plex and
-  network shares serve original files.
+  [Supported audio formats](#supported-audio-formats)). There is no core-side
+  transcode stage: Subsonic, Plex, and network shares serve original files
+  (Subsonic only asks the server for WAV on non-decodable containers), and on
+  Emby/Jellyfin the clock-sync path requests a normalized WAV source but the
+  server decides whether to transcode — with transcoding disabled it serves
+  the original file.
 - Little Spud client music is not switched over — the Tater host currently links
   client music to the stock `music_core` only, and this core's client music
   surface (`run_client_music_action`, `get_client_music_stream_source`) follows
   the shared household queue, not a Person queue.
 - Network-share playback serves original files; there is no on-the-fly transcode
-  for mixed sync groups (Emby/Jellyfin username sign-in does transcode to WAV
-  when needed).
+  (Emby/Jellyfin's clock-sync path requests a normalized WAV source from the
+  server, but the server decides whether to honor it).
 - Volume and per-target calibrations are shared per destination; two queues
   playing different rooms at once keep their own volume, but the same room's
   calibration is shared.
