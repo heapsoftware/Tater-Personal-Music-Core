@@ -54,7 +54,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.3.0"
+__version__ = "3.4.0"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby user or network-share folder (or both), browse "
@@ -418,7 +418,8 @@ CORE_SETTINGS = {
                 "included). The playlists are rebuilt from the library on every sync and "
                 "play, so songs added to the folder join automatically. They work everywhere "
                 "a picked playlist works — the \"Tracks from a playlist\" Endless Playback "
-                "mode and voice (\"play my Christmas Music playlist\")."
+                "mode and voice (\"play my Christmas Music playlist\"). Each linked Person can "
+                "replace this list with their own on their link card in the People section."
             ),
         },
         "smart_shuffle_enabled": {
@@ -909,6 +910,7 @@ PERSON_LINK_TEST_FIELD_KEYS = (
     "person_link_prompt_context_enabled",
     "person_link_endless_playback_mode",
     "person_link_endless_playback_playlist",
+    "person_link_folder_playlists",
     "person_link_smart_shuffle_enabled",
     "person_link_follow_me_entity",
     "person_link_follow_me_room_overrides",
@@ -6128,15 +6130,31 @@ def _endless_playlist_payload(store: Any, person_id: Any) -> Dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _folder_playlist_specs(cfg: Dict[str, Any]) -> List[tuple]:
-    """Parse the Folder Playlists setting into (playlist name, folder path) pairs."""
+def _parse_folder_playlist_specs(raw: Any) -> List[tuple]:
+    """Parse a Folder Playlists value into (playlist name, folder path) pairs."""
     specs: List[tuple] = []
-    for chunk in _text(cfg.get("folder_playlists")).split(","):
+    for chunk in _text(raw).split(","):
         name, separator, folder = chunk.partition("=")
         name, folder = _text(name), _text(folder).strip().strip("/")
         if separator and name and folder:
             specs.append((name, folder))
     return specs
+
+
+def _folder_playlist_specs(cfg: Dict[str, Any]) -> List[tuple]:
+    """The global Folder Playlists setting as (playlist name, folder path) pairs."""
+    return _parse_folder_playlist_specs(cfg.get("folder_playlists"))
+
+
+def _person_folder_playlist_specs(
+    person_id: Any, cfg: Dict[str, Any], client: Any = None
+) -> List[tuple]:
+    """One Person's effective folder playlists: their own list when set on their
+    link card, otherwise the global Folder Playlists setting."""
+    raw = _text(_person_link(person_id, client).get("folder_playlists")).strip()
+    if raw:
+        return _parse_folder_playlist_specs(raw)
+    return _folder_playlist_specs(cfg)
 
 
 def _folder_defined_playlists(
@@ -6145,12 +6163,13 @@ def _folder_defined_playlists(
     provider_id: Any,
     cfg: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
-    """Playlists defined by a library folder in the Folder Playlists setting.
+    """Playlists defined by a library folder in the Person's effective Folder
+    Playlists list (their link-card override, or the global setting when blank).
 
     Rebuilt from the live catalog on every call, so a song added to the folder
     joins the playlist on the next sync without touching any stored playlist.
     """
-    specs = _folder_playlist_specs(cfg)
+    specs = _person_folder_playlist_specs(person_id, cfg, store)
     if not specs:
         return []
     catalog = _person_catalog(store, provider_id, person_id)
@@ -11423,6 +11442,19 @@ def _person_link_personalization_fields(
             ),
         },
         {
+            "key": "person_link_folder_playlists",
+            "label": "Their Folder Playlists",
+            "type": "text",
+            "value": _text(link.get("folder_playlists")),
+            "placeholder": "Workout=Tunes/Workout, Jazz=Tunes/Jazz",
+            "description": (
+                "Name=Folder pairs (comma-separated) that turn folders in their library "
+                "into always-up-to-date playlists just for them, matched against their own "
+                "library on every play. Leave blank to use the global Folder Playlists "
+                "setting; when filled, it replaces that list for this Person."
+            ),
+        },
+        {
             "key": "person_link_smart_shuffle_enabled",
             "label": "Their Smart Shuffle",
             "type": "select",
@@ -12471,6 +12503,11 @@ def _save_person_link_action(values: Dict[str, Any], store: Any) -> Dict[str, An
         link["endless_playback_playlist"] = _text(
             values.get("person_link_endless_playback_playlist")
         ).strip()
+    # Blank means inherit the global Folder Playlists setting, so the key is
+    # left out of the rebuilt link, like the other personalization overrides.
+    person_folder_playlists = _text(values.get("person_link_folder_playlists")).strip()
+    if person_folder_playlists:
+        link["folder_playlists"] = person_folder_playlists
     for field_key, link_key, override_max in (
         ("person_link_recommendation_interval_hours", "recommendation_interval_hours", 168),
         ("person_link_recommendation_playlist_count", "recommendation_playlist_count", 6),

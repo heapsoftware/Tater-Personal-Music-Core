@@ -1272,6 +1272,43 @@ class PerPersonLinkageTests(unittest.TestCase):
         finally:
             self.core._PEOPLE_API_MODULE = original_people
 
+    def test_link_save_folder_playlists_override(self):
+        people = types.SimpleNamespace(
+            load_store=lambda _client=None: {
+                "people": [{"id": "person_zoe", "display_name": "Zoe"}]
+            }
+        )
+        original_people = self.core._PEOPLE_API_MODULE
+        self.core._PEOPLE_API_MODULE = people
+        try:
+            self.core._save_person_link_action(
+                {
+                    "person_link_person_id": "person_zoe",
+                    "person_link_source": "network_share",
+                    "person_link_share_root_path": self.share_root,
+                    "person_link_folder_playlists": "Workout=Tunes/Workout, Jazz=Tunes/Jazz",
+                },
+                self.redis,
+            )
+            link = self.core._person_link("person_zoe", self.redis)
+            self.assertEqual(
+                link["folder_playlists"], "Workout=Tunes/Workout, Jazz=Tunes/Jazz"
+            )
+            # A blank value drops the override so the global list is inherited.
+            self.core._save_person_link_action(
+                {
+                    "person_link_person_id": "person_zoe",
+                    "person_link_source": "network_share",
+                    "person_link_share_root_path": self.share_root,
+                    "person_link_folder_playlists": "   ",
+                },
+                self.redis,
+            )
+            link = self.core._person_link("person_zoe", self.redis)
+            self.assertNotIn("folder_playlists", link)
+        finally:
+            self.core._PEOPLE_API_MODULE = original_people
+
     def test_people_section_appears_in_tab_data(self):
         people = types.SimpleNamespace(
             load_store=lambda _client=None: {
@@ -4181,6 +4218,62 @@ class EndlessPlaybackTests(unittest.TestCase):
         self.assertEqual(
             sorted(track["id"] for track in batch), ["track:1", "track:2", "track:5"]
         )
+
+    def test_folder_playlist_person_override_replaces_global_list(self):
+        core = self.core
+        tracks = [
+            dict(_track_row(1, "Frosty"), path="/mnt/music/Christmas/Frosty.mp3"),
+            dict(_track_row(2, "Regular"), path="/mnt/music/Rock/Regular.mp3"),
+            dict(_track_row(3, "Sweat"), path="/mnt/music/Workout/Sweat.mp3"),
+        ]
+        # Shared library (unlinked people) plus two linked People with the same
+        # personal catalog.
+        self.seed_person_catalog("", tracks)
+        self.seed_person_catalog("p1", tracks)
+        self.seed_person_catalog("p2", tracks)
+        core._save_hash(
+            self.redis,
+            core.SETTINGS_KEY,
+            {"folder_playlists": "Christmas Music=Christmas"},
+        )
+        self.redis.hset(
+            core.PERSON_LINKS_KEY,
+            mapping={"p1": json.dumps({"music_source": "emby"})},
+        )
+        self.redis.hset(
+            core.PERSON_LINKS_KEY,
+            mapping={
+                "p2": json.dumps(
+                    {
+                        "music_source": "emby",
+                        "folder_playlists": "Workout Mix=Workout",
+                    }
+                )
+            },
+        )
+        # The override replaces the global list for p2 alone and matches their
+        # own catalog; p1 (blank override) and unlinked people keep the global.
+        self.assertEqual(
+            [row["name"] for row in core._catalog_user_playlists(self.redis, "p1", "emby")],
+            ["Christmas Music"],
+        )
+        p2_playlists = core._catalog_user_playlists(self.redis, "p2", "emby")
+        self.assertEqual([row["name"] for row in p2_playlists], ["Workout Mix"])
+        self.assertEqual(p2_playlists[0]["track_ids"], ["track:3"])
+        self.assertEqual(
+            [row["name"] for row in core._catalog_user_playlists(self.redis, "", "emby")],
+            ["Christmas Music"],
+        )
+        # The endless loop honors the override through the same path.
+        core._save_hash(
+            self.redis,
+            core.SETTINGS_KEY,
+            {"endless_playback_mode": "playlist_loop", "endless_playback_playlist": "Workout Mix"},
+        )
+        player = self.seed_playing_queue("p2", [tracks[0]], index=0)
+        batch, playlist, _offset = core._playlist_loop_tracks(player, self.redis, count=2)
+        self.assertEqual(playlist.get("name"), "Workout Mix")
+        self.assertEqual([track["id"] for track in batch], ["track:3"])
 
     def test_playlist_order_setting_plays_mixes_in_a_fixed_order(self):
         core = self.core
