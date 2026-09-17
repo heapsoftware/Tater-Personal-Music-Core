@@ -94,6 +94,9 @@ playlist"*) and feed the **Tracks from a playlist** Endless Playback mode:
   builds a "Christmas Music" playlist from every track under the Christmas
   folder (subfolders included). The playlist is rebuilt from the library on
   every sync and every play, so songs added to the folder join automatically.
+  Each linked Person can replace the global list with their own on their link
+  card in the People section (blank inherits the global list); folders match
+  against that Person's own library.
 
 With no playlist picked, the newest AI mix is used (or the first user-created
 playlist when there are no mixes yet).
@@ -340,7 +343,7 @@ enable.
 | Endless Playback | `Basic Auto (LLM)` | How queues keep playing after their final track (see [Endless Playback](#endless-playback)); per-Person override on the link card. |
 | Endless Playback Playlist | blank | Playlist looped by the "Tracks from a playlist" mode (AI mix, Emby playlist, share `.m3u`, or Folder Playlists entry). |
 | Playlist Order | `Shuffle each play` | Fixed ordering for AI mixes and picked playlists (track number, title, artist, album; asc/desc) instead of shuffling every play. |
-| Folder Playlists | blank | `Name=Folder` pairs that turn library folders into always-current playlists (see [Playlists](#playlists)). |
+| Folder Playlists | blank | `Name=Folder` pairs that turn library folders into always-current playlists (see [Playlists](#playlists)); per-Person override on the link card (blank inherits the global list). |
 | Smart Shuffle | off | History-aware shuffle with on-the-fly multi-source mixing; per-Person override on the link card. |
 | Resume in Another Room | `Stay where it was` | What "resume my music" does from a room other than the paused queue's room: stay, follow to the speaking room, or ask over TTS (per-Person override on the link card). |
 | Follow-Me Presence | off | Master switch for following linked People's Home Assistant person entities (see [Follow-Me presence](#follow-me-presence)). |
