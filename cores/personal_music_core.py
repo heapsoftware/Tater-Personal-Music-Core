@@ -54,7 +54,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.5.0"
+__version__ = "3.6.0"
 MIN_TATER_VERSION = "99.5"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby, Jellyfin, Subsonic, or Plex account or "
@@ -479,6 +479,12 @@ PENDING_CONFIRM_KEY_PREFIX = "personal_music_core:pending:"
 PENDING_CONFIRM_TTL_SECONDS = 600.0
 QUEUE_CONFLICT_MODES = ("ask", "auto_move")
 DEFAULT_QUEUE_CONFLICT_MODE = "ask"
+# Jarvis Screen browser playback destinations ("screen:<screen_key>"). The
+# profiles hash belongs to the Jarvis Screen core and is read-only here: the
+# screen core's uninstall sweep derives its Redis namespace generically, so
+# nothing is ever written under "jarvis_screen:*".
+SCREEN_TARGET_PREFIX = "screen:"
+SCREEN_PROFILES_KEY = "jarvis_screen:profiles"
 # Follow-Me presence: each linked Person can carry a Home Assistant person
 # entity (e.g. one a BLE tracker updates as they move between rooms). When the
 # entity reports a new room, that Person's queue hands off to it. Per-Person
@@ -1611,8 +1617,16 @@ def _sonos_airplay_target(value: Any) -> str:
 
 
 def _uses_audio_sync_transcode(targets: Any) -> bool:
-    """Use one normalized PCM source for every Music Core playback target."""
-    return bool(_list(targets))
+    """Use one normalized PCM source for every hardware Music Core target.
+
+    ``screen:`` destinations (Jarvis Screen browser playback) decode the
+    original containers natively, so they never force the WAV transcode —
+    a screen-only target list plays the plain source URL.
+    """
+    return any(
+        not _text(target).casefold().startswith(SCREEN_TARGET_PREFIX)
+        for target in _list(targets)
+    )
 
 
 def _mixed_sync_from_player_settings(
@@ -6850,7 +6864,11 @@ def _set_player_volume(
         100,
     )
     live_result = {"sent_count": 0, "warnings": []}
-    if _text(player.get("status")).lower() == "playing":
+    playing_hardware = _text(player.get("status")).lower() == "playing" and any(
+        not _is_screen_target(target)
+        for target in _list(player.get("targets") or player.get("target"))
+    )
+    if playing_hardware:
         live_result = _set_target_volume(player, volume)
         if _as_int(live_result.get("sent_count"), 0, 0, 10000) <= 0:
             warning = "; ".join(
@@ -6899,7 +6917,11 @@ def _apply_player_mute(
         if new_volume <= 0:
             new_volume = volume if volume > 0 else 75
     live_result = {"sent_count": 0, "warnings": []}
-    if _text(player.get("status")).lower() == "playing":
+    playing_hardware = _text(player.get("status")).lower() == "playing" and any(
+        not _is_screen_target(target)
+        for target in _list(player.get("targets") or player.get("target"))
+    )
+    if playing_hardware:
         live_result = _set_target_volume(player, new_volume)
         if _as_int(live_result.get("sent_count"), 0, 0, 10000) <= 0:
             warning = "; ".join(
@@ -9429,6 +9451,86 @@ def _preferred_room_target(room_names: Iterable[str], client: Any = None) -> str
         return ""
 
 
+def _is_screen_target(value: Any) -> bool:
+    return _text(value).casefold().startswith(SCREEN_TARGET_PREFIX)
+
+
+def _screen_profiles(store: Any = None) -> Dict[str, Dict[str, Any]]:
+    """Jarvis Screen profiles read-only: ``screen_key (casefolded) -> profile``.
+
+    The hash lives in the screen core's Redis namespace; it is only ever read
+    here, never written.
+    """
+    store = store if store is not None else globals().get("redis_client")
+    rows: Dict[Any, Any] = {}
+    try:
+        rows = store.hgetall(SCREEN_PROFILES_KEY) if store else {}
+    except Exception:
+        rows = {}
+    profiles: Dict[str, Dict[str, Any]] = {}
+    for screen_key, value in (rows or {}).items():
+        key = _text(screen_key).casefold()
+        if not key:
+            continue
+        try:
+            profile = json.loads(value) if isinstance(value, (str, bytes, bytearray)) else {}
+        except Exception:
+            profile = {}
+        if isinstance(profile, dict):
+            profiles[key] = profile
+    return profiles
+
+
+def _screen_target_label(screen_key: Any, *, store: Any = None) -> str:
+    """Human label for one screen key, from the Jarvis Screen profiles."""
+    profile = _screen_profiles(store).get(_text(screen_key).casefold()) or {}
+    return _text(profile.get("label")) or _text(screen_key)
+
+
+def _screen_target_summary_label(screen_key: Any, *, store: Any = None) -> str:
+    """Label shaped for a spoken summary, e.g. "the Office screen"."""
+    label = _screen_target_label(screen_key, store=store)
+    if any(word in label.casefold() for word in ("screen", "display", "monitor", "panel", "tablet")):
+        return f"the {label}"
+    return f"the {label} screen"
+
+
+def _screen_targets_from_words(values: Any, store: Any = None) -> Dict[str, str]:
+    """Map user-named screens to ``screen:<key>`` playback targets.
+
+    Reads the Jarvis Screen profiles hash (read-only) and matches each word
+    against a profile's ``label`` — exact or case-insensitively contained —
+    and the bare screen key; a ``screen:<key>`` value is accepted verbatim.
+    Returns ``word (casefolded) -> screen target`` for the words that resolve;
+    everything else is left to the hardware-target resolution path.
+    """
+    profiles = _screen_profiles(store)
+    matches: Dict[str, str] = {}
+    for value in _list(values):
+        word = _text(value)
+        lowered = word.casefold()
+        if not word or lowered in matches:
+            continue
+        if lowered.startswith(SCREEN_TARGET_PREFIX):
+            key = lowered[len(SCREEN_TARGET_PREFIX) :]
+            if key:
+                # The literal form is already resolved; pass it through even
+                # when the profiles hash is unavailable (the screen core
+                # validates the key when the card opens).
+                matches[lowered] = lowered
+            continue
+        for profile_key, profile in profiles.items():
+            label = _text(profile.get("label")).casefold()
+            if (
+                lowered == label
+                or lowered == profile_key
+                or (len(lowered) >= 3 and lowered in label)
+            ):
+                matches[lowered] = f"{SCREEN_TARGET_PREFIX}{profile_key}"
+                break
+    return matches
+
+
 def _resolve_targets(
     requested: Any = "",
     *,
@@ -9471,13 +9573,21 @@ def _resolve_targets(
         return _normalize_stereo_targets(resolved_rooms)
 
     if requested_values:
+        # Jarvis Screen destinations resolve first: user-named screens ("on the
+        # office screen") and literal screen:<key> values map before the
+        # hardware-target lookups, which would not know them.
+        screen_matches = _screen_targets_from_words(requested_values, store)
         explicit = []
         for value in requested_values:
             direct_value = _text(value)
             if direct_value.casefold() in local_airplay_targets:
                 explicit.append("")
                 continue
-            if direct_value.casefold().startswith(("voice_core:", "ha:", "sonos:", "airplay:", "integration:")):
+            screen_target = screen_matches.get(direct_value.casefold())
+            if screen_target:
+                explicit.append(screen_target)
+                continue
+            if direct_value.casefold().startswith(("voice_core:", "ha:", "sonos:", "airplay:", "integration:", "screen:")):
                 target = _target_alias_map(options).get(direct_value.casefold(), direct_value)
             else:
                 target = (
@@ -9546,6 +9656,9 @@ def _target_summary(targets: Any) -> str:
     values = _list(targets)
     if not values:
         return "no players"
+    screens = [value for value in values if _is_screen_target(value)]
+    if screens and len(screens) == len(values):
+        return _screen_target_summary_label(screens[0].casefold()[len(SCREEN_TARGET_PREFIX) :])
     if len(values) == 1:
         return values[0]
     return f"{len(values)} destinations"
@@ -9592,13 +9705,27 @@ def _play_track(
 ) -> Dict[str, Any]:
     provider = _provider(client, track.get("provider"), track.get("person_scope"))
     target_ids = _list(targets)
+    hardware_targets = [
+        target for target in target_ids if not _is_screen_target(target)
+    ]
+    screen_targets = [target for target in target_ids if _is_screen_target(target)]
     selected_player_settings = (
         player_settings if isinstance(player_settings, dict) else {}
     )
-    audio_sync_transcode = _uses_audio_sync_transcode(target_ids)
+    audio_sync_transcode = _uses_audio_sync_transcode(hardware_targets)
     source_url = provider.stream_url(track, audio_sync=audio_sync_transcode)
     if not source_url:
         raise RuntimeError(f"No stream is available for {_track_label(track)}.")
+    if not hardware_targets:
+        # Screen-only playback: the Jarvis Screen browser fetches the stream
+        # URL itself (no audio_sync transcode — browsers decode original
+        # containers), so this core only keeps the queue timeline and never
+        # drives hardware for it.
+        return {
+            "ok": True,
+            "target_count": len(screen_targets),
+            "screen_targets": list(screen_targets),
+        }
     from media_playback import play_media_url_targets
 
     duration = max(0.0, _as_float(track.get("duration_seconds")))
@@ -9610,7 +9737,7 @@ def _play_track(
         else source_path.name
     )
     result = play_media_url_targets(
-        target_ids,
+        hardware_targets,
         source_url,
         media_type=playback_media_type,
         media_content_type="music",
@@ -9626,12 +9753,12 @@ def _play_track(
         target_volume_percent={
             target: _as_int(values.get("volume_percent"), volume_percent, 0, 100)
             for target, values in dict(player_settings or {}).items()
-            if _text(target) and isinstance(values, dict)
+            if _text(target) and not _is_screen_target(target) and isinstance(values, dict)
         },
         target_sync_offset_ms={
             target: _as_int(values.get("sync_offset_ms"), 0, -1000, 1000)
             for target, values in dict(player_settings or {}).items()
-            if _text(target) and isinstance(values, dict)
+            if _text(target) and not _is_screen_target(target) and isinstance(values, dict)
         },
         target_transport_mode={
             target: _player_transport_mode(values.get("transport_mode"))
@@ -9646,10 +9773,38 @@ def _play_track(
     )
     if not isinstance(result, dict) or result.get("ok") is False:
         raise RuntimeError(_text((result or {}).get("error")) or "Music playback failed.")
+    # The screen mirrors in parallel when a queue mixes screens with speakers;
+    # mixed sync is not guaranteed.
+    if screen_targets:
+        result["screen_targets"] = list(screen_targets)
     result["audio_sync_transcode_used"] = audio_sync_transcode
     if audio_sync_transcode:
         result["audio_sync_transcode_profile"] = "audio_sync"
     return result
+
+
+def get_media_urls(track: Dict[str, Any], client: Any = None) -> Dict[str, str]:
+    """Public stream/artwork URLs for one catalog/queue track row.
+
+    Used by the Jarvis Screen music card. Returns {"stream": url, "art": url}
+    with "" for missing entries. No audio_sync transcode: browser targets
+    decode original containers.
+    """
+    if not isinstance(track, dict):
+        return {"stream": "", "art": ""}
+    provider = None
+    try:
+        provider = _provider(client, track.get("provider"), track.get("person_scope"))
+        stream = _text(provider.stream_url(track)) if provider else ""
+    except Exception:
+        stream = ""
+    art = ""
+    if provider is not None:
+        try:
+            art = _text(provider.artwork_url(track))
+        except Exception:
+            art = ""
+    return {"stream": stream, "art": art}
 
 
 def _playback_voice_core_sessions(player: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -9671,10 +9826,18 @@ def _stop_target(
     expected_voice_core_sessions: Any = None,
 ) -> List[str]:
     warnings: List[str] = []
+    # Screen destinations are browser-side only: there is no session to stop
+    # and split_announcement_targets would treat the unknown id as a
+    # voice_core selector, so screens never reach the host target split.
+    hardware_targets = [
+        target for target in _list(targets) if not _is_screen_target(target)
+    ]
+    if not hardware_targets:
+        return warnings
     try:
         from announcement_targets import split_announcement_targets
 
-        grouped = split_announcement_targets(_list(targets))
+        grouped = split_announcement_targets(hardware_targets)
     except Exception as exc:
         return [_text(exc)]
 
@@ -9854,7 +10017,14 @@ def _require_native_seek_support(targets: Any) -> None:
 
 
 def _set_target_volume(player: Dict[str, Any], volume_percent: int) -> Dict[str, Any]:
-    targets = _list(player.get("targets") or player.get("target"))
+    # Screen destinations play at the browser's own volume; there is nothing
+    # to send, and the host target split would read an unknown id as a
+    # voice_core selector.
+    targets = [
+        target
+        for target in _list(player.get("targets") or player.get("target"))
+        if not _is_screen_target(target)
+    ]
     if not targets:
         return {"sent_count": 0, "warnings": ["No playback destinations are selected."]}
     try:
@@ -10941,7 +11111,9 @@ def get_hydra_kernel_tools(*, platform: str = "", **_kwargs) -> List[Dict[str, A
                 "Use when the user asks to play music from their personal Emby or network-share library by "
                 "song, artist, album, genre, or description. Put user-named rooms in rooms, specific "
                 "user-named speakers in targets, and leave both empty when playback should follow the "
-                "speaking room. When the user asks for music for a set amount of time (\"play my music "
+                "speaking room. User-named screens (\"play on the office screen\") are also valid "
+                "destinations and can be mixed with speakers — screen playback renders in the screen's "
+                "browser. When the user asks for music for a set amount of time (\"play my music "
                 "for an hour\"), also pass sleep_minutes; a sleep timer then stops playback and "
                 "overrides endless playback when it hits zero."
             ),
@@ -10966,7 +11138,9 @@ def get_hydra_kernel_tools(*, platform: str = "", **_kwargs) -> List[Dict[str, A
                 "add more music to the queue, set a sleep timer, set one or more playback "
                 "destinations, or bind rooms to a Person. Each Person has their own queue, and "
                 "transport actions act on the music playing in the speaking room first, then that "
-                "Person's own queue. Use the add action to queue an extra album, playlist, artist, "
+                "Person's own queue. User-named screens (\"set targets to the office screen\") are "
+                "valid destinations and can be mixed with speakers. Use the add action to queue an "
+                "extra album, playlist, artist, "
                 "or genre on top of what is playing — with Smart Shuffle on, several sources mix "
                 "together on the fly. Use the volume action when the user asks to set the volume "
                 "across the whole speaker group (\"set all speakers to 70 percent\") — it sets every "
@@ -10995,7 +11169,9 @@ def get_hydra_kernel_tools(*, platform: str = "", **_kwargs) -> List[Dict[str, A
             "description": (
                 "Follow-me handoff: move or transfer the user's currently playing music to another "
                 "room or speaker (\"move/transfer my music to the Master Bedroom\"), keeping the "
-                "same track, position, and full queue. Only use when music is already playing; "
+                "same track, position, and full queue. User-named screens (\"move my music to the "
+                "office screen\") are valid destinations too, though mixing a screen with speakers "
+                "does not guarantee tight sync. Only use when music is already playing; "
                 "start a new queue with personal_music_play instead."
             ),
             "usage": (
@@ -11567,16 +11743,28 @@ async def run_hydra_kernel_tool(
                 _apply_mute_warnings(player, live_result)
                 _save_player(player, store, control_queue_id)
                 targets = _list(player.get("targets") or player.get("target"))
+                # Screen playback plays at each screen's own browser volume;
+                # the requested level stays stored and applies when speakers
+                # are (or become) part of the destination group.
+                screen_only = bool(targets) and all(
+                    _is_screen_target(target) for target in targets
+                )
+                summary = (
+                    f"Every speaker in the group is now at {volume}%."
+                    if len(targets) > 1
+                    else f"Volume set to {volume}%."
+                )
+                if screen_only:
+                    summary = (
+                        f"Queued {volume}% for the group — screen playback uses each "
+                        "screen's own volume control until speakers are targeted too."
+                    )
                 return {
                     "ok": True,
                     "status": _text(player.get("status")),
                     "volume_percent": volume,
                     "target_count": len(targets),
-                    "summary_for_user": (
-                        f"Every speaker in the group is now at {volume}%."
-                        if len(targets) > 1
-                        else f"Volume set to {volume}%."
-                    ),
+                    "summary_for_user": summary,
                 }
             elif action in {"mute_all", "unmute_all"}:
                 player = _player(store, control_queue_id)

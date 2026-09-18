@@ -6149,5 +6149,324 @@ class PlexProviderTests(unittest.TestCase):
         self.assertIn("Plex connection works", result["message"])
 
 
+class ScreenTargetTests(unittest.TestCase):
+    """``screen:<key>`` destinations: browser playback with no hardware.
+
+    Covers docs/specs/screen-target-playback-spec.md: screen-only target lists
+    never touch media_playback or the host target split, user-named screens
+    resolve from the read-only jarvis_screen:profiles hash, and screen-only
+    queues run the usual state machine end-to-end.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.core = load_personal_music_core()
+
+    def setUp(self):
+        self.redis = FakeRedis()
+        self.core.redis_client = self.redis
+        self.core._shutdown_stream_server()
+        self._originals = {}
+        self.media_calls = []
+        self.split_calls = []
+        self.stream_calls = []
+
+        # Jarvis Screen profiles fixture (read-only from the core's side).
+        self.redis.hset(
+            "jarvis_screen:profiles",
+            mapping={
+                "office": json.dumps({"label": "Office Screen"}),
+                "den": json.dumps({"label": "Den Display"}),
+            },
+        )
+
+        # The core imports these host modules lazily; stand in for them so
+        # hardware dispatch and target splitting are observable.
+        media_playback = types.ModuleType("media_playback")
+
+        def play_media_url_targets(targets, *_args, **_kwargs):
+            self.media_calls.append(list(targets))
+            return {"ok": True, "sent_count": len(targets), "voice_core_sessions": []}
+
+        media_playback.play_media_url_targets = play_media_url_targets
+        self._original_media_module = sys.modules.get("media_playback")
+        sys.modules["media_playback"] = media_playback
+
+        announcement_targets = types.ModuleType("announcement_targets")
+
+        def split_announcement_targets(values, **_kwargs):
+            self.split_calls.append(list(values))
+            return {
+                "voice_core_selectors": [
+                    value for value in values if value.startswith("voice_core:")
+                ],
+                "airplay_players": [],
+                "sonos_speakers": [],
+                "integration_devices": [],
+                "homeassistant_media_players": [],
+            }
+
+        def build_announcement_target_options(**_kwargs):
+            return [
+                {"value": "voice_core:native:kitchen", "label": "Tater Satellite: Kitchen"},
+                {"value": "voice_core:native:living", "label": "Tater Satellite: Living Room"},
+            ]
+
+        announcement_targets.split_announcement_targets = split_announcement_targets
+        announcement_targets.build_announcement_target_options = (
+            build_announcement_target_options
+        )
+        announcement_targets.resolve_sonos_airplay_target = lambda value: ""
+        self._original_announcement_module = sys.modules.get("announcement_targets")
+        sys.modules["announcement_targets"] = announcement_targets
+
+        class FakeProvider:
+            def stream_url(inner, track, audio_sync=False):
+                self.stream_calls.append(bool(audio_sync))
+                return f"http://stream/{track['id']}" + ("~wav" if audio_sync else "")
+
+            def artwork_url(inner, track):
+                return f"http://art/{track['id']}"
+
+        self._originals["_provider"] = self.core._provider
+        self.core._provider = lambda client=None, provider_id="", person_id="": FakeProvider()
+
+    def tearDown(self):
+        for name, value in self._originals.items():
+            setattr(self.core, name, value)
+        for name, original in (
+            ("media_playback", self._original_media_module),
+            ("announcement_targets", self._original_announcement_module),
+        ):
+            if original is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = original
+        self.core._shutdown_stream_server()
+
+    def seed_playing(self, person_id, targets, *, elapsed=0.0, duration=180.0):
+        player = {
+            "status": "playing",
+            "provider": "emby",
+            "queue": [_track_row(1, "Jamming", duration), _track_row(2, "Exodus", duration)],
+            "queue_original": [
+                _track_row(1, "Jamming", duration),
+                _track_row(2, "Exodus", duration),
+            ],
+            "index": 0,
+            "current": _track_row(1, "Jamming", duration),
+            "targets": targets,
+            "person_id": person_id,
+            "shuffle": False,
+            "repeat": "off",
+            "volume_percent": 60,
+            "mixed_sync_adjustment_ms": 0,
+            "created_at": time.time(),
+            "queue_session_id": f"session-{person_id or 'shared'}",
+            "continuous_radio": False,
+            "continuation_pending": False,
+            "started_at": time.time() - elapsed if elapsed else 0.0,
+            "position_offset_seconds": 30.0,
+            "duration_seconds": duration,
+            "last_error": "",
+        }
+        self.core._save_player(player, self.redis, person_id)
+        return player
+
+    def origin_for(self, person_id, selector="kitchen"):
+        return {
+            "people_resolution": {"master_user_id": person_id},
+            "satellite_selector": selector,
+        }
+
+    # ---- screen-only playback never drives hardware ----
+
+    def test_screen_only_play_track_never_calls_media_playback(self):
+        sys.modules["media_playback"].play_media_url_targets = lambda *_a, **_k: (
+            (_ for _ in ()).throw(AssertionError("screen-only playback must not drive hardware"))
+        )
+        result = self.core._play_track(
+            _track_row(1, "Jamming"), ["screen:office"], volume_percent=50
+        )
+        self.assertEqual(
+            result,
+            {"ok": True, "target_count": 1, "screen_targets": ["screen:office"]},
+        )
+        self.assertEqual(self.media_calls, [])
+        # No WAV transcode for a browser target.
+        self.assertEqual(self.stream_calls, [False])
+
+    def test_screen_only_play_track_still_requires_a_stream(self):
+        missing = types.SimpleNamespace(
+            stream_url=lambda track, audio_sync=False: "",
+            artwork_url=lambda track: "",
+        )
+        self.core._provider = lambda client=None, provider_id="", person_id="": missing
+        with self.assertRaises(RuntimeError) as caught:
+            self.core._play_track(_track_row(1), ["screen:office"], volume_percent=50)
+        self.assertIn("No stream is available", str(caught.exception))
+        self.assertEqual(self.media_calls, [])
+
+    def test_mixed_targets_drive_hardware_for_the_hardware_list_only(self):
+        result = self.core._play_track(
+            _track_row(1, "Jamming"),
+            ["screen:office", "voice_core:native:kitchen"],
+            volume_percent=50,
+        )
+        self.assertEqual(self.media_calls, [["voice_core:native:kitchen"]])
+        self.assertEqual(result.get("screen_targets"), ["screen:office"])
+        # Speakers in the group still get the WAV transcode.
+        self.assertEqual(self.stream_calls, [True])
+
+    # ---- stopping ----
+
+    def test_stop_target_screen_only_returns_no_warnings(self):
+        self.assertEqual(self.core._stop_target(["screen:office"]), [])
+        self.assertEqual(self.split_calls, [])
+
+    def test_stop_target_mixed_splits_hardware_only(self):
+        self.core._stop_target(["screen:office", "voice_core:native:kitchen"])
+        self.assertEqual(self.split_calls, [["voice_core:native:kitchen"]])
+
+    # ---- transcode decision ----
+
+    def test_uses_audio_sync_transcode_ignores_screens(self):
+        self.assertFalse(self.core._uses_audio_sync_transcode(["screen:office"]))
+        self.assertFalse(self.core._uses_audio_sync_transcode([]))
+        self.assertTrue(self.core._uses_audio_sync_transcode(["voice_core:kitchen"]))
+        self.assertTrue(
+            self.core._uses_audio_sync_transcode(["screen:office", "voice_core:kitchen"])
+        )
+
+    # ---- screen-name resolution ----
+
+    def test_screen_words_resolve_to_screen_targets(self):
+        resolve = self.core._screen_targets_from_words
+        self.assertEqual(
+            resolve(["office screen"], self.redis),
+            {"office screen": "screen:office"},
+        )
+        self.assertEqual(resolve(["Office"], self.redis), {"office": "screen:office"})
+        self.assertEqual(resolve(["den"], self.redis), {"den": "screen:den"})
+        self.assertEqual(
+            resolve(["screen:office"], self.redis),
+            {"screen:office": "screen:office"},
+        )
+        # Unknown words are left to the hardware resolution path.
+        self.assertEqual(resolve(["kitchen"], self.redis), {})
+
+    def test_resolve_targets_prefers_screens_then_hardware(self):
+        self.assertEqual(
+            self.core._resolve_targets(["office screen"], client=self.redis),
+            ["screen:office"],
+        )
+        self.assertEqual(
+            self.core._resolve_targets(["screen:den"], client=self.redis),
+            ["screen:den"],
+        )
+        # A miss falls through to hardware resolution.
+        self.assertEqual(
+            self.core._resolve_targets(["kitchen"], client=self.redis),
+            ["voice_core:native:kitchen"],
+        )
+        # Screens and speakers mix in one destination list.
+        self.assertEqual(
+            self.core._resolve_targets(["office", "kitchen"], client=self.redis),
+            ["screen:office", "voice_core:native:kitchen"],
+        )
+
+    def test_literal_screen_form_passes_through_without_profiles(self):
+        self.redis.delete("jarvis_screen:profiles")
+        self.assertEqual(
+            self.core._screen_targets_from_words(["screen:office"], self.redis),
+            {"screen:office": "screen:office"},
+        )
+        self.assertEqual(
+            self.core._resolve_targets(["screen:office"], client=self.redis),
+            ["screen:office"],
+        )
+
+    def test_target_summary_reads_the_screen_label(self):
+        self.assertEqual(self.core._target_summary(["screen:office"]), "the Office Screen")
+        self.assertEqual(self.core._target_summary(["screen:den"]), "the Den Display")
+
+    # ---- queue state machine on screen-only targets ----
+
+    def test_start_player_index_accepts_screen_only_targets(self):
+        player = self.core._create_and_start_queue(
+            [_track_row(1, "Jamming"), _track_row(2, "Exodus")],
+            targets=["screen:office"],
+            shuffle=False,
+            volume_percent=60,
+            person_id="person_s",
+            client=self.redis,
+        )
+        self.assertEqual(player["status"], "playing")
+        self.assertEqual(player["targets"], ["screen:office"])
+        self.assertEqual(player["playback_result"]["target_count"], 1)
+        self.assertEqual(self.media_calls, [])
+        self.assertEqual(self.stream_calls, [False])
+
+    def test_screen_only_queue_auto_advances_without_hardware(self):
+        duration = 180.0
+        self.core._create_and_start_queue(
+            [_track_row(1, "Jamming", duration), _track_row(2, "Exodus", duration)],
+            targets=["screen:office"],
+            shuffle=False,
+            volume_percent=60,
+            person_id="person_s",
+            client=self.redis,
+        )
+        player = self.core._player(self.redis, "person_s")
+        player["started_at"] = time.time() - duration - 1.0
+        self.core._save_player(player, self.redis, "person_s")
+        # Simulate the run-loop maintenance tick.
+        self.core._advance_finished_player(self.redis, person_id="person_s")
+        player = self.core._player(self.redis, "person_s")
+        self.assertEqual(player["index"], 1)
+        self.assertEqual(player["status"], "playing")
+        self.assertEqual(self.media_calls, [])
+
+    # ---- volume / mute with screens ----
+
+    def test_screen_only_volume_and_mute_skip_the_live_send(self):
+        self.seed_playing("person_s", ["screen:office"])
+        player = self.core._player(self.redis, "person_s")
+        result = self.core._set_player_volume(player, 70, store=self.redis)
+        self.assertEqual(result["sent_count"], 0)
+        self.core._save_player(player, self.redis, "person_s")
+        self.assertEqual(self.core._player(self.redis, "person_s")["volume_percent"], 70)
+        player = self.core._player(self.redis, "person_s")
+        self.core._apply_player_mute(player, mute=True, client=self.redis)
+        self.core._save_player(player, self.redis, "person_s")
+        self.assertTrue(self.core._player(self.redis, "person_s")["muted"])
+
+    def test_volume_reply_mentions_screen_volume(self):
+        self.seed_playing("person_s", ["screen:office"])
+        result = asyncio.run(
+            self.core.run_hydra_kernel_tool(
+                tool_id="personal_music_control",
+                args={"action": "volume", "volume_percent": 70},
+                origin=self.origin_for("person_s"),
+                redis_client=self.redis,
+            )
+        )
+        self.assertTrue(result.get("ok"), result)
+        self.assertIn("screen", result["summary_for_user"])
+        self.assertEqual(self.core._player(self.redis, "person_s")["volume_percent"], 70)
+
+    # ---- public URL helper ----
+
+    def test_get_media_urls_returns_stream_and_art(self):
+        self.assertEqual(
+            self.core.get_media_urls(_track_row(1, "Jamming"), self.redis),
+            {"stream": "http://stream/track:1", "art": "http://art/track:1"},
+        )
+        self.assertEqual(
+            self.core.get_media_urls(None, self.redis),
+            {"stream": "", "art": ""},
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
