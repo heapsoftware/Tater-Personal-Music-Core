@@ -371,13 +371,29 @@ AI-named mixes** on the Recommendations tab.
 ### Follow-Me presence
 
 Optionally, a linked Person's music can **follow them room to room**. Enable
-**Follow-Me Presence** in the core settings, then give the Person a
-**Home Assistant Person** entity in their People card (e.g. `person.john`) —
-any presence stack works, including BLE trackers that compute the closest node
-and update the person entity (Bermuda, ESPHome, phone GPS, …). The core
-reuses Tater's built-in Home Assistant integration for the base URL and token
-(no separate credentials) and polls HA's REST API for the entity's state,
-which is the friendly name of the zone the Person is in.
+**Follow-Me Presence** in the core settings, then pick where their location
+comes from:
+
+- **Home Assistant person entities** (default). Give the Person a **Home
+  Assistant Person** entity in their People card (e.g. `person.john`) — any
+  presence stack works, including BLE trackers that compute the closest node
+  and update the person entity (Bermuda, ESPHome, phone GPS, …). The core
+  reuses Tater's built-in Home Assistant integration for the base URL and
+  token (no separate credentials) and polls HA's REST API for the entity's
+  state, which is the friendly name of the zone the Person is in.
+- **Tater native BLE presence.** Give the Person a **Tater BLE Address** in
+  their People card (a key fob, badge, phone, or watch that advertises to your
+  satellites — find the address under Tater's Satellites → Presence UI). The
+  core reads Tater v1.2.0's native BLE presence, which combines the passive
+  observations from every satellite and assigns the device to the room with
+  the strongest fresh signal — no Home Assistant needed. A Person counts as
+  **home** until they haven't been seen for the **Follow-Me BLE Away Timeout**
+  (default 90 s); after that the Away Behavior applies, so a dead battery or a
+  left-behind tag is treated the same as leaving the house.
+
+Both sources produce the same room handoffs below; a Person can even mix
+sources (one tracked by Home Assistant, another by BLE) with the per-Person
+**Presence Source** override on their card.
 
 - **Follows zones, resolves Tater rooms.** When the zone changes and holds for
   the move delay (default 20 s), the Person's queue hands off to that room at
@@ -416,9 +432,10 @@ which is the friendly name of the zone the Person is in.
   Kitchen → Kitchen", "paused (away from home)", "person entity not found in
   Home Assistant").
 
-Follow-Me is off by default and requires Tater's Home Assistant integration to
-be configured (base URL + token); without it the system task explains what to
-enable.
+Follow-Me is off by default. Home Assistant tracking requires Tater's Home
+Assistant integration to be configured (base URL + token); Tater BLE tracking
+requires Tater v1.2.0+ (its native BLE presence). Without what the chosen
+source needs, the system task explains what to enable.
 
 ## Settings worth knowing
 
@@ -433,8 +450,10 @@ enable.
 | Folder Playlists | blank | `Name=Folder` pairs that turn library folders into always-current playlists (see [Playlists](#playlists)); per-Person override on the link card (blank inherits the global list). |
 | Smart Shuffle | off | History-aware shuffle with on-the-fly multi-source mixing; per-Person override on the link card. |
 | Resume in Another Room | `Stay where it was` | What "resume my music" does from a room other than the paused queue's room: stay, follow to the speaking room, or ask over TTS (per-Person override on the link card). |
-| Follow-Me Presence | off | Master switch for following linked People's Home Assistant person entities (see [Follow-Me presence](#follow-me-presence)). |
-| Follow-Me Poll Interval | `15` s | How often HA is polled for each tracked Person (5–3600 s). |
+| Follow-Me Presence | off | Master switch for following linked People room to room (see [Follow-Me presence](#follow-me-presence)). |
+| Follow-Me Presence Source | `Home Assistant` | Where each Person's location comes from: Home Assistant person entities or Tater's native BLE presence (per-Person override on the link card). |
+| Follow-Me BLE Away Timeout | `90` s | How long after the last satellite sighting a BLE-tracked Person still counts as home. |
+| Follow-Me Poll Interval | `15` s | How often presence is checked for each tracked Person (5–3600 s). |
 | Follow-Me Move Delay | `20` s | How long a new zone must hold before the music moves (prevents hallway flicker). |
 | Transfer Resume Delay | `0` s | Wait before music resumes in the room a transfer moved to — time to walk between rooms (per-Person override on the link card). |
 | Follow-Me Move Resume Delay | `0` s | Same wait, but for follow-me zone handoffs. |

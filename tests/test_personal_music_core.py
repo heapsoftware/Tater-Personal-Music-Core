@@ -2884,15 +2884,261 @@ class FollowMeTests(unittest.TestCase):
         self.assertEqual(core._player(self.redis, "person_a")["targets"], ["voice_core:native:kitchen"])
         self.assertEqual(core._runtime(self.redis).get("follow_me_last_error"), "")
 
-    def test_follow_me_tick_skips_when_disabled_or_unconfigured(self):
+    def test_follow_me_tick_skips_when_disabled(self):
         core = self.core
         # Off by default.
         self.assertEqual(core._follow_me_tick(self.redis).get("skipped"), "disabled")
-        # On, but Tater has no Home Assistant integration configured.
-        self.redis.hset(core.SETTINGS_KEY, mapping={"follow_me_enabled": "1"})
-        self.assertEqual(core._follow_me_tick(self.redis).get("skipped"), "ha_not_configured")
         # Skipped passes never record a run.
         self.assertIsNone(core._runtime(self.redis).get("last_follow_me_at"))
+
+    def test_follow_me_tick_records_ha_not_configured_per_person(self):
+        core = self.core
+        self.enable_follow_me(delay="0")
+        self.link_person("person_a", "person.john")
+        # On, but Tater has no Home Assistant integration configured: each HA
+        # person records the error (BLE-sourced People are unaffected).
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["checked"], 1)
+        self.assertEqual(summary["errors"], ["person_a: ha_not_configured"])
+        state = core._follow_me_state("person_a", self.redis)
+        self.assertEqual(state["status"], "error")
+        self.assertEqual(state["last_error"], "ha_not_configured")
+
+    # ---- tick: Tater native BLE presence ----
+
+    def stub_ble(self):
+        """Point Tater's native BLE snapshot at fakes (like stub_ha)."""
+        core = self.core
+        self.ble_devices = {}
+        self.ble_queries = []
+        self._originals["_tater_ble_snapshot"] = core._tater_ble_snapshot
+        # Room resolution matches stub_ha's fake (setdefault: stub_ha may have
+        # installed it first, and its original is the one tearDown restores).
+        self._originals.setdefault("_room_name_to_targets", core._room_name_to_targets)
+        core._room_name_to_targets = lambda name, client=None: self.room_targets.get(
+            str(name), ""
+        )
+
+        def fake_snapshot(*, address, max_age_s):
+            self.ble_queries.append({"address": address, "max_age_s": max_age_s})
+            devices = self.ble_devices.get(address)
+            if devices is None:  # None simulates the module being unavailable
+                return None
+            return {"ok": True, "devices": list(devices), "device_count": len(devices)}
+
+        core._tater_ble_snapshot = fake_snapshot
+
+    def test_normalize_ble_address(self):
+        core = self.core
+        self.assertEqual(
+            core._normalize_ble_address(" AA:BB:CC:DD:EE:FF "), "aa:bb:cc:dd:ee:ff"
+        )
+        self.assertEqual(core._normalize_ble_address("keyfob"), "")
+        self.assertEqual(core._normalize_ble_address(""), "")
+        self.assertEqual(core._normalize_ble_address(None), "")
+
+    def test_follow_me_presence_source_resolution(self):
+        core = self.core
+        # Defaults to Home Assistant, then the global setting, then the link.
+        self.assertEqual(core._follow_me_presence_source("person_a", self.redis), "home_assistant")
+        self.redis.hset(
+            core.SETTINGS_KEY, mapping={"follow_me_presence_source": "tater_ble"}
+        )
+        self.assertEqual(core._follow_me_presence_source("person_a", self.redis), "tater_ble")
+        # A per-Person override wins over the global setting; junk inherits.
+        link = {"music_source": "", "follow_me_presence_source": "home_assistant"}
+        self.redis.hset(core.PERSON_LINKS_KEY, mapping={"person_a": json.dumps(link)})
+        self.assertEqual(core._follow_me_presence_source("person_a", self.redis), "home_assistant")
+        link["follow_me_presence_source"] = "carrier_pigeon"
+        self.redis.hset(core.PERSON_LINKS_KEY, mapping={"person_a": json.dumps(link)})
+        self.assertEqual(core._follow_me_presence_source("person_a", self.redis), "tater_ble")
+
+    def test_ble_person_location_maps_the_snapshot(self):
+        core = self.core
+        self.stub_ble()
+        link = {"follow_me_ble_address": "AA:BB:CC:DD:EE:FF"}
+        # Seen: the strongest room rides through like an HA zone.
+        self.ble_devices["aa:bb:cc:dd:ee:ff"] = [
+            {
+                "address": "aa:bb:cc:dd:ee:ff",
+                "strongest_room": "Office",
+                "strongest_rssi": -58,
+                "signal": "good",
+                "last_seen_age_s": 1.2,
+            }
+        ]
+        self.assertEqual(
+            core._ble_person_location(self.redis, link),
+            {
+                "state": "Office",
+                "source": "tater_ble",
+                "ble_rssi": -58,
+                "ble_signal": "good",
+                "last_seen_age_s": 1.2,
+            },
+        )
+        # The snapshot is queried for the Person's address within the away timeout.
+        self.assertEqual(
+            self.ble_queries,
+            [{"address": "aa:bb:cc:dd:ee:ff", "max_age_s": 90}],
+        )
+        # Not seen within the timeout: away, like HA's not_home.
+        self.ble_devices["aa:bb:cc:dd:ee:ff"] = []
+        self.assertEqual(
+            core._ble_person_location(self.redis, link),
+            {"state": "not_home", "source": "tater_ble"},
+        )
+        # A satellite without a room reads as the Unknown dead zone.
+        self.ble_devices["aa:bb:cc:dd:ee:ff"] = [{"address": "aa:bb:cc:dd:ee:ff", "strongest_room": ""}]
+        self.assertEqual(core._ble_person_location(self.redis, link)["state"], "Unknown")
+        # Module missing (pre-1.2.0 host) and malformed addresses are errors.
+        self.ble_devices["aa:bb:cc:dd:ee:ff"] = None
+        self.assertEqual(
+            core._ble_person_location(self.redis, link), {"error": "tater_ble_unavailable"}
+        )
+        self.assertEqual(
+            core._ble_person_location(self.redis, {"follow_me_ble_address": "keyfob"}),
+            {"error": "ble_address_invalid"},
+        )
+        self.assertEqual(core._ble_person_location(self.redis, {}), {"error": "ble_address_invalid"})
+
+    def test_ble_person_location_uses_the_away_timeout_setting(self):
+        core = self.core
+        self.stub_ble()
+        self.redis.hset(
+            core.SETTINGS_KEY, mapping={"follow_me_ble_max_age_seconds": "45"}
+        )
+        core._ble_person_location(
+            self.redis, {"follow_me_ble_address": "aa:bb:cc:dd:ee:ff"}
+        )
+        self.assertEqual(self.ble_queries[0]["max_age_s"], 45)
+
+    def test_follow_me_tick_moves_music_with_tater_ble(self):
+        core = self.core
+        self.stub_playback()
+        self.stub_ble()
+        self.enable_follow_me(delay="0")
+        self.link_person(
+            "person_a",
+            entity="",
+            follow_me_presence_source="tater_ble",
+            follow_me_ble_address="AA:BB:CC:DD:EE:FF",
+        )
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"], position=30.0, elapsed=10.0)
+        self.ble_devices["aa:bb:cc:dd:ee:ff"] = [
+            {"address": "aa:bb:cc:dd:ee:ff", "strongest_room": "Office", "strongest_rssi": -58}
+        ]
+        self.room_targets["Office"] = "voice_core:native:office"
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["checked"], 1)
+        self.assertEqual(summary["moved"], 1)
+        self.assertEqual(core._player(self.redis, "person_a")["targets"], ["voice_core:native:office"])
+        state = core._follow_me_state("person_a", self.redis)
+        self.assertEqual(state["status"], "following")
+        self.assertEqual(state["zone"], "Office")
+        # Not seen anymore: the default away behavior pauses at the same spot.
+        self.ble_devices["aa:bb:cc:dd:ee:ff"] = []
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["paused"], 1)
+        self.assertEqual(core._player(self.redis, "person_a")["status"], "paused")
+        self.assertEqual(core._follow_me_state("person_a", self.redis)["status"], "paused_away")
+
+    def test_follow_me_tick_mixes_ha_and_ble_people(self):
+        core = self.core
+        self.stub_playback()
+        self.stub_ha()
+        self.stub_ble()
+        self.enable_follow_me(delay="0")
+        # Alice tracks through Home Assistant; Bob through Tater BLE — even
+        # with no HA configured at all, Bob still follows.
+        self.link_person("person_a", "person.john")
+        self.link_person(
+            "person_b",
+            entity="",
+            follow_me_presence_source="tater_ble",
+            follow_me_ble_address="11:22:33:44:55:66",
+        )
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"], position=30.0, elapsed=10.0)
+        self.seed_playing_queue("person_b", ["voice_core:native:den"], position=30.0, elapsed=10.0)
+        self.ble_devices["11:22:33:44:55:66"] = [
+            {"address": "11:22:33:44:55:66", "strongest_room": "Office"}
+        ]
+        self.ha_states["person.john"] = {"state": "Patio"}
+        self.room_targets["Office"] = "voice_core:native:office"
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["checked"], 2)
+        # Alice's HA zone is a dead room (no target) so she idles there.
+        self.assertEqual(core._follow_me_state("person_a", self.redis)["status"], "dead_zone")
+        # Bob's BLE sighting moves him with no Home Assistant configured.
+        self.assertEqual(core._player(self.redis, "person_b")["targets"], ["voice_core:native:office"])
+
+    def test_follow_me_tick_skips_ble_people_without_an_address(self):
+        core = self.core
+        self.stub_ble()
+        self.enable_follow_me(delay="0")
+        self.link_person("person_a", entity="", follow_me_presence_source="tater_ble")
+        self.ha_states["person.john"] = {"state": "Office"}
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["checked"], 0)
+        self.assertEqual(self.ble_queries, [])
+
+    def test_follow_me_ble_people_work_without_home_assistant(self):
+        core = self.core
+        self.stub_playback()
+        self.stub_ble()
+        self.enable_follow_me(delay="0")
+        self.link_person(
+            "person_a",
+            entity="",
+            follow_me_presence_source="tater_ble",
+            follow_me_ble_address="aa:bb:cc:dd:ee:ff",
+        )
+        # No HA settings at all; the module reports the person in the Kitchen.
+        self.seed_playing_queue("person_a", ["voice_core:native:office"], position=30.0, elapsed=10.0)
+        self.ble_devices["aa:bb:cc:dd:ee:ff"] = [
+            {"address": "aa:bb:cc:dd:ee:ff", "strongest_room": "Kitchen"}
+        ]
+        self.room_targets["Kitchen"] = "voice_core:native:kitchen"
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["checked"], 1)
+        self.assertEqual(summary["errors"], [])
+        self.assertEqual(core._player(self.redis, "person_a")["targets"], ["voice_core:native:kitchen"])
+
+    def test_follow_me_card_status_for_ble_people(self):
+        core = self.core
+        self.enable_follow_me()
+        cfg = core._settings(self.redis)
+        link = {
+            "music_source": "",
+            "follow_me_presence_source": "tater_ble",
+            "follow_me_ble_address": "aa:bb:cc:dd:ee:ff",
+        }
+        # No check yet: the card shows the waiting state.
+        self.assertEqual(
+            core._follow_me_card_status("person_a", link, cfg, self.redis),
+            "Follow-me: waiting for first check",
+        )
+        core._save_follow_me_state(
+            "person_a",
+            {"status": "following", "zone": "Office", "resolved_room": "Office"},
+            self.redis,
+        )
+        self.assertEqual(
+            core._follow_me_card_status("person_a", link, cfg, self.redis),
+            "Follow-me: in Office → Office",
+        )
+        # Without an address the card stays quiet; BLE errors get a friendly label.
+        no_address = {key: value for key, value in link.items() if key != "follow_me_ble_address"}
+        self.assertEqual(
+            core._follow_me_card_status("person_a", no_address, cfg, self.redis), ""
+        )
+        core._save_follow_me_state(
+            "person_a", {"status": "error", "last_error": "tater_ble_unavailable"}, self.redis
+        )
+        self.assertEqual(
+            core._follow_me_card_status("person_a", link, cfg, self.redis),
+            "Follow-me: Tater BLE presence unavailable (needs Tater v1.2.0+)",
+        )
 
     # ---- system task + manual run ----
 
@@ -2914,6 +3160,15 @@ class FollowMeTests(unittest.TestCase):
         self.assertFalse(follow_me_task["available"])
         self.assertEqual(follow_me_task["status"], "waiting")
         self.assertIn("Home Assistant", follow_me_task["unavailable_reason"])
+        # A BLE-sourced setup is judged by Tater's BLE presence module instead
+        # (not importable in this test host), so it stays unavailable too.
+        self.redis.hset(
+            core.SETTINGS_KEY, mapping={"follow_me_presence_source": "tater_ble"}
+        )
+        follow_me_task = core.get_core_system_tasks(redis_client=self.redis)["tasks"][-1]
+        self.assertFalse(follow_me_task["available"])
+        self.assertIn("BLE", follow_me_task["unavailable_reason"])
+        self.redis.hdel(core.SETTINGS_KEY, "follow_me_presence_source")
         # With Tater's HA integration configured and the feature enabled, the
         # task is available and a manual run performs one presence pass.
         self.redis.hset(
@@ -3045,6 +3300,8 @@ class FollowMeTests(unittest.TestCase):
                     "person_link_person_id": "person_zoe",
                     "person_link_source": "",
                     "person_link_follow_me_entity": " person.zoe ",
+                    "person_link_follow_me_ble_address": " AA:BB:CC:DD:EE:FF ",
+                    "person_link_follow_me_presence_source": "TATER_BLE",
                     "person_link_follow_me_room_overrides": " The Kitchen=Kitchen ",
                     "person_link_follow_me_takeover_mode": "ASK",
                     "person_link_follow_me_away_action": "pause",
@@ -3054,15 +3311,21 @@ class FollowMeTests(unittest.TestCase):
             self.assertTrue(result["ok"], result)
             link = core._person_link("person_zoe", self.redis)
             self.assertEqual(link["follow_me_person_entity"], "person.zoe")
+            self.assertEqual(link["follow_me_ble_address"], "aa:bb:cc:dd:ee:ff")
+            self.assertEqual(link["follow_me_presence_source"], "tater_ble")
             self.assertEqual(link["follow_me_room_overrides"], "The Kitchen=Kitchen")
             self.assertEqual(link["follow_me_takeover_mode"], "ask")
             self.assertEqual(link["follow_me_away_action"], "pause")
             # Blank entity clears tracking; invalid select values are dropped.
+            # An empty presence source is a real choice ("Use global setting"),
+            # so it clears the per-Person override instead of being dropped.
             result = core._save_person_link_action(
                 {
                     "person_link_person_id": "person_zoe",
                     "person_link_source": "",
                     "person_link_follow_me_entity": "",
+                    "person_link_follow_me_ble_address": "",
+                    "person_link_follow_me_presence_source": "",
                     "person_link_follow_me_takeover_mode": "yolo",
                     "person_link_follow_me_away_action": "teleport",
                 },
@@ -3071,6 +3334,8 @@ class FollowMeTests(unittest.TestCase):
             self.assertTrue(result["ok"], result)
             link = core._person_link("person_zoe", self.redis)
             self.assertEqual(link.get("follow_me_person_entity"), "")
+            self.assertEqual(link.get("follow_me_ble_address"), "")
+            self.assertNotIn("follow_me_presence_source", link)
             self.assertEqual(link.get("follow_me_takeover_mode"), "ask")
             self.assertEqual(link.get("follow_me_away_action"), "pause")
         finally:
