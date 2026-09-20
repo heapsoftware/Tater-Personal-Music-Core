@@ -54,7 +54,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.8.0"
+__version__ = "3.8.1"
 MIN_TATER_VERSION = "1.2.0"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby, Jellyfin, Subsonic, or Plex account or "
@@ -13945,7 +13945,7 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
     """Per-Person source links shown in the core tab's People section.
 
     Linked People render as compact cards (name, library sync state, and their
-    actions); Edit opens the card's full settings form in the host's modal
+    actions); Settings opens the card's full settings form in the host's modal
     (ui.item_fields_popup, Tater v1.2.0+), whose Save/Cancel round-trip straight
     to music_person_link_save needs no core-side editor state.
     """
@@ -13978,7 +13978,7 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
         else:
             sleep_status = ""
         library_hint = (
-            "Their library has not been synced yet — press Edit, then Save Person Link to load it."
+            "Their library has not been synced yet — press Settings, then Save Person Link to load it."
             if source
             else "The shared library has not been synced yet — press Rescan Library on the source card."
         )
@@ -14054,8 +14054,8 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
         card["save_action"] = "music_person_link_save"
         card["save_label"] = "Save Person Link"
         card["fields_popup"] = True
-        card["settings_label"] = "Edit"
-        card["settings_title"] = f"Edit {name}'s music link"
+        card["settings_label"] = "Settings"
+        card["settings_title"] = f"{name}'s music link settings"
         card["actions"] = [
             {
                 "action": "music_view_as_switch",
