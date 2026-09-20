@@ -54,7 +54,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.7.0"
+__version__ = "3.8.0"
 MIN_TATER_VERSION = "1.2.0"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby, Jellyfin, Subsonic, or Plex account or "
@@ -63,7 +63,8 @@ CORE_DESCRIPTION = (
     "history across clock-synchronized satellites, native Sonos groups, stereo pairs, and media players — with "
     "selectable Endless Playback modes (AI radio, offline Infinite Mix, or looping a chosen playlist), Smart "
     "Shuffle that mixes several queued sources on the fly, per-Person sleep timers, and optional Follow-Me "
-    "presence that moves a Person's music to the room their Home Assistant person entity reports."
+    "presence that moves a Person's music to the room they're in, tracked through Home Assistant person "
+    "entities or Tater's native BLE presence."
 )
 TAGS = [
     "music",
@@ -241,15 +242,40 @@ CORE_SETTINGS = {
             ),
         },
         "follow_me_enabled": {
-            "label": "Follow-Me (Home Assistant Presence)",
+            "label": "Follow-Me (Presence Tracking)",
             "type": "checkbox",
             "default": False,
             "description": (
-                "Track each Person's Home Assistant person entity (for example one your BLE "
-                "trackers update as they move between rooms) and automatically move their music "
-                "to the room they're in. Requires the Home Assistant integration configured in "
-                "Tater (base URL and token); set each Person's entity on their card in the "
-                "People section."
+                "Track each Person's location and automatically move their music to the room "
+                "they're in. The location source is chosen below: Home Assistant person entities, "
+                "or Tater's own native BLE presence. Set each Person's entity or BLE address on "
+                "their card in the People section."
+            ),
+        },
+        "follow_me_presence_source": {
+            "label": "Follow-Me Presence Source",
+            "type": "select",
+            "default": "home_assistant",
+            "options": [
+                {"value": "home_assistant", "label": "Home Assistant person entities"},
+                {"value": "tater_ble", "label": "Tater native BLE presence (satellites)"},
+            ],
+            "description": (
+                "Where Follow-Me gets each Person's location. Home Assistant polls the person "
+                "entity set on their People card (any presence stack behind it: BLE trackers, "
+                "phone GPS, …). Tater native BLE uses the device address set on their People "
+                "card and assigns them to the room of the satellite with the strongest fresh "
+                "signal — no Home Assistant needed. Each Person can override this on their card."
+            ),
+        },
+        "follow_me_ble_max_age_seconds": {
+            "label": "Follow-Me BLE Away Timeout (sec)",
+            "type": "number",
+            "default": 90,
+            "description": (
+                "Tater native BLE presence only: how long after the last satellite sighting a "
+                "Person still counts as home. Older than this (they left, the tag stopped "
+                "advertising, battery died) and their music follows the Away Behavior."
             ),
         },
         "follow_me_poll_interval_seconds": {
@@ -481,11 +507,14 @@ DEFAULT_QUEUE_CONFLICT_MODE = "ask"
 SCREEN_TARGET_PREFIX = "screen:"
 SCREEN_PROFILES_KEY = "jarvis_screen:profiles"
 # Follow-Me presence: each linked Person can carry a Home Assistant person
-# entity (e.g. one a BLE tracker updates as they move between rooms). When the
-# entity reports a new room, that Person's queue hands off to it. Per-Person
-# tracking state lives at "personal_music_core:follow_me:<person_id>"; the HA
-# base URL and token are reused from Tater's built-in Home Assistant
-# integration (host-owned key "homeassistant_settings" — read only).
+# entity (e.g. one a BLE tracker updates as they move between rooms), or be
+# tracked by Tater's native BLE presence directly (Tater v1.2.0+ combines the
+# passive BLE observations from every satellite and reports the room with the
+# strongest fresh signal per device address). When the detected room changes,
+# that Person's queue hands off to it. Per-Person tracking state lives at
+# "personal_music_core:follow_me:<person_id>"; the HA base URL and token are
+# reused from Tater's built-in Home Assistant integration (host-owned key
+# "homeassistant_settings" — read only).
 FOLLOW_ME_KEY = "personal_music_core:follow_me"
 HA_SETTINGS_KEY = "homeassistant_settings"
 HA_DEFAULT_BASE_URL = "http://homeassistant.local:8123"
@@ -493,6 +522,16 @@ FOLLOW_ME_TAKEOVER_MODES = ("auto", "ask")
 DEFAULT_FOLLOW_ME_TAKEOVER_MODE = "auto"
 FOLLOW_ME_AWAY_ACTIONS = ("keep_pause", "pause", "keep")
 DEFAULT_FOLLOW_ME_AWAY_ACTION = "keep_pause"
+# Where a tracked Person's location comes from: Home Assistant person entities
+# (any presence stack behind them), or Tater's own satellite BLE presence.
+FOLLOW_ME_PRESENCE_SOURCES = ("home_assistant", "tater_ble")
+DEFAULT_FOLLOW_ME_PRESENCE_SOURCE = "home_assistant"
+# How long after the last BLE sighting a Person still counts as "home"; older
+# than this (the device stopped advertising, they left, battery died) their
+# location reads "not_home" and the away behavior applies.
+FOLLOW_ME_BLE_DEFAULT_MAX_AGE_SECONDS = 90
+# Same shape Tater's native BLE module enforces on satellite-reported addresses.
+BLE_ADDRESS_RE = re.compile(r"^(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$")
 # Voice resume behavior when the paused queue sits somewhere other than the
 # room the speaker is asking from ("resume my music" said from another room).
 RESUME_ROOM_MODES = ("stay", "follow", "ask")
@@ -942,6 +981,8 @@ _PERSON_LINK_TEST_CORE_FIELD_KEYS = (
     "person_link_folder_playlists",
     "person_link_smart_shuffle_enabled",
     "person_link_follow_me_entity",
+    "person_link_follow_me_ble_address",
+    "person_link_follow_me_presence_source",
     "person_link_follow_me_room_overrides",
     "person_link_follow_me_takeover_mode",
     "person_link_follow_me_away_action",
@@ -6403,6 +6444,97 @@ def _ha_person_location(client: Any, entity: str) -> Dict[str, Any]:
     return {"state": _text(data.get("state")), "last_changed": _as_float(data.get("last_changed"))}
 
 
+def _follow_me_presence_source(person_id: Any, client: Any = None) -> str:
+    """Per-Person override, else the global setting, else Home Assistant."""
+    store = client or globals().get("redis_client")
+    value = _text(_person_link(person_id, store).get("follow_me_presence_source")).casefold()
+    if value in FOLLOW_ME_PRESENCE_SOURCES:
+        return value
+    value = _text(_settings(store).get("follow_me_presence_source")).casefold()
+    if value in FOLLOW_ME_PRESENCE_SOURCES:
+        return value
+    return DEFAULT_FOLLOW_ME_PRESENCE_SOURCE
+
+
+def _follow_me_ble_max_age(cfg: Dict[str, Any] | None = None, client: Any = None) -> int:
+    """Fresh-sighting window (s) before an untracked BLE device counts as away."""
+    raw = cfg if cfg is not None else _settings(client)
+    return _as_int(
+        raw.get("follow_me_ble_max_age_seconds"),
+        FOLLOW_ME_BLE_DEFAULT_MAX_AGE_SECONDS,
+        15,
+        900,
+    )
+
+
+def _normalize_ble_address(raw: Any) -> str:
+    """Lowercase, validated BLE address ("" when missing or malformed)."""
+    address = _text(raw).lower()
+    return address if BLE_ADDRESS_RE.fullmatch(address) else ""
+
+
+def _tater_ble_available() -> bool:
+    """Whether Tater's native BLE presence module is importable (v1.2.0+)."""
+    try:
+        from tater_voice import native_ble  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+def _tater_ble_snapshot(*, address: str, max_age_s: int) -> Dict[str, Any] | None:
+    """Tater's native BLE presence snapshot for one address (None when absent).
+
+    The core runs inside Tater, so the snapshot comes from the host module
+    directly — no HTTP, no auth. Indirection so tests can stub the module.
+    """
+    try:
+        from tater_voice import native_ble
+    except Exception as exc:
+        logger.debug("[Music] Tater native BLE presence unavailable: %s", exc)
+        return None
+    try:
+        return native_ble.snapshot(
+            address=address,
+            max_age_s=max_age_s,
+            include_observations=False,
+        )
+    except Exception as exc:
+        logger.debug("[Music] Tater native BLE snapshot failed: %s", exc)
+        return None
+
+
+def _ble_person_location(client: Any, link: Dict[str, Any]) -> Dict[str, Any]:
+    """Current Tater BLE location for a Person link: {"state": ...} or {"error": ...}.
+
+    Same shape as _ha_person_location: the zone is the strongest_room of the
+    Person's device (which satellite heard it last with the best fresh signal),
+    or "not_home" when nothing saw it within the away timeout. Zone "Unknown"
+    means the satellite has no room — the tick treats it as a dead zone.
+    """
+    address = _normalize_ble_address((link or {}).get("follow_me_ble_address"))
+    if not address:
+        return {"error": "ble_address_invalid"}
+    snapshot = _tater_ble_snapshot(
+        address=address,
+        max_age_s=_follow_me_ble_max_age(client=client),
+    )
+    if not isinstance(snapshot, dict) or not snapshot.get("ok"):
+        return {"error": "tater_ble_unavailable"}
+    devices = snapshot.get("devices") or []
+    if not devices:
+        return {"state": "not_home", "source": "tater_ble"}
+    device = devices[0] if isinstance(devices[0], dict) else {}
+    return {
+        "state": _text(device.get("strongest_room")) or "Unknown",
+        "source": "tater_ble",
+        "ble_rssi": _as_int(device.get("strongest_rssi"), -127, -127, 20),
+        "ble_signal": _text(device.get("signal")),
+        "last_seen_age_s": _as_float(device.get("last_seen_age_s")),
+    }
+
+
 def _follow_me_state_key(person_id: Any) -> str:
     return f"{FOLLOW_ME_KEY}:{_text(person_id) or 'shared'}"
 
@@ -6615,14 +6747,12 @@ def _follow_me_apply_away_action(
 
 
 def _follow_me_tick(client: Any = None) -> Dict[str, Any]:
-    """One pass: check every linked Person's HA entity and follow the movers."""
+    """One pass: check every linked Person's presence source and follow the movers."""
     store = client or globals().get("redis_client")
     with _follow_me_lock:
         cfg = _settings(store)
         if not _follow_me_follow_enabled(cfg):
             return {"ok": True, "skipped": "disabled"}
-        if not _text(_ha_config(store).get("token")):
-            return {"ok": True, "skipped": "ha_not_configured"}
         delay = _follow_me_move_delay(cfg)
         now = time.time()
         summary: Dict[str, Any] = {
@@ -6634,9 +6764,16 @@ def _follow_me_tick(client: Any = None) -> Dict[str, Any]:
             "errors": [],
         }
         for person_id, link in _person_links(store).items():
-            entity = _text(link.get("follow_me_person_entity"))
-            if not entity:
-                continue
+            if _follow_me_presence_source(person_id, store) == "tater_ble":
+                # BLE tracking works without Home Assistant entirely.
+                if not _normalize_ble_address(link.get("follow_me_ble_address")):
+                    continue
+                location = _ble_person_location(store, link)
+            else:
+                entity = _text(link.get("follow_me_person_entity"))
+                if not entity:
+                    continue
+                location = _ha_person_location(store, entity)
             summary["checked"] += 1
             state = _follow_me_state(person_id, store)
             player = _player(store, _queue_id_for_person(person_id))
@@ -6646,7 +6783,6 @@ def _follow_me_tick(client: Any = None) -> Dict[str, Any]:
                 player.get("status")
             ).lower() == "playing":
                 state.pop("paused_by_follow_me", None)
-            location = _ha_person_location(store, entity)
             if "error" in location:
                 state.update(
                     {
@@ -13246,6 +13382,22 @@ def _follow_me_link_fields(
     """Follow-Me presence fields shared by the People section cards."""
     return [
         {
+            "key": "person_link_follow_me_presence_source",
+            "label": "Presence Source",
+            "type": "select",
+            "value": _text(link.get("follow_me_presence_source")),
+            "options": [
+                {"value": "", "label": "Use global setting"},
+                {"value": "home_assistant", "label": "Home Assistant person entity"},
+                {"value": "tater_ble", "label": "Tater native BLE presence"},
+            ],
+            "description": (
+                "Where this Person's location comes from: the Home Assistant person entity below, "
+                "or Tater's satellite BLE presence by device address. The default follows the "
+                "Follow-Me Presence Source core setting."
+            ),
+        },
+        {
             "key": "person_link_follow_me_entity",
             "label": "Home Assistant Person",
             "type": "text",
@@ -13253,8 +13405,22 @@ def _follow_me_link_fields(
             "placeholder": "person.john",
             "description": (
                 "The Home Assistant person entity for this Person (updated as they move, for "
-                "example by your BLE trackers). With Follow-Me enabled, their music follows "
-                "them to the room this entity reports."
+                "example by your BLE trackers). With Follow-Me enabled and the Home Assistant "
+                "source, their music follows them to the room this entity reports."
+            ),
+        },
+        {
+            "key": "person_link_follow_me_ble_address",
+            "label": "Tater BLE Address",
+            "type": "text",
+            "value": _text(link.get("follow_me_ble_address")),
+            "placeholder": "aa:bb:cc:dd:ee:ff",
+            "description": (
+                "The BLE device address Tater tracks for this Person (a key fob, badge, phone, "
+                "or watch that advertises to your satellites). With Follow-Me enabled and the "
+                "Tater native BLE source, their music follows the room of the satellite with "
+                "the strongest fresh signal — no Home Assistant needed. Find the address under "
+                "Tater's Satellites → Presence UI."
             ),
         },
         {
@@ -13264,8 +13430,9 @@ def _follow_me_link_fields(
             "value": _text(link.get("follow_me_room_overrides")),
             "placeholder": "The Kitchen=Kitchen, Guest Room=Beds",
             "description": (
-                "Map Home Assistant zone names to Tater room names when they differ, so the "
-                "right room is used automatically. Comma-separated Zone=Room pairs."
+                "Map reported zone or room names to Tater room names when they differ, so the "
+                "right room is used automatically. Comma-separated Zone=Room pairs. Applies to "
+                "Home Assistant zones and Tater BLE satellite rooms alike."
             ),
         },
         {
@@ -13345,7 +13512,15 @@ def _follow_me_card_status(
     """Short follow-me status for a Person card subtitle ("" when not shown)."""
     if not _follow_me_follow_enabled(cfg):
         return ""
-    if not _text(link.get("follow_me_person_entity")):
+    # The source may ride the link being rendered (the add-link card has no
+    # stored link yet); otherwise resolve it like the tick does.
+    source = _text(link.get("follow_me_presence_source")).casefold()
+    if source not in FOLLOW_ME_PRESENCE_SOURCES:
+        source = _follow_me_presence_source(person_id, store)
+    if source == "tater_ble":
+        if not _normalize_ble_address(link.get("follow_me_ble_address")):
+            return ""
+    elif not _text(link.get("follow_me_person_entity")):
         return ""
     state = _follow_me_state(person_id, store)
     status = _text(state.get("status"))
@@ -13357,6 +13532,8 @@ def _follow_me_card_status(
             "ha_not_configured": "Home Assistant not configured in Tater",
             "entity_not_found": "person entity not found in Home Assistant",
             "ha_unauthorized": "Home Assistant token was rejected",
+            "tater_ble_unavailable": "Tater BLE presence unavailable (needs Tater v1.2.0+)",
+            "ble_address_invalid": "BLE address missing or malformed on this Person's card",
         }
         return f"Follow-me: {labels.get(error, error) or 'unreachable'}"
     if status == "awaiting_confirmation":
@@ -14583,12 +14760,25 @@ def _save_person_link_action(values: Dict[str, Any], store: Any) -> Dict[str, An
         link[link_key] = min(600, max(0, parsed))
     if "person_link_follow_me_entity" in values:
         link["follow_me_person_entity"] = _text(values.get("person_link_follow_me_entity")).strip()
+    if "person_link_follow_me_ble_address" in values:
+        # Tater reports addresses lowercased; store them the same way.
+        link["follow_me_ble_address"] = _text(
+            values.get("person_link_follow_me_ble_address")
+        ).strip().lower()
     if "person_link_follow_me_room_overrides" in values:
         link["follow_me_room_overrides"] = _text(
             values.get("person_link_follow_me_room_overrides")
         ).strip()
     # Selects inherit the stored value when the payload carries an invalid one,
-    # so a stale form can never wipe a saved mode.
+    # so a stale form can never wipe a saved mode. The presence-source select
+    # is different: "" is a real option ("Use global setting"), so a carried
+    # empty value clears the override instead of inheriting it.
+    if "person_link_follow_me_presence_source" in values:
+        follow_source = _text(values.get("person_link_follow_me_presence_source")).casefold()
+        if follow_source in FOLLOW_ME_PRESENCE_SOURCES:
+            link["follow_me_presence_source"] = follow_source
+        else:
+            link.pop("follow_me_presence_source", None)
     follow_takeover = _text(values.get("person_link_follow_me_takeover_mode")).casefold()
     if follow_takeover not in FOLLOW_ME_TAKEOVER_MODES:
         follow_takeover = _text(existing.get("follow_me_takeover_mode")).casefold()
@@ -15762,6 +15952,29 @@ def get_core_system_tasks(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
     follow_me_interval = _follow_me_poll_interval(cfg)
     last_follow_me = _as_float(runtime.get("last_follow_me_at"))
     follow_me_ha_ready = bool(_text(_ha_config(store).get("token")))
+    follow_me_ble_ready = _tater_ble_available()
+    # Readiness follows the sources the linked People actually use (the global
+    # default when none are linked): Home Assistant needs its integration,
+    # native BLE needs Tater's presence module.
+    follow_me_sources = {
+        _follow_me_presence_source(person_id, store) for person_id in _person_links(store)
+    } or {_follow_me_presence_source("", store)}
+    follow_me_ready = all(
+        follow_me_ha_ready if source == "home_assistant" else follow_me_ble_ready
+        for source in follow_me_sources
+    )
+    follow_me_source_reasons = []
+    if "home_assistant" in follow_me_sources and not follow_me_ha_ready:
+        follow_me_source_reasons.append(
+            "Enable the Home Assistant integration in Tater (base URL and token) before "
+            "Follow-Me can track People."
+        )
+    if "tater_ble" in follow_me_sources and not follow_me_ble_ready:
+        follow_me_source_reasons.append(
+            "Follow-Me BLE tracking needs Tater v1.2.0+ (its native BLE presence module is not "
+            "available in this host)."
+        )
+    follow_me_unavailable_reason = " ".join(follow_me_source_reasons)
     return {
         "label": "Personal Music Core",
         "order": 36,
@@ -15881,7 +16094,7 @@ def get_core_system_tasks(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
             {
                 "id": "follow_me",
                 "label": "Follow-Me Presence",
-                "description": "Checks linked People's Home Assistant person entities and moves their music to the room they're in.",
+                "description": "Checks linked People's presence (Home Assistant or Tater BLE) and moves their music to the room they're in.",
                 "interval_seconds": follow_me_interval,
                 "enabled": follow_me_enabled,
                 "running": bool(_follow_me_lock.locked()),
@@ -15900,14 +16113,9 @@ def get_core_system_tasks(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
                     0,
                     1_000_000_000,
                 ),
-                "available": follow_me_ha_ready,
-                "unavailable_reason": (
-                    "Enable the Home Assistant integration in Tater (base URL and token) before "
-                    "Follow-Me can track People."
-                    if not follow_me_ha_ready
-                    else ""
-                ),
-                "status": "idle" if follow_me_enabled and follow_me_ha_ready else "waiting",
+                "available": follow_me_ready,
+                "unavailable_reason": follow_me_unavailable_reason,
+                "status": "idle" if follow_me_enabled and follow_me_ready else "waiting",
                 "requires_running": True,
                 "order": 50,
             },
@@ -16386,7 +16594,7 @@ def run(stop_event: Optional[object] = None) -> None:
                             queue_id or "shared",
                             exc,
                         )
-                # Follow-Me presence: check linked People's Home Assistant
+                # Follow-Me presence: check linked People's location source
                 # person entities and hand their queues off to new rooms.
                 if _as_bool(cfg.get("follow_me_enabled"), False) and now - _as_float(
                     runtime.get("last_follow_me_at")
