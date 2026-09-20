@@ -476,8 +476,7 @@ class CustomMusicCoreTests(unittest.TestCase):
             link = core._person_link("person_zoe", self.redis)
             self.assertEqual(link["emby"]["library_name"], "Zoe Media")
             self.assertEqual(link["emby"]["library_folder"], "Music")
-            # The editor carries the folder field back to the form.
-            core._save_person_link_edit_target("person_zoe", self.redis)
+            # Every link card carries the form, so the folder field is there.
             cards = {
                 item["id"]: item
                 for item in core._person_link_items(core._settings(self.redis), self.redis)
@@ -486,7 +485,6 @@ class CustomMusicCoreTests(unittest.TestCase):
             self.assertEqual(fields["person_link_emby_library_folder"]["value"], "Music")
         finally:
             core._PEOPLE_API_MODULE = original_people
-            core._clear_person_link_edit_target(self.redis)
 
     def test_link_remove_clears_queue_and_per_person_state(self):
         people = types.SimpleNamespace(
@@ -1453,36 +1451,25 @@ class PerPersonLinkageTests(unittest.TestCase):
             self.link_person()
             data = self.core.get_htmlui_tab_data(redis_client=self.redis)
             cards = {item.get("id"): item for item in data["ui"]["item_forms"]}
-            # Compact cards stay out of the way: Edit and Remove only.
+            # Every card always carries its full form for the host's Edit modal
+            # (ui.item_fields_popup), plus its own Test Connection action.
             for card_id in ("person:person_zoe", "person:new"):
-                actions = [a.get("action") for a in cards[card_id].get("actions") or []]
-                self.assertIn("music_person_link_edit", actions)
-                self.assertNotIn("music_person_link_test", actions)
-                self.assertNotIn("fields", cards[card_id])
-            # Editing opens the full form for that Person (or the add form).
-            core._save_person_link_edit_target("person_zoe", self.redis)
-            data = self.core.get_htmlui_tab_data(redis_client=self.redis)
-            cards = {item.get("id"): item for item in data["ui"]["item_forms"]}
-            self.assertIn(
-                "music_person_link_test",
-                [a.get("action") for a in cards["person:person_zoe"]["actions"]],
-            )
-            core._save_person_link_edit_target("new", self.redis)
-            data = self.core.get_htmlui_tab_data(redis_client=self.redis)
-            cards = {item.get("id"): item for item in data["ui"]["item_forms"]}
-            self.assertIn(
-                "music_person_link_test",
-                [a.get("action") for a in cards["person:new"]["actions"]],
-            )
+                card = cards[card_id]
+                self.assertTrue(card.get("fields"))
+                self.assertTrue(card.get("fields_popup"))
+                self.assertEqual(card.get("save_action"), "music_person_link_save")
+                self.assertTrue(card.get("settings_label"))
+                self.assertTrue(card.get("settings_title"))
+                actions = [a.get("action") for a in card.get("actions") or []]
+                self.assertIn("music_person_link_test", actions)
+                self.assertNotIn("music_person_link_edit", actions)
         finally:
             self.core._PEOPLE_API_MODULE = original_people
-            core._clear_person_link_edit_target(self.redis)
 
     def test_person_link_test_result_and_typed_values_survive_refetch(self):
-        # The tab UI refetches after every action and only toasts errors, so the
-        # core records the test outcome and the typed values for the cards to
-        # prefill — otherwise a passing test looks like nothing happened and
-        # the form empties itself.
+        # The tab UI toasts a test's success message and preserves the unsaved
+        # form edits across its post-action refetch (Tater v1.2.0+); the core
+        # only records the outcome so its summary row outlives the toast.
         people = types.SimpleNamespace(
             load_store=lambda _client=None: {
                 "people": [
@@ -1515,10 +1502,8 @@ class PerPersonLinkageTests(unittest.TestCase):
         self.core.EmbyMusicProvider = StubEmby
         try:
             self.link_person()
-            # The editor card is what carries the form, so open it for Zoe.
-            self.core._save_person_link_edit_target("person_zoe", self.redis)
-            # A passing test is recorded and shown on the linked person's card,
-            # with the password left blank (blank still means keep the saved one).
+            # A passing test returns its message for the host to toast, and the
+            # linked person's card keeps showing the outcome as a summary row.
             draft = {
                 "person_link_person_id": "person_zoe",
                 "person_link_source": "emby",
@@ -1538,16 +1523,17 @@ class PerPersonLinkageTests(unittest.TestCase):
                 for row in cards["person:person_zoe"].get("summary_rows") or []
             }
             self.assertIn("passed", " ".join(linked_rows))
+            # The form keeps the saved link's values; typed draft values are not
+            # prefilled back (the host preserves unsaved edits across refetches).
             linked_fields = {
                 field["key"]: field["value"]
                 for field in cards["person:person_zoe"]["fields"]
             }
-            self.assertEqual(linked_fields["person_link_emby_server_url"], "http://emby.local:8096")
-            self.assertEqual(linked_fields["person_link_emby_username"], "zoe")
+            self.assertEqual(linked_fields["person_link_share_root_path"], self.share_root)
+            self.assertEqual(linked_fields["person_link_emby_server_url"], "")
             self.assertEqual(linked_fields["person_link_emby_password"], "")
-            # A failing test for a not-yet-linked person prefills the new-link
-            # editor, including the chosen Person and the typed password.
-            self.core._save_person_link_edit_target("new", self.redis)
+            # A failing test for a not-yet-linked person shows its outcome on
+            # the add-link card without touching the form values.
             with self.assertRaises(ValueError):
                 self.core._test_person_link_source_action(
                     {
@@ -1568,15 +1554,14 @@ class PerPersonLinkageTests(unittest.TestCase):
             new_fields = {
                 field["key"]: field["value"] for field in cards["person:new"]["fields"]
             }
-            self.assertEqual(new_fields["person_link_person_id"], "person_ama")
-            self.assertEqual(new_fields["person_link_emby_password"], "ama-pw")
+            self.assertEqual(new_fields["person_link_person_id"], "")
+            self.assertEqual(new_fields["person_link_emby_password"], "")
             # Saving or removing the link clears the recorded test state.
             self.core._clear_person_link_test_state("person_ama", self.redis)
             self.assertEqual(self.core._person_link_test_state(self.redis), {})
         finally:
             self.core._PEOPLE_API_MODULE = original_people
             self.core.EmbyMusicProvider = original_provider
-            self.core._clear_person_link_edit_target(self.redis)
         original_people = self.core._PEOPLE_API_MODULE
         self.core._PEOPLE_API_MODULE = types.SimpleNamespace(
             load_store=lambda _client=None: {
@@ -1830,84 +1815,6 @@ class PerPersonLinkageTests(unittest.TestCase):
             )
         finally:
             self.core._PEOPLE_API_MODULE = original_people
-
-    def test_edit_flow_opens_and_closes_the_link_editor(self):
-        people = types.SimpleNamespace(
-            load_store=lambda _client=None: {
-                "people": [
-                    {"id": "person_zoe", "display_name": "Zoe"},
-                    {"id": "person_ama", "display_name": "Ama"},
-                ]
-            }
-        )
-        original_people = self.core._PEOPLE_API_MODULE
-        self.core._PEOPLE_API_MODULE = people
-        try:
-            self.link_person()
-            # Edit flips that Person's compact card into the full form.
-            result = self.core.handle_htmlui_tab_action(
-                action="music_person_link_edit",
-                payload={"values": {}, "id": "person:person_zoe"},
-                redis_client=self.redis,
-            )
-            self.assertTrue(result["ok"], result)
-            self.assertEqual(self.core._person_link_edit_target(self.redis), "person_zoe")
-            cards = {
-                item["id"]: item
-                for item in self.core._person_link_items(
-                    self.core._settings(self.redis), self.redis
-                )
-            }
-            self.assertIn("fields", cards["person:person_zoe"])
-            self.assertNotIn("fields", cards["person:new"])
-            # Cancel closes it; the add form opens with the "new" target.
-            self.core.handle_htmlui_tab_action(
-                action="music_person_link_edit_cancel",
-                payload={"values": {}},
-                redis_client=self.redis,
-            )
-            self.assertEqual(self.core._person_link_edit_target(self.redis), "")
-            self.core.handle_htmlui_tab_action(
-                action="music_person_link_edit",
-                payload={"values": {"person_link_person_id": "new"}},
-                redis_client=self.redis,
-            )
-            cards = {
-                item["id"]: item
-                for item in self.core._person_link_items(
-                    self.core._settings(self.redis), self.redis
-                )
-            }
-            self.assertIn("fields", cards["person:new"])
-            self.assertNotIn("fields", cards["person:person_zoe"])
-            # Only linked People (or the add form) can be opened for editing.
-            self.core._clear_person_link_edit_target(self.redis)
-            with self.assertRaises(ValueError):
-                self.core.handle_htmlui_tab_action(
-                    action="music_person_link_edit",
-                    payload={"values": {"person_link_person_id": "person_ama"}},
-                    redis_client=self.redis,
-                )
-            # Saving a link closes the editor as well.
-            self.core.handle_htmlui_tab_action(
-                action="music_person_link_edit",
-                payload={"values": {"person_link_person_id": "person_zoe"}},
-                redis_client=self.redis,
-            )
-            self.core.handle_htmlui_tab_action(
-                action="music_person_link_save",
-                payload={
-                    "values": {
-                        "person_link_person_id": "person_zoe",
-                        "person_link_source": "",
-                    }
-                },
-                redis_client=self.redis,
-            )
-            self.assertEqual(self.core._person_link_edit_target(self.redis), "")
-        finally:
-            self.core._PEOPLE_API_MODULE = original_people
-            self.core._clear_person_link_edit_target(self.redis)
 
     def test_view_as_switch_syncs_empty_person_library(self):
         people = types.SimpleNamespace(
@@ -3096,20 +3003,16 @@ class FollowMeTests(unittest.TestCase):
             cards = {item["id"]: item for item in core._person_link_items(core._settings(self.redis), self.redis)}
             self.assertIn("person:person_zoe", cards)
             self.assertIn("person:new", cards)
-            # The follow-me status shows on the compact card; the fields live
-            # in the editor that the card's Edit action opens.
+            # The follow-me status shows on the card; its fields ride the form
+            # the card's Edit modal opens.
             self.assertIn("Follow-me: in Kitchen → Kitchen", cards["person:person_zoe"]["subtitle"])
-            core._save_person_link_edit_target("person_zoe", self.redis)
-            cards = {item["id"]: item for item in core._person_link_items(core._settings(self.redis), self.redis)}
             fields = {field["key"]: field for field in cards["person:person_zoe"]["fields"]}
             self.assertEqual(fields["person_link_follow_me_entity"]["value"], "person.zoe")
             self.assertEqual(fields["person_link_follow_me_room_overrides"]["value"], "The Kitchen=Kitchen")
             self.assertEqual(fields["person_link_follow_me_takeover_mode"]["value"], "ask")
             self.assertEqual(fields["person_link_follow_me_away_action"]["value"], "pause")
             self.assertIn("Follow-me: in Kitchen → Kitchen", cards["person:person_zoe"]["subtitle"])
-            # The new-link editor carries the same fields, defaulted from settings.
-            core._save_person_link_edit_target("new", self.redis)
-            cards = {item["id"]: item for item in core._person_link_items(core._settings(self.redis), self.redis)}
+            # The add-link card carries the same fields, defaulted from settings.
             new_fields = {field["key"]: field for field in cards["person:new"]["fields"]}
             self.assertEqual(new_fields["person_link_follow_me_takeover_mode"]["value"], "auto")
             self.assertEqual(new_fields["person_link_follow_me_away_action"]["value"], "keep_pause")
@@ -3126,7 +3029,6 @@ class FollowMeTests(unittest.TestCase):
             )
         finally:
             core._PEOPLE_API_MODULE = original_people
-            core._clear_person_link_edit_target(self.redis)
 
     def test_link_save_persists_follow_me_fields(self):
         core = self.core
@@ -4952,7 +4854,6 @@ class ProviderFoundationTests(unittest.TestCase):
         original_people = self.core._PEOPLE_API_MODULE
         self.core._PEOPLE_API_MODULE = people
         try:
-            self.core._save_person_link_edit_target("new", self.redis)
             data = self.core.get_htmlui_tab_data(redis_client=self.redis)
             cards = {item.get("id"): item for item in data["ui"]["item_forms"]}
             keys = {field["key"] for field in cards["person:new"]["fields"]}
