@@ -3078,6 +3078,7 @@ class FollowMeTests(unittest.TestCase):
         """Point Tater's native BLE snapshot at fakes (like stub_ha)."""
         core = self.core
         self.ble_devices = {}
+        self.ble_observations = []
         self.ble_queries = []
         self._originals["_tater_ble_snapshot"] = core._tater_ble_snapshot
         # Room resolution matches stub_ha's fake (setdefault: stub_ha may have
@@ -3087,12 +3088,30 @@ class FollowMeTests(unittest.TestCase):
             str(name), ""
         )
 
-        def fake_snapshot(*, address, max_age_s):
-            self.ble_queries.append({"address": address, "max_age_s": max_age_s})
+        def fake_snapshot(*, address, max_age_s, include_observations=False):
+            self.ble_queries.append(
+                {
+                    "address": address,
+                    "max_age_s": max_age_s,
+                    "include_observations": include_observations,
+                }
+            )
             devices = self.ble_devices.get(address)
             if devices is None:  # None simulates the module being unavailable
                 return None
-            return {"ok": True, "devices": list(devices), "device_count": len(devices)}
+            snapshot = {
+                "ok": True,
+                "devices": list(devices),
+                "device_count": len(devices),
+                "generated_ts": time.time(),
+            }
+            if include_observations:
+                # Simulated satellite observations: (room, rssi, age seconds ago).
+                snapshot["observations"] = [
+                    {"room": room, "rssi": rssi, "received_ts": snapshot["generated_ts"] - age}
+                    for room, rssi, age in self.ble_observations
+                ]
+            return snapshot
 
         core._tater_ble_snapshot = fake_snapshot
 
@@ -3145,10 +3164,11 @@ class FollowMeTests(unittest.TestCase):
                 "last_seen_age_s": 1.2,
             },
         )
-        # The snapshot is queried for the Person's address within the away timeout.
+        # The snapshot is queried for the Person's address within the away
+        # timeout, without observations (no Prompt-Stop pass needs them).
         self.assertEqual(
             self.ble_queries,
-            [{"address": "aa:bb:cc:dd:ee:ff", "max_age_s": 90}],
+            [{"address": "aa:bb:cc:dd:ee:ff", "max_age_s": 90, "include_observations": False}],
         )
         # Not seen within the timeout: away, like HA's not_home.
         self.ble_devices["aa:bb:cc:dd:ee:ff"] = []
@@ -3210,6 +3230,310 @@ class FollowMeTests(unittest.TestCase):
         self.assertEqual(summary["paused"], 1)
         self.assertEqual(core._player(self.redis, "person_a")["status"], "paused")
         self.assertEqual(core._follow_me_state("person_a", self.redis)["status"], "paused_away")
+
+    # ---- Prompt-Stop & Rewind (Tater native BLE source) ----
+
+    def enable_prompt_stop(self, rewind="30"):
+        self.redis.hset(
+            self.core.SETTINGS_KEY,
+            mapping={
+                "follow_me_ble_prompt_stop": "1",
+                "follow_me_ble_rewind_max_seconds": rewind,
+            },
+        )
+
+    def ble_in_room(self, room, *, rssi=-58, obs_age=0.5, room_changed_ts=None):
+        device = {
+            "address": "aa:bb:cc:dd:ee:ff",
+            "strongest_room": room,
+            "strongest_rssi": rssi,
+            "last_seen_age_s": obs_age,
+        }
+        if room_changed_ts is not None:
+            device["room_changed_ts"] = room_changed_ts
+        self.ble_devices["aa:bb:cc:dd:ee:ff"] = [device]
+        self.ble_observations = [(room, rssi, obs_age)]
+
+    def link_ble_person(self, **extra):
+        self.link_person(
+            "person_a",
+            entity="",
+            follow_me_presence_source="tater_ble",
+            follow_me_ble_address="AA:BB:CC:DD:EE:FF",
+            **extra,
+        )
+
+    def test_ble_person_location_probes_the_room_signal(self):
+        core = self.core
+        self.stub_ble()
+        link = {"follow_me_ble_address": "aa:bb:cc:dd:ee:ff"}
+        self.ble_devices["aa:bb:cc:dd:ee:ff"] = [
+            {
+                "address": "aa:bb:cc:dd:ee:ff",
+                "strongest_room": "Kitchen",
+                "strongest_rssi": -60,
+                "last_seen_age_s": 2.0,
+                "room_changed_ts": 1234.0,
+            }
+        ]
+        self.ble_observations = [("Kitchen", -61, 2.0), ("Office", -80, 1.0)]
+        # Without the probe: no room-signal fields, observations not requested.
+        plain = core._ble_person_location(self.redis, link)
+        self.assertNotIn("room_rssi", plain)
+        self.assertNotIn("room_seen_age_s", plain)
+        self.assertFalse(self.ble_queries[-1]["include_observations"])
+        # With the probe: how freshly and strongly the assigned room's own
+        # satellite hears them, plus the assignment's flip timestamp.
+        probed = core._ble_person_location(self.redis, link, probe_room_signal=True)
+        self.assertTrue(self.ble_queries[-1]["include_observations"])
+        self.assertEqual(probed["room_rssi"], -61)
+        self.assertAlmostEqual(probed["room_seen_age_s"], 2.0, delta=0.2)
+        self.assertEqual(probed["room_changed_ts"], 1234.0)
+        # A device row without a flip timestamp just omits the field.
+        self.ble_devices["aa:bb:cc:dd:ee:ff"] = [
+            {"address": "aa:bb:cc:dd:ee:ff", "strongest_room": "Kitchen"}
+        ]
+        self.assertNotIn("room_changed_ts", core._ble_person_location(self.redis, link, probe_room_signal=True))
+
+    def test_follow_me_ble_prompt_stop_pauses_on_signal_decay_and_rewinds(self):
+        core = self.core
+        self.stub_playback()
+        self.stub_ble()
+        self.enable_follow_me(delay="0")
+        self.enable_prompt_stop()
+        self.link_ble_person()
+        self.room_targets["Kitchen"] = "voice_core:native:kitchen"
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"], position=30.0, elapsed=10.0)
+        # Kitchen's satellite last heard them 30s ago: out of earshot.
+        self.ble_in_room("Kitchen", rssi=-60, obs_age=30.0)
+        # First degraded pass arms the grace window; the music keeps playing.
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["prompt_stopped"], 0)
+        self.assertEqual(core._player(self.redis, "person_a")["status"], "playing")
+        state = core._follow_me_state("person_a", self.redis)
+        self.assertGreater(float(state.get("prompt_stop_candidate_ts") or 0), 0)
+        # Still inside the grace window: no pause yet.
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["prompt_stopped"], 0)
+        # Past the grace window: Prompt-Stop pauses the music in place.
+        state["prompt_stop_candidate_ts"] = float(state["prompt_stop_candidate_ts"]) - 30.0
+        core._save_follow_me_state("person_a", state, self.redis)
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["prompt_stopped"], 1)
+        self.assertEqual(summary["paused"], 0)
+        self.assertEqual(core._player(self.redis, "person_a")["status"], "paused")
+        state = core._follow_me_state("person_a", self.redis)
+        self.assertTrue(state.get("paused_by_follow_me"))
+        self.assertEqual(state.get("prompt_stop_room_target"), "voice_core:native:kitchen")
+        self.assertEqual(state["status"], "prompt_stop")
+        # While the room's satellite still hears nothing fresh, the hold keeps
+        # the music parked: no move, no resume.
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["moved"], 0)
+        self.assertEqual(core._player(self.redis, "person_a")["status"], "paused")
+        self.assertEqual(core._follow_me_state("person_a", self.redis)["status"], "prompt_stop")
+        # They walk back in: fresh sightings lift the hold and the resume
+        # rewinds by the estimated detection lag (capped at 30s here).
+        self.ble_in_room("Kitchen", rssi=-60, obs_age=0.5)
+        state = core._follow_me_state("person_a", self.redis)
+        state["prompt_stop_earshot_ts"] = float(state["prompt_stop_paused_ts"]) - 20.0
+        core._save_follow_me_state("person_a", state, self.redis)
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["moved"], 1)
+        player = core._player(self.redis, "person_a")
+        self.assertEqual(player["status"], "playing")
+        self.assertAlmostEqual(self.played[-1]["start_position"], 20.0, delta=1.5)
+        state = core._follow_me_state("person_a", self.redis)
+        self.assertNotIn("paused_by_follow_me", state)
+        self.assertNotIn("prompt_stop_earshot_ts", state)
+        self.assertEqual(state["status"], "following")
+
+    def test_follow_me_ble_prompt_stop_rewind_is_capped(self):
+        core = self.core
+        self.stub_playback()
+        self.stub_ble()
+        self.enable_follow_me(delay="0")
+        self.enable_prompt_stop(rewind="5")
+        self.link_ble_person()
+        self.room_targets["Kitchen"] = "voice_core:native:kitchen"
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"], position=30.0, elapsed=10.0)
+        self.ble_in_room("Kitchen", rssi=-60, obs_age=30.0)
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["prompt_stopped"], 0)
+        state = core._follow_me_state("person_a", self.redis)
+        state["prompt_stop_candidate_ts"] = float(state["prompt_stop_candidate_ts"]) - 30.0
+        core._save_follow_me_state("person_a", state, self.redis)
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["prompt_stopped"], 1)
+        state = core._follow_me_state("person_a", self.redis)
+        state["prompt_stop_earshot_ts"] = float(state["prompt_stop_paused_ts"]) - 120.0
+        core._save_follow_me_state("person_a", state, self.redis)
+        self.ble_in_room("Kitchen", rssi=-60, obs_age=0.5)
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["moved"], 1)
+        # The 120s gap rewinds only to the 5s cap.
+        self.assertAlmostEqual(self.played[-1]["start_position"], 35.0, delta=1.5)
+
+    def test_follow_me_ble_prompt_stop_pauses_on_room_flip(self):
+        core = self.core
+        self.stub_playback()
+        self.stub_ble()
+        self.enable_follow_me(delay="20")
+        self.enable_prompt_stop()
+        self.link_ble_person()
+        self.room_targets["Kitchen"] = "voice_core:native:kitchen"
+        self.room_targets["Office"] = "voice_core:native:office"
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"], position=30.0, elapsed=10.0)
+        self.ble_in_room("Kitchen", rssi=-60, obs_age=0.5)
+        # Settled in the Kitchen (the Move Delay has not elapsed yet).
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["prompt_stopped"], 0)
+        self.assertEqual(summary["moved"], 0)
+        self.assertEqual(core._follow_me_state("person_a", self.redis)["zone"], "Kitchen")
+        # The assignment flips to the Office: Prompt-Stop pauses right away,
+        # before the Move Delay's arrival dwell, anchored on the flip time.
+        flip_ts = time.time() - 8.0
+        self.ble_in_room("Office", rssi=-58, obs_age=0.5, room_changed_ts=flip_ts)
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["prompt_stopped"], 1)
+        self.assertEqual(summary["moved"], 0)
+        self.assertEqual(core._player(self.redis, "person_a")["status"], "paused")
+        state = core._follow_me_state("person_a", self.redis)
+        self.assertEqual(state.get("prompt_stop_room_target"), "voice_core:native:kitchen")
+        self.assertEqual(state.get("prompt_stop_room_name"), "Kitchen")
+        self.assertAlmostEqual(
+            float(state.get("prompt_stop_earshot_ts")), flip_ts - 10.0, delta=2.0
+        )
+        # Once the Move Delay elapses, the music hands off to the Office,
+        # resumed with the rewind.
+        state["prompt_stop_earshot_ts"] = float(state["prompt_stop_paused_ts"]) - 15.0
+        state["zone_since"] = float(state["zone_since"]) - 30.0
+        core._save_follow_me_state("person_a", state, self.redis)
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["moved"], 1)
+        player = core._player(self.redis, "person_a")
+        self.assertEqual(player["targets"], ["voice_core:native:office"])
+        self.assertEqual(player["status"], "playing")
+        self.assertAlmostEqual(self.played[-1]["start_position"], 25.0, delta=1.5)
+
+    def test_follow_me_ble_prompt_stop_requires_enabling_and_ble_source(self):
+        core = self.core
+        self.stub_playback()
+        self.stub_ble()
+        self.stub_ha()
+        self.enable_follow_me(delay="0")
+        self.link_ble_person()
+        self.room_targets["Kitchen"] = "voice_core:native:kitchen"
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"], position=30.0, elapsed=10.0)
+        # Degraded signal with the feature off: the music keeps playing.
+        self.ble_in_room("Kitchen", rssi=-60, obs_age=30.0)
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["prompt_stopped"], 0)
+        self.assertEqual(core._player(self.redis, "person_a")["status"], "playing")
+        self.assertNotIn("prompt_stop_candidate_ts", core._follow_me_state("person_a", self.redis))
+        # Enabled, but a Home Assistant person entity does not prompt-stop:
+        # zone flips keep the normal Move Delay behavior.
+        self.enable_prompt_stop()
+        self.enable_follow_me(delay="20")
+        self.link_person("person_a", "person.john")
+        self.ha_states["person.john"] = {"state": "Office"}
+        self.room_targets["Office"] = "voice_core:native:office"
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["prompt_stopped"], 0)
+        self.assertEqual(summary["paused"], 0)
+        self.assertEqual(summary["moved"], 0)
+        self.assertEqual(core._follow_me_state("person_a", self.redis)["status"], "tracking")
+
+    def test_follow_me_ble_prompt_stop_cleared_by_manual_playback(self):
+        core = self.core
+        self.stub_playback()
+        self.stub_ble()
+        self.enable_follow_me(delay="0")
+        self.enable_prompt_stop()
+        self.link_ble_person()
+        self.room_targets["Kitchen"] = "voice_core:native:kitchen"
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"], position=30.0, elapsed=10.0)
+        self.ble_in_room("Kitchen", rssi=-60, obs_age=30.0)
+        core._follow_me_tick(self.redis)
+        state = core._follow_me_state("person_a", self.redis)
+        state["prompt_stop_candidate_ts"] = float(state["prompt_stop_candidate_ts"]) - 30.0
+        core._save_follow_me_state("person_a", state, self.redis)
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["prompt_stopped"], 1)
+        # The Person manually restarts playback: the supersede clears the
+        # prompt-stop hold and the pending rewind together.
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"], position=5.0, elapsed=0.0)
+        core._follow_me_tick(self.redis)
+        state = core._follow_me_state("person_a", self.redis)
+        self.assertNotIn("paused_by_follow_me", state)
+        self.assertNotIn("prompt_stop_room_target", state)
+        self.assertNotIn("prompt_stop_earshot_ts", state)
+        self.assertEqual(state["status"], "following")
+
+    # ---- per-Person transit rooms ----
+
+    def test_follow_me_transit_room_pauses_instead_of_moving(self):
+        core = self.core
+        self.stub_playback()
+        self.stub_ble()
+        self.enable_follow_me(delay="0")
+        self.link_ble_person(follow_me_transit_rooms="Hallway, Laundry Room")
+        self.room_targets["Kitchen"] = "voice_core:native:kitchen"
+        self.room_targets["Laundry Room"] = "voice_core:native:laundry"
+        self.room_targets["Office"] = "voice_core:native:office"
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"], position=30.0, elapsed=10.0)
+        # They linger in a transit room past the Move Delay: the music is
+        # paused in place, never moved into the transit room.
+        self.ble_in_room("Laundry Room")
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["transit_pauses"], 1)
+        self.assertEqual(summary["moved"], 0)
+        player = core._player(self.redis, "person_a")
+        self.assertEqual(player["status"], "paused")
+        self.assertEqual(player["targets"], ["voice_core:native:kitchen"])
+        state = core._follow_me_state("person_a", self.redis)
+        self.assertEqual(state["status"], "paused_transit")
+        self.assertTrue(state.get("paused_by_follow_me"))
+        # Reaching a real room resumes the music there.
+        self.ble_in_room("Office")
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["moved"], 1)
+        player = core._player(self.redis, "person_a")
+        self.assertEqual(player["status"], "playing")
+        self.assertEqual(player["targets"], ["voice_core:native:office"])
+        self.assertEqual(core._follow_me_state("person_a", self.redis)["status"], "following")
+
+    def test_follow_me_transit_room_with_keep_action_never_pauses(self):
+        core = self.core
+        self.stub_playback()
+        self.stub_ble()
+        self.enable_follow_me(delay="0")
+        self.redis.hset(core.SETTINGS_KEY, mapping={"follow_me_away_action": "keep"})
+        self.link_ble_person(follow_me_transit_rooms="Laundry")
+        self.room_targets["Kitchen"] = "voice_core:native:kitchen"
+        self.room_targets["Laundry"] = "voice_core:native:laundry"
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"], position=30.0, elapsed=10.0)
+        self.ble_in_room("Laundry")
+        summary = core._follow_me_tick(self.redis)
+        self.assertEqual(summary["transit_pauses"], 0)
+        self.assertEqual(summary["moved"], 0)
+        player = core._player(self.redis, "person_a")
+        self.assertEqual(player["status"], "playing")
+        self.assertEqual(player["targets"], ["voice_core:native:kitchen"])
+        self.assertEqual(core._follow_me_state("person_a", self.redis)["status"], "transit_kept")
+
+    def test_parse_transit_rooms(self):
+        core = self.core
+        self.assertEqual(
+            core._parse_transit_rooms("Hallway, Laundry Room "),
+            {"hallway", "laundryroom"},
+        )
+        self.assertEqual(core._parse_transit_rooms(""), set())
+        link = {"follow_me_transit_rooms": "hallway, laundry room"}
+        self.assertTrue(core._is_follow_me_transit_room("Laundry Room", link))
+        self.assertTrue(core._is_follow_me_transit_room("HALLWAY", link))
+        self.assertFalse(core._is_follow_me_transit_room("Kitchen", link))
+        self.assertFalse(core._is_follow_me_transit_room("Kitchen", {}))
 
     def test_follow_me_tick_mixes_ha_and_ble_people(self):
         core = self.core
@@ -3349,7 +3673,8 @@ class FollowMeTests(unittest.TestCase):
         self.assertEqual(follow_me_task["status"], "idle")
         self.assertEqual(
             core.run_core_system_task(task_id="follow_me", redis_client=self.redis),
-            {"ok": True, "checked": 0, "moved": 0, "paused": 0, "awaiting": 0, "errors": []},
+            {"ok": True, "checked": 0, "moved": 0, "paused": 0, "awaiting": 0,
+             "prompt_stopped": 0, "transit_pauses": 0, "errors": []},
         )
 
     # ---- hydra prompt note ----
@@ -3471,6 +3796,7 @@ class FollowMeTests(unittest.TestCase):
                     "person_link_follow_me_ble_address": " AA:BB:CC:DD:EE:FF ",
                     "person_link_follow_me_presence_source": "TATER_BLE",
                     "person_link_follow_me_room_overrides": " The Kitchen=Kitchen ",
+                    "person_link_follow_me_transit_rooms": " Hallway, Laundry Room ",
                     "person_link_follow_me_takeover_mode": "ASK",
                     "person_link_follow_me_away_action": "pause",
                 },
@@ -3482,6 +3808,7 @@ class FollowMeTests(unittest.TestCase):
             self.assertEqual(link["follow_me_ble_address"], "aa:bb:cc:dd:ee:ff")
             self.assertEqual(link["follow_me_presence_source"], "tater_ble")
             self.assertEqual(link["follow_me_room_overrides"], "The Kitchen=Kitchen")
+            self.assertEqual(link["follow_me_transit_rooms"], "Hallway, Laundry Room")
             self.assertEqual(link["follow_me_takeover_mode"], "ask")
             self.assertEqual(link["follow_me_away_action"], "pause")
             # Blank entity clears tracking; invalid select values are dropped.
@@ -3494,6 +3821,7 @@ class FollowMeTests(unittest.TestCase):
                     "person_link_follow_me_entity": "",
                     "person_link_follow_me_ble_address": "",
                     "person_link_follow_me_presence_source": "",
+                    "person_link_follow_me_transit_rooms": "",
                     "person_link_follow_me_takeover_mode": "yolo",
                     "person_link_follow_me_away_action": "teleport",
                 },
@@ -3503,6 +3831,7 @@ class FollowMeTests(unittest.TestCase):
             link = core._person_link("person_zoe", self.redis)
             self.assertEqual(link.get("follow_me_person_entity"), "")
             self.assertEqual(link.get("follow_me_ble_address"), "")
+            self.assertEqual(link.get("follow_me_transit_rooms"), "")
             self.assertNotIn("follow_me_presence_source", link)
             self.assertEqual(link.get("follow_me_takeover_mode"), "ask")
             self.assertEqual(link.get("follow_me_away_action"), "pause")

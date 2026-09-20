@@ -54,7 +54,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.8.2"
+__version__ = "3.9.0"
 MIN_TATER_VERSION = "1.2.0"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby, Jellyfin, Subsonic, or Plex account or "
@@ -252,6 +252,32 @@ CORE_SETTINGS = {
                 "Tater native BLE presence only: how long after the last satellite sighting a "
                 "Person still counts as home. Older than this (they left, the tag stopped "
                 "advertising, battery died) and their music follows the Away Behavior."
+            ),
+        },
+        "follow_me_ble_prompt_stop": {
+            "label": "Follow-Me BLE Prompt-Stop & Rewind",
+            "type": "checkbox",
+            "default": False,
+            "description": (
+                "Tater native BLE presence only: instead of playing on through the Move Delay, "
+                "the music pauses as soon as the Person leaves earshot of the room it's playing "
+                "in — no dead-room playback — and when it resumes in their next room it rewinds "
+                "by the estimated detection lag, so it picks up near where their ears left off. "
+                "Walking back into the room works the same way. The rewind is capped by the "
+                "Rewind Cap setting; Home Assistant person entities flip zones instantly, so "
+                "this applies to the Tater native BLE source only."
+            ),
+        },
+        "follow_me_ble_rewind_max_seconds": {
+            "label": "Follow-Me BLE Rewind Cap (sec)",
+            "type": "number",
+            "default": 30,
+            "description": (
+                "Tater native BLE Prompt-Stop only: the most the music rewinds when it resumes "
+                "after a Prompt-Stop pause. BLE detection lags your ears (signal smoothing, "
+                "room-switch hysteresis, the check interval), so the music keeps playing a "
+                "little past where you stopped hearing it — the rewind plays back that gap, "
+                "capped here. 0 disables the rewind (Prompt-Stop still pauses promptly)."
             ),
         },
         "follow_me_poll_interval_seconds": {
@@ -506,6 +532,24 @@ DEFAULT_FOLLOW_ME_PRESENCE_SOURCE = "home_assistant"
 # than this (the device stopped advertising, they left, battery died) their
 # location reads "not_home" and the away behavior applies.
 FOLLOW_ME_BLE_DEFAULT_MAX_AGE_SECONDS = 90
+# Prompt-Stop & Rewind (Tater native BLE source only): pause a Person's music
+# as soon as they leave earshot of the room it plays in, then rewind by the
+# estimated detection lag when it resumes elsewhere. The assigned room's
+# satellite stopping (or faintly) hearing the device is the earshot proxy.
+FOLLOW_ME_PROMPT_STOP_FRESH_SECONDS = 15.0
+# Weaker than this and the assigned room's satellite barely hears them.
+FOLLOW_ME_PROMPT_STOP_RSSI_DBM = -80
+# A faint sighting only counts as degraded once it is at least this stale, so
+# a fob heard weakly but continuously (far corner of a big room) never trips.
+FOLLOW_ME_PROMPT_STOP_FAINT_GRACE_SECONDS = 5.0
+# Degraded signal must persist this long before the music pauses (rides the
+# poll interval, so effectively two checks).
+FOLLOW_ME_PROMPT_STOP_GRACE_SECONDS = 10.0
+# Earshot estimate ahead of a room flip: the assignment flips ~8s (challenger
+# dwell) after the Person actually crossed into the next room, so estimate
+# their ears losing the old room this many seconds before the flip timestamp.
+FOLLOW_ME_PROMPT_STOP_FLIP_LAG_SECONDS = 10.0
+DEFAULT_FOLLOW_ME_BLE_REWIND_MAX_SECONDS = 30
 # Same shape Tater's native BLE module enforces on satellite-reported addresses.
 BLE_ADDRESS_RE = re.compile(r"^(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$")
 # Voice resume behavior when the paused queue sits somewhere other than the
@@ -960,6 +1004,7 @@ _PERSON_LINK_TEST_CORE_FIELD_KEYS = (
     "person_link_follow_me_ble_address",
     "person_link_follow_me_presence_source",
     "person_link_follow_me_room_overrides",
+    "person_link_follow_me_transit_rooms",
     "person_link_follow_me_takeover_mode",
     "person_link_follow_me_away_action",
     "person_link_transfer_resume_delay_seconds",
@@ -6401,7 +6446,12 @@ def _tater_ble_available() -> bool:
         return False
 
 
-def _tater_ble_snapshot(*, address: str, max_age_s: int) -> Dict[str, Any] | None:
+def _tater_ble_snapshot(
+    *,
+    address: str,
+    max_age_s: int,
+    include_observations: bool = False,
+) -> Dict[str, Any] | None:
     """Tater's native BLE presence snapshot for one address (None when absent).
 
     The core runs inside Tater, so the snapshot comes from the host module
@@ -6416,20 +6466,32 @@ def _tater_ble_snapshot(*, address: str, max_age_s: int) -> Dict[str, Any] | Non
         return native_ble.snapshot(
             address=address,
             max_age_s=max_age_s,
-            include_observations=False,
+            include_observations=include_observations,
         )
     except Exception as exc:
         logger.debug("[Music] Tater native BLE snapshot failed: %s", exc)
         return None
 
 
-def _ble_person_location(client: Any, link: Dict[str, Any]) -> Dict[str, Any]:
+def _ble_person_location(
+    client: Any,
+    link: Dict[str, Any],
+    *,
+    probe_room_signal: bool = False,
+) -> Dict[str, Any]:
     """Current Tater BLE location for a Person link: {"state": ...} or {"error": ...}.
 
     Same shape as _ha_person_location: the zone is the strongest_room of the
     Person's device (which satellite heard it last with the best fresh signal),
     or "not_home" when nothing saw it within the away timeout. Zone "Unknown"
     means the satellite has no room — the tick treats it as a dead zone.
+
+    With probe_room_signal (Follow-Me BLE Prompt-Stop), the snapshot also
+    carries the per-satellite observations so the result can report how
+    freshly (and how strongly) the assigned room's own satellite still hears
+    the Person — the earshot proxy Prompt-Stop pauses on — plus the room
+    assignment's flip timestamp for the rewind estimate:
+      room_rssi, room_seen_age_s, room_changed_ts
     """
     address = _normalize_ble_address((link or {}).get("follow_me_ble_address"))
     if not address:
@@ -6437,6 +6499,7 @@ def _ble_person_location(client: Any, link: Dict[str, Any]) -> Dict[str, Any]:
     snapshot = _tater_ble_snapshot(
         address=address,
         max_age_s=_follow_me_ble_max_age(client=client),
+        include_observations=probe_room_signal,
     )
     if not isinstance(snapshot, dict) or not snapshot.get("ok"):
         return {"error": "tater_ble_unavailable"}
@@ -6444,13 +6507,124 @@ def _ble_person_location(client: Any, link: Dict[str, Any]) -> Dict[str, Any]:
     if not devices:
         return {"state": "not_home", "source": "tater_ble"}
     device = devices[0] if isinstance(devices[0], dict) else {}
-    return {
+    location = {
         "state": _text(device.get("strongest_room")) or "Unknown",
         "source": "tater_ble",
         "ble_rssi": _as_int(device.get("strongest_rssi"), -127, -127, 20),
         "ble_signal": _text(device.get("signal")),
         "last_seen_age_s": _as_float(device.get("last_seen_age_s")),
     }
+    if probe_room_signal:
+        room = _text(location.get("state"))
+        generated_ts = _as_float(snapshot.get("generated_ts"))
+        freshest: Dict[str, Any] = {}
+        for row in snapshot.get("observations") or []:
+            if not isinstance(row, dict) or _text(row.get("room")) != room:
+                continue
+            received_ts = _as_float(row.get("received_ts"))
+            if received_ts <= 0:
+                continue
+            if not freshest or received_ts > _as_float(freshest.get("received_ts")):
+                freshest = row
+        if freshest:
+            location["room_rssi"] = _as_int(freshest.get("rssi"), -127, -127, 20)
+            if generated_ts > 0:
+                location["room_seen_age_s"] = max(
+                    0.0, generated_ts - _as_float(freshest.get("received_ts"))
+                )
+        room_changed_ts = _as_float(device.get("room_changed_ts"))
+        if room_changed_ts > 0:
+            location["room_changed_ts"] = room_changed_ts
+    return location
+
+
+def _follow_me_ble_prompt_stop_enabled(cfg: Dict[str, Any]) -> bool:
+    return _as_bool(cfg.get("follow_me_ble_prompt_stop"), False)
+
+
+def _follow_me_ble_rewind_max(
+    cfg: Dict[str, Any] | None = None,
+    client: Any = None,
+) -> float:
+    """Rewind cap (s) for a Prompt-Stop resume; 0 disables the rewind."""
+    raw = cfg if cfg is not None else _settings(client)
+    return min(
+        300.0,
+        max(0.0, _as_float(raw.get("follow_me_ble_rewind_max_seconds"), DEFAULT_FOLLOW_ME_BLE_REWIND_MAX_SECONDS)),
+    )
+
+
+def _follow_me_prompt_stop_state_keys() -> tuple:
+    return (
+        "prompt_stop_room_target",
+        "prompt_stop_room_name",
+        "prompt_stop_earshot_ts",
+        "prompt_stop_paused_ts",
+        "prompt_stop_candidate_ts",
+    )
+
+
+def _clear_follow_me_prompt_stop_state(state: Dict[str, Any]) -> None:
+    for key in _follow_me_prompt_stop_state_keys():
+        state.pop(key, None)
+
+
+def _follow_me_prompt_stop_rewind_seconds(person_id: Any, client: Any = None) -> float:
+    """Lag-compensating rewind (s) for a Prompt-Stop pause; 0 when none applies.
+
+    The music kept playing for the detection lag after the Person's ears lost
+    it, so resuming rewinds by that gap — floored at the track start by the
+    resume path, capped by the Rewind Cap setting.
+    """
+    store = client or globals().get("redis_client")
+    if not _follow_me_ble_prompt_stop_enabled(_settings(store)):
+        return 0.0
+    cap = _follow_me_ble_rewind_max(client=store)
+    if cap <= 0:
+        return 0.0
+    state = _follow_me_state(person_id, store)
+    paused_ts = _as_float(state.get("prompt_stop_paused_ts"))
+    earshot_ts = _as_float(state.get("prompt_stop_earshot_ts"))
+    if paused_ts <= 0 or earshot_ts <= 0 or paused_ts <= earshot_ts:
+        return 0.0
+    return min(cap, paused_ts - earshot_ts)
+
+
+def _follow_me_room_signal_degraded(location: Dict[str, Any]) -> bool:
+    """Whether the assigned room's satellite has (barely) stopped hearing them.
+
+    The earshot proxy for Prompt-Stop: with the observation probe, staleness of
+    the assigned room's own sightings is the primary signal and a faint stale
+    sighting degrades too; without the probe (observations unavailable), fall
+    back to the device-level sighting age.
+    """
+    if "room_seen_age_s" in (location or {}):
+        seen_age = _as_float(location.get("room_seen_age_s"))
+        if seen_age > FOLLOW_ME_PROMPT_STOP_FRESH_SECONDS:
+            return True
+        return (
+            seen_age > FOLLOW_ME_PROMPT_STOP_FAINT_GRACE_SECONDS
+            and _as_int(location.get("room_rssi"), 0, -127, 20) < FOLLOW_ME_PROMPT_STOP_RSSI_DBM
+        )
+    return _as_float((location or {}).get("last_seen_age_s")) > FOLLOW_ME_PROMPT_STOP_FRESH_SECONDS
+
+
+def _parse_transit_rooms(raw: Any) -> set:
+    """Normalized room-name set from a comma-separated transit list."""
+    return {
+        _normalize_room_token(chunk)
+        for chunk in _text(raw).split(",")
+        if _normalize_room_token(chunk)
+    }
+
+
+def _is_follow_me_transit_room(room_name: Any, link: Dict[str, Any]) -> bool:
+    """Whether a resolved room is on this Person's transit (no-follow) list."""
+    if not _text(room_name):
+        return False
+    return _normalize_room_token(room_name) in _parse_transit_rooms(
+        (link or {}).get("follow_me_transit_rooms")
+    )
 
 
 def _follow_me_state_key(person_id: Any) -> str:
@@ -6631,7 +6805,16 @@ def _follow_me_move(
         _player(store, queue_id).get("status")
     ).lower() == "paused":
         # Walked back into a speaker room after Follow-Me paused them: resume
-        # (after the Person's resume delay, if one is set).
+        # (after the Person's resume delay, if one is set). A Prompt-Stop
+        # pause rewinds first by the detection lag, so the music picks up
+        # near where the Person's ears left off.
+        rewind = _follow_me_prompt_stop_rewind_seconds(person_id, store)
+        if rewind > 0:
+            rewound = _player(store, queue_id)
+            rewound["position_offset_seconds"] = max(
+                0.0, _player_position_seconds(rewound) - rewind
+            )
+            _save_player(rewound, store, queue_id)
         resume_delay = _follow_me_resume_delay(person_id, store)
         if resume_delay > 0:
             resumed_player = _player(store, queue_id)
@@ -6642,6 +6825,7 @@ def _follow_me_move(
             _resume_player(person_id=queue_id, client=store)
         state = _follow_me_state(person_id, store)
         state.pop("paused_by_follow_me", None)
+        _clear_follow_me_prompt_stop_state(state)
         _save_follow_me_state(person_id, state, store)
     return {"moved": True, "targets": _list(_player(store, queue_id).get("targets"))}
 
@@ -6664,6 +6848,121 @@ def _follow_me_apply_away_action(
     return True
 
 
+def _follow_me_prompt_stop_pass(
+    person_id: Any,
+    link: Dict[str, Any],
+    zone: Any,
+    location: Dict[str, Any],
+    state: Dict[str, Any],
+    previous_zone: Any,
+    *,
+    client: Any = None,
+) -> Dict[str, Any]:
+    """One Prompt-Stop & Rewind pass for a BLE-tracked Person.
+
+    Pause their playing queue the moment they leave earshot of the room it
+    plays in — either a room-assignment flip away from the playing room, or
+    the assigned room's own satellite (barely) stopping to hear them, held
+    across the grace window so a single weak sighting never trips it. While
+    prompt-stopped, hold the music in the room it stopped in until they are
+    detected somewhere else or the room's satellite hears them fresh again
+    (they walked back in). Callers skip normal move handling when the pass
+    returns {"paused": True} or {"hold": True}; {"resume": True} lifts the
+    hold (same room, fresh signal) and lets the tick's move branch resume.
+
+    Callers must hold _follow_me_lock. The rewind itself is applied by
+    _follow_me_move when the paused queue resumes.
+    """
+    store = client or globals().get("redis_client")
+    queue_id = _queue_id_for_person(person_id)
+    player = _player(store, queue_id)
+    queue_targets = set(_list(player.get("targets")))
+    status = _text(player.get("status")).lower()
+    room_name, target = _resolve_follow_me_zone(zone, link, store)
+
+    if bool(state.get("paused_by_follow_me")) and _text(
+        state.get("prompt_stop_room_target")
+    ):
+        # Prompt-stopped earlier. Still assigned to the room we stopped in?
+        # The assignment can trail the Person by seconds (hysteresis), so the
+        # hold stands until they are detected in another room — or the room's
+        # satellite hears them fresh again, meaning they walked back in.
+        if target and target != _text(state.get("prompt_stop_room_target")):
+            return {"hold": False, "resume": False}
+        if not _follow_me_room_signal_degraded(location):
+            # They walked back in: lift the hold but keep the rewind fields —
+            # the resume below still compensates for what they missed.
+            state.pop("prompt_stop_room_target", None)
+            state.pop("prompt_stop_room_name", None)
+            state.pop("prompt_stop_candidate_ts", None)
+            _save_follow_me_state(person_id, state, store)
+            return {"hold": False, "resume": True}
+        return {"hold": True}
+
+    if status != "playing" or not queue_targets:
+        return {}
+
+    now = time.time()
+    # Earshot anchor: how long the music likely kept playing past their ears.
+    if (
+        target
+        and target not in queue_targets
+        and _room_name_to_targets(_text(previous_zone), store) in queue_targets
+    ):
+        # Room-assignment flip away from the playing room: they crossed into
+        # the next room; the flip lags that crossing, so estimate earshot a
+        # little before it.
+        changed_ts = _as_float(location.get("room_changed_ts"))
+        anchor = changed_ts if changed_ts > 0 else _as_float(state.get("zone_since"))
+        if anchor <= 0:
+            anchor = now
+        earshot_ts = anchor - FOLLOW_ME_PROMPT_STOP_FLIP_LAG_SECONDS
+        state.pop("prompt_stop_candidate_ts", None)
+    elif target and target in queue_targets:
+        # Still assigned to the playing room: the room's own satellite going
+        # quiet (or faint) is the departure signal.
+        if not _follow_me_room_signal_degraded(location):
+            if state.pop("prompt_stop_candidate_ts", None) is not None:
+                _save_follow_me_state(person_id, state, store)
+            return {}
+        candidate_ts = _as_float(state.get("prompt_stop_candidate_ts"))
+        if candidate_ts <= 0:
+            state["prompt_stop_candidate_ts"] = now
+            _save_follow_me_state(person_id, state, store)
+            return {"degraded": True}
+        if now - candidate_ts < FOLLOW_ME_PROMPT_STOP_GRACE_SECONDS:
+            return {"degraded": True}
+        earshot_ts = candidate_ts
+    else:
+        # Music playing somewhere they are not (a manual move or a dead zone):
+        # not a departure to prompt-stop on.
+        if state.pop("prompt_stop_candidate_ts", None) is not None:
+            _save_follow_me_state(person_id, state, store)
+        return {}
+
+    if not _follow_me_apply_away_action(person_id, client=store):
+        return {}
+    state = _follow_me_state(person_id, store)
+    state.update(
+        {
+            "paused_by_follow_me": True,
+            "prompt_stop_room_target": sorted(queue_targets)[0],
+            "prompt_stop_room_name": _text(previous_zone) or _text(zone),
+            "prompt_stop_earshot_ts": earshot_ts,
+            "prompt_stop_paused_ts": time.time(),
+        }
+    )
+    state.pop("prompt_stop_candidate_ts", None)
+    state["status"] = "prompt_stop"
+    _save_follow_me_state(person_id, state, store)
+    logger.info(
+        "[Music] Follow-Me prompt-stopped %s's music (left %s)",
+        person_id,
+        _text(previous_zone) or _text(zone),
+    )
+    return {"paused": True}
+
+
 def _follow_me_tick(client: Any = None) -> Dict[str, Any]:
     """One pass: check every linked Person's presence source and follow the movers."""
     store = client or globals().get("redis_client")
@@ -6672,6 +6971,7 @@ def _follow_me_tick(client: Any = None) -> Dict[str, Any]:
         if not _follow_me_follow_enabled(cfg):
             return {"ok": True, "skipped": "disabled"}
         delay = _follow_me_move_delay(cfg)
+        prompt_stop_enabled = _follow_me_ble_prompt_stop_enabled(cfg)
         now = time.time()
         summary: Dict[str, Any] = {
             "ok": True,
@@ -6679,14 +6979,19 @@ def _follow_me_tick(client: Any = None) -> Dict[str, Any]:
             "moved": 0,
             "paused": 0,
             "awaiting": 0,
+            "prompt_stopped": 0,
+            "transit_pauses": 0,
             "errors": [],
         }
         for person_id, link in _person_links(store).items():
-            if _follow_me_presence_source(person_id, store) == "tater_ble":
+            source = _follow_me_presence_source(person_id, store)
+            if source == "tater_ble":
                 # BLE tracking works without Home Assistant entirely.
                 if not _normalize_ble_address(link.get("follow_me_ble_address")):
                     continue
-                location = _ble_person_location(store, link)
+                location = _ble_person_location(
+                    store, link, probe_room_signal=prompt_stop_enabled
+                )
             else:
                 entity = _text(link.get("follow_me_person_entity"))
                 if not entity:
@@ -6696,11 +7001,13 @@ def _follow_me_tick(client: Any = None) -> Dict[str, Any]:
             state = _follow_me_state(person_id, store)
             player = _player(store, _queue_id_for_person(person_id))
             # The flag only means "Follow-Me paused this"; any playback since
-            # then (manual resume, new request, track advance) supersedes it.
+            # then (manual resume, new request, track advance) supersedes it —
+            # along with any pending Prompt-Stop rewind.
             if bool(state.get("paused_by_follow_me")) and _text(
                 player.get("status")
             ).lower() == "playing":
                 state.pop("paused_by_follow_me", None)
+                _clear_follow_me_prompt_stop_state(state)
             if "error" in location:
                 state.update(
                     {
@@ -6714,7 +7021,8 @@ def _follow_me_tick(client: Any = None) -> Dict[str, Any]:
                 summary["errors"].append(f"{person_id}: {location.get('error')}")
                 continue
             zone = _text(location.get("state"))
-            if zone != _text(state.get("zone")):
+            previous_zone = _text(state.get("zone"))
+            if zone != previous_zone:
                 # A new room supersedes any pending takeover question.
                 _clear_pending_confirmation(store, person_id)
                 state.update(
@@ -6727,6 +7035,24 @@ def _follow_me_tick(client: Any = None) -> Dict[str, Any]:
                 )
             state["last_check_at"] = now
             _save_follow_me_state(person_id, state, store)
+            if prompt_stop_enabled and source == "tater_ble":
+                # Prompt-Stop acts on the departure itself, before the Move
+                # Delay's arrival dwell — and holds a prompt-stopped queue in
+                # its room until the Person is detected elsewhere or walks
+                # back in. {"resume": True} just lifted the hold; the move
+                # branch below resumes (with the rewind) as usual.
+                outcome = _follow_me_prompt_stop_pass(
+                    person_id, link, zone, location, state, previous_zone, client=store
+                )
+                state = _follow_me_state(person_id, store)
+                if outcome.get("hold"):
+                    state["status"] = "prompt_stop"
+                    state["last_check_at"] = now
+                    _save_follow_me_state(person_id, state, store)
+                    continue
+                if outcome.get("paused"):
+                    summary["prompt_stopped"] += 1
+                    continue
             if now - _as_float(state.get("zone_since")) < delay:
                 continue
             if zone.casefold() in {"not_home", ""}:
@@ -6754,6 +7080,24 @@ def _follow_me_tick(client: Any = None) -> Dict[str, Any]:
                         state["status"] = "dead_zone_idle"
                 else:
                     state["status"] = "dead_zone"
+                _save_follow_me_state(person_id, state, store)
+                continue
+            if _is_follow_me_transit_room(room_name, link):
+                # A room the Person flagged as a walk-through space: never
+                # move the music into it, and lingering here past the Move
+                # Delay pauses it instead (unless the Away Behavior says
+                # never pause). Reaching a real room resumes as usual.
+                if _follow_me_away_action(person_id, store) in {"keep_pause", "pause"}:
+                    if _follow_me_apply_away_action(person_id, client=store):
+                        summary["transit_pauses"] += 1
+                        state["paused_by_follow_me"] = True
+                        state["status"] = "paused_transit"
+                    else:
+                        state["status"] = "transit_idle"
+                else:
+                    state["status"] = "transit_kept"
+                state["resolved_room"] = room_name
+                state["resolved_targets"] = []
                 _save_follow_me_state(person_id, state, store)
                 continue
             result = _follow_me_move(person_id, zone, [target], store)
@@ -13364,6 +13708,20 @@ def _follow_me_link_fields(
             ),
         },
         {
+            "key": "person_link_follow_me_transit_rooms",
+            "label": "Transit Rooms (optional)",
+            "type": "text",
+            "value": _text(link.get("follow_me_transit_rooms")),
+            "placeholder": "Hallway, Laundry",
+            "description": (
+                "Comma-separated Tater room names to treat as walk-through spaces: Follow-Me "
+                "never moves their music into these rooms, and lingering in one past the Move "
+                "Delay pauses their music instead (unless the Away Behavior is \"Never pause\"). "
+                "It resumes automatically when they reach a room with speakers. Leave blank for "
+                "no transit rooms."
+            ),
+        },
+        {
             "key": "person_link_follow_me_takeover_mode",
             "label": "Follow-Me Room Takeover",
             "type": "select",
@@ -13475,6 +13833,13 @@ def _follow_me_card_status(
         return f"Follow-me: spotted in {zone}, holding…"
     if status == "paused_away":
         return "Follow-me: paused (away from home)"
+    if status == "prompt_stop":
+        left = _text(state.get("prompt_stop_room_name"))
+        return f"Follow-me: paused (left {left or zone or 'the room'})"
+    if status == "paused_transit":
+        return f"Follow-me: paused (in {zone}, a transit room)"
+    if status in {"transit_kept", "transit_idle"}:
+        return f"Follow-me: in {zone} (transit room)"
     if status == "paused_dead_zone":
         return f"Follow-me: paused (in {zone}, no speakers)"
     if status == "away_kept":
@@ -14650,6 +15015,10 @@ def _save_person_link_action(values: Dict[str, Any], store: Any) -> Dict[str, An
     if "person_link_follow_me_room_overrides" in values:
         link["follow_me_room_overrides"] = _text(
             values.get("person_link_follow_me_room_overrides")
+        ).strip()
+    if "person_link_follow_me_transit_rooms" in values:
+        link["follow_me_transit_rooms"] = _text(
+            values.get("person_link_follow_me_transit_rooms")
         ).strip()
     # Selects inherit the stored value when the payload carries an invalid one,
     # so a stale form can never wipe a saved mode. The presence-source select

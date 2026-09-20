@@ -427,9 +427,32 @@ sources (one tracked by Home Assistant, another by BLE) with the per-Person
   - **Never pause; only move into rooms**
   A follow-me pause resumes automatically when they reappear in a room with
   speakers, at the same spot in the track.
+- **Transit rooms (per Person).** Some rooms are walk-through spaces, not
+  destinations. List them on the Person's card under **Transit Rooms**
+  (comma-separated Tater room names, e.g. `Hallway, Laundry`) and Follow-Me
+  never moves their music into those rooms — lingering in one past the Move
+  Delay pauses the music instead (unless the Away Behavior is "Never pause"),
+  resuming automatically when they reach a room with speakers.
+- **Prompt-Stop & Rewind (Tater native BLE only).** BLE detection lags your
+  ears: signal smoothing, room-switch hysteresis, and the check interval mean
+  the music keeps playing for tens of seconds after you've stopped hearing it
+  — often into a room nobody is in. With **Follow-Me BLE Prompt-Stop &
+  Rewind** enabled, the music pauses as soon as the Person leaves earshot of
+  the room it plays in (the assigned room's own satellite going quiet or
+  faint, held across a short grace window so one weak sighting never trips
+  it — and an assignment flip away from the playing room pauses immediately).
+  While paused it holds in that room until the Person is detected elsewhere
+  or walks back in (fresh sightings there lift the hold). When the music
+  resumes — next room or same room — it rewinds by the estimated detection
+  lag, so it picks up near where their ears left off, capped by the
+  **Follow-Me BLE Rewind Cap** (default 30 s; 0 disables the rewind). Any
+  manual play/pause/stop supersedes the pause and drops the pending rewind.
+  Home Assistant person entities flip zones instantly, so this applies to
+  the Tater native BLE source only.
 - **Visibility.** The **Follow-Me Presence** system task shows the last check
   and errors; each Person card shows their current state (e.g. "Follow-me: in
-  Kitchen → Kitchen", "paused (away from home)", "person entity not found in
+  Kitchen → Kitchen", "paused (away from home)", "paused (left Kitchen)",
+  "paused (in Hallway, a transit room)", "person entity not found in
   Home Assistant").
 
 Follow-Me is off by default. Home Assistant tracking requires Tater's Home
@@ -453,6 +476,8 @@ source needs, the system task explains what to enable.
 | Follow-Me Presence | off | Master switch for following linked People room to room (see [Follow-Me presence](#follow-me-presence)). |
 | Follow-Me Presence Source | `Home Assistant` | Where each Person's location comes from: Home Assistant person entities or Tater's native BLE presence (per-Person override on the link card). |
 | Follow-Me BLE Away Timeout | `90` s | How long after the last satellite sighting a BLE-tracked Person still counts as home. |
+| Follow-Me BLE Prompt-Stop & Rewind | off | BLE source only: pause the music the moment the Person leaves earshot of the room it plays in; the resume rewinds by the estimated detection lag (see [Follow-Me presence](#follow-me-presence)). |
+| Follow-Me BLE Rewind Cap | `30` s | Most the music rewinds on a Prompt-Stop resume; 0 disables the rewind. |
 | Follow-Me Poll Interval | `15` s | How often presence is checked for each tracked Person (5–3600 s). |
 | Follow-Me Move Delay | `20` s | How long a new zone must hold before the music moves (prevents hallway flicker). |
 | Transfer Resume Delay | `0` s | Wait before music resumes in the room a transfer moved to — time to walk between rooms (per-Person override on the link card). |
