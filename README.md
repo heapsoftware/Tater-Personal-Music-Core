@@ -174,8 +174,8 @@ time.
 
 ## Per-person links
 
-**Personal Music** tab → **People** → **Add Person Link** (the form opens on
-that card; **Edit** on a linked Person's card reopens it). Each Person can get:
+**Personal Music** tab → **People** → **Add Person Link** (Edit opens the
+form in a modal; **Edit** on a linked Person's card reopens it). Each Person can get:
 
 - their own Emby or Jellyfin user/library on a shared server,
 - their own Subsonic account (Navidrome/Airsonic/Gonic included),
@@ -361,8 +361,8 @@ queue** on the Playlist tab (with its own transport controls), and **their own
 AI-named mixes** on the Recommendations tab.
 
 - Reach it from the **View Music As** card on the Browse Library,
-  Recommendations, and People tabs, or from **View Their Music** inside a
-  Person's link editor (press **Edit** on their card); only linked People are
+  Recommendations, and People tabs, or from **View Their Music** on a Person's
+  card (or inside their Edit modal); only linked People are
   offered, plus "Back to Household".
 - While viewing, playing from the dashboard goes to **that Person's queue** (and
   records their listening history), and the stats row shows who you're viewing.

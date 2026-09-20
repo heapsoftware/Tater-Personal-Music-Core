@@ -54,8 +54,8 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.6.0"
-MIN_TATER_VERSION = "99.5"
+__version__ = "3.7.0"
+MIN_TATER_VERSION = "1.2.0"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby, Jellyfin, Subsonic, or Plex account or "
     "network-share folder (or two sources at once), browse "
@@ -454,15 +454,10 @@ CORE_WEBUI_TAB = {
 SETTINGS_KEY = "personal_music_core_settings"
 RUNTIME_KEY = "personal_music_core:runtime"
 PERSON_LINKS_KEY = "personal_music_core:person_links"
-# Last "Test Emby Connection" outcome plus the form values that were tested.
-# The music tab UI only toasts action errors and refetches the tab after a
-# successful action, which also resets unsaved form edits — so the core keeps
-# the tested values and result here and prefills the link cards with them.
+# Last "Test Connection" outcome. The music tab UI (Tater v1.2.0+) toasts the
+# action's success message, but a toast is gone on the next click — the record
+# here keeps the outcome visible on the link card as a summary row.
 PERSON_LINK_TEST_KEY = "personal_music_core:person_link_test"
-# Person id ("new" = the add-link form) whose link editor is open. The tab
-# renderer has no modal, so "Edit" flips that Person's card into the full
-# settings form until it is saved or cancelled.
-PERSON_LINK_EDIT_KEY = "personal_music_core:person_link_edit"
 # Compact sync outcome per catalog ("track/artist/album/genre counts +
 # synced_at", or "syncing/error") keyed by person id ("" = the household
 # catalog). Link cards and the search card read this instead of decoding
@@ -12206,6 +12201,7 @@ def _search_item(catalog: Dict[str, Any]) -> Dict[str, Any]:
         "title": "Search Your Library",
         "subtitle": "Find a genre, artist, album, or song and start a fresh track list.",
         "summary_rows": [{"label": "Searchable Library", "value": searchable}],
+        "fields_popup": False,
         "fields_dropdown": False,
         "fields": [
             {
@@ -13385,26 +13381,12 @@ def _follow_me_card_status(
     return f"Follow-me: {status}"
 
 
-def _apply_person_link_test_state(
-    card: Dict[str, Any],
-    state: Dict[str, Any],
-    *,
-    prefill_password: bool,
-) -> None:
-    """Restore the last-tested form values and show the test outcome on a card.
+def _apply_person_link_test_state(card: Dict[str, Any], state: Dict[str, Any]) -> None:
+    """Show the last connection-test outcome on a link card as a summary row.
 
-    The tab UI refetches after every action, which would otherwise wipe both
-    the test result and anything the user typed but has not saved yet.
+    The tab UI toasts the test's success message (Tater v1.2.0+), but the row
+    keeps the outcome visible on the card after the toast is gone.
     """
-    values = state.get("values") if isinstance(state.get("values"), dict) else {}
-    for field in card.get("fields") or []:
-        key = _text(field.get("key"))
-        if key not in values:
-            continue
-        # Existing links keep the blank-secret-means-keep-saved convention.
-        if not prefill_password and field.get("type") == "password":
-            continue
-        field["value"] = values[key]
     message = _text(state.get("message"))
     if message:
         passed = _text(state.get("status")) == "ok"
@@ -13470,28 +13452,6 @@ def _library_summary_value(
         f" · {_as_int(stats.get('genre_count'), 0, 0, 10**9)} genres"
         f" · scanned {_format_time(stats.get('synced_at'))}"
     )
-
-
-def _person_link_edit_target(store: Any = None) -> str:
-    """Person id ("new" = add-link form) whose link editor is open, else ""."""
-    store = store or globals().get("redis_client")
-    try:
-        return _text(store.get(PERSON_LINK_EDIT_KEY)) if store is not None else ""
-    except Exception:
-        return ""
-
-
-def _save_person_link_edit_target(person_id: Any, store: Any = None) -> None:
-    if store is not None:
-        store.set(PERSON_LINK_EDIT_KEY, _text(person_id))
-
-
-def _clear_person_link_edit_target(store: Any = None) -> None:
-    if store is not None:
-        try:
-            store.delete(PERSON_LINK_EDIT_KEY)
-        except Exception:
-            pass
 
 
 def _person_link_personalization_fields(
@@ -13807,17 +13767,16 @@ def _person_link_source_fields(
 def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
     """Per-Person source links shown in the core tab's People section.
 
-    Linked People render as compact cards (name, library sync state, Edit and
-    Remove); Edit flips that Person's card into the full settings form until
-    the link is saved, cancelled, or removed (see PERSON_LINK_EDIT_KEY) — the
-    tab renderer offers no modal to open the form in.
+    Linked People render as compact cards (name, library sync state, and their
+    actions); Edit opens the card's full settings form in the host's modal
+    (ui.item_fields_popup, Tater v1.2.0+), whose Save/Cancel round-trip straight
+    to music_person_link_save needs no core-side editor state.
     """
     items: List[Dict[str, Any]] = []
     person_options = _people_person_options(store)
     if len(person_options) <= 1:
         return items
     linked_ids = set(_person_links(store))
-    editing = _person_link_edit_target(store)
     for person_id, link in sorted(_person_links(store).items()):
         name = _people_person_name(person_id, store) or person_id
         source = _person_link_source(link)
@@ -13881,33 +13840,6 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                 else [{"label": "SYNCING", "tone": "muted"}] if stats_status == "syncing" else []
             ),
         }
-        if editing != person_id:
-            card["actions"] = [
-                {
-                    "action": "music_person_link_edit",
-                    "label": "Edit",
-                },
-                {
-                    "action": "music_person_sleep_start_30",
-                    "label": "Sleep 30m",
-                },
-                {
-                    "action": "music_person_sleep_start_60",
-                    "label": "Sleep 60m",
-                },
-                {
-                    "action": "music_person_sleep_cancel",
-                    "label": "Cancel Timer",
-                },
-                {
-                    "action": "music_person_link_remove",
-                    "label": "Remove Link",
-                    "tone": "danger",
-                    "confirm": f"Remove {name}'s personal music link? Their library and history stay until removed.",
-                },
-            ]
-            items.append(card)
-            continue
         card["fields"] = [
                     {
                         "key": "person_link_person_id",
@@ -13944,6 +13876,9 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
         ]
         card["save_action"] = "music_person_link_save"
         card["save_label"] = "Save Person Link"
+        card["fields_popup"] = True
+        card["settings_label"] = "Edit"
+        card["settings_title"] = f"Edit {name}'s music link"
         card["actions"] = [
             {
                 "action": "music_view_as_switch",
@@ -13954,8 +13889,16 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                 "label": "Test Connection",
             },
             {
-                "action": "music_person_link_edit_cancel",
-                "label": "Cancel",
+                "action": "music_person_sleep_start_30",
+                "label": "Sleep 30m",
+            },
+            {
+                "action": "music_person_sleep_start_60",
+                "label": "Sleep 60m",
+            },
+            {
+                "action": "music_person_sleep_cancel",
+                "label": "Cancel Timer",
             },
             {
                 "action": "music_person_link_remove",
@@ -13976,85 +13919,69 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
             "group": "people",
             "title": "Link a Person",
             "subtitle": "Give one Person their own music source, library, and listening history.",
+            "detail": "Choose a Person, pick a source, and fill in that source's details.",
+            "hero_badges": [{"label": "NEW LINK", "tone": "muted"}],
+            "fields": [
+                {
+                    "key": "person_link_person_id",
+                    "label": "Person",
+                    "type": "select",
+                    "value": "",
+                    "options": unlinked,
+                },
+                {
+                    "key": "person_link_source",
+                    "label": "Music Source",
+                    "type": "select",
+                    "value": "emby",
+                    "options": _person_link_source_options("primary", allow_blank=False),
+                },
+                {
+                    "key": "person_link_queue_conflict_mode",
+                    "label": "Playback Conflicts",
+                    "type": "select",
+                    "value": _text(cfg.get("queue_conflict_mode") or DEFAULT_QUEUE_CONFLICT_MODE),
+                    "options": [
+                        {"value": "ask", "label": "Ask before taking over"},
+                        {"value": "auto_move", "label": "Auto-move / take over"},
+                    ],
+                    "description": (
+                        "When their music is playing elsewhere, or someone else's music is on "
+                        "the rooms they ask for: ask first, or move/take over automatically."
+                    ),
+                },
+                *_follow_me_link_fields(cfg, {}),
+                *_person_link_personalization_fields(cfg, {}, store),
+                *_person_link_extra_source_fields({}, cfg),
+                *_person_link_source_fields({}, cfg),
+            ],
         }
-        if editing != "new":
-            new_card["detail"] = "Add a Person's own music source — their own server account or a share folder."
-            new_card["hero_badges"] = [{"label": "NEW LINK", "tone": "muted"}]
-            new_card["actions"] = [
-                {
-                    "action": "music_person_link_edit",
-                    "label": "Add Person Link",
-                },
-            ]
-            items.append(new_card)
-        else:
-            new_card["detail"] = "Choose a Person, pick a source, and fill in that source's details."
-            new_card["hero_badges"] = [{"label": "NEW LINK", "tone": "muted"}]
-            new_card["fields"] = [
-                    {
-                        "key": "person_link_person_id",
-                        "label": "Person",
-                        "type": "select",
-                        "value": "",
-                        "options": unlinked,
-                    },
-                    {
-                        "key": "person_link_source",
-                        "label": "Music Source",
-                        "type": "select",
-                        "value": "emby",
-                        "options": _person_link_source_options("primary", allow_blank=False),
-                    },
-                    {
-                        "key": "person_link_queue_conflict_mode",
-                        "label": "Playback Conflicts",
-                        "type": "select",
-                        "value": _text(cfg.get("queue_conflict_mode") or DEFAULT_QUEUE_CONFLICT_MODE),
-                        "options": [
-                            {"value": "ask", "label": "Ask before taking over"},
-                            {"value": "auto_move", "label": "Auto-move / take over"},
-                        ],
-                        "description": (
-                            "When their music is playing elsewhere, or someone else's music is on "
-                            "the rooms they ask for: ask first, or move/take over automatically."
-                        ),
-                    },
-                    *_follow_me_link_fields(cfg, {}),
-                    *_person_link_personalization_fields(cfg, {}, store),
-                    *_person_link_extra_source_fields({}, cfg),
-                    *_person_link_source_fields({}, cfg),
-            ]
-            new_card["save_action"] = "music_person_link_save"
-            new_card["save_label"] = "Link Person"
-            new_card["actions"] = [
-                {
-                    "action": "music_person_link_test",
-                    "label": "Test Connection",
-                },
-                {
-                    "action": "music_person_link_edit_cancel",
-                    "label": "Cancel",
-                },
-            ]
-            items.append(new_card)
-    # Prefill the editor the last test was run against with the tested values
-    # and its outcome, so the result stays visible after the tab's post-action
-    # refetch (which also resets unsaved form edits). Compact cards carry no
-    # form, so they are skipped.
+        new_card["save_action"] = "music_person_link_save"
+        new_card["save_label"] = "Link Person"
+        new_card["fields_popup"] = True
+        new_card["settings_label"] = "Add Person Link"
+        new_card["settings_title"] = "Link a Person to their own music"
+        new_card["actions"] = [
+            {
+                "action": "music_person_link_test",
+                "label": "Test Connection",
+            },
+        ]
+        items.append(new_card)
+    # Show the last connection-test outcome on the card it was run against, so
+    # it stays visible on the card after the success toast is gone.
     state = _person_link_test_state(store)
     if state.get("person_id"):
         unlinked_ids = {option.get("value") for option in unlinked}
         for card in items:
-            if not card.get("fields"):
-                continue
             card_id = _text(card.get("id"))
             if card_id == "person:new":
-                # The new-link editor only exists for still-unlinked people.
+                # The add-link card only exists for still-unlinked people.
                 if state["person_id"] not in unlinked_ids:
                     continue
-                _apply_person_link_test_state(card, state, prefill_password=True)
+                _apply_person_link_test_state(card, state)
             elif card_id == f"person:{state['person_id']}":
-                _apply_person_link_test_state(card, state, prefill_password=False)
+                _apply_person_link_test_state(card, state)
     return items
 
 
@@ -14234,6 +14161,11 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
                         "value": "Shairport Sync 5.2+ · classic AirPlay/RAOP receiver",
                     },
                 ],
+                # Keep these settings cards rendering inline: the ui-level
+                # item_fields_popup/item_fields_dropdown defaults are for the
+                # People tab's link modals only.
+                "fields_popup": False,
+                "fields_dropdown": False,
                 "fields": [
                     {
                         "key": "airplay_receiver_enabled",
@@ -14291,6 +14223,8 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
                 "card_variant": "settings_wide",
                 "title": "Playback Defaults",
                 "subtitle": "Where music starts and how broad requests behave.",
+                "fields_popup": False,
+                "fields_dropdown": False,
                 "fields": [
                     {
                         "key": "default_targets",
@@ -14336,6 +14270,8 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
                 "group": "settings",
                 "title": "Library & Sync",
                 "subtitle": "Background refresh timing and the starting point for mixed speaker groups.",
+                "fields_popup": False,
+                "fields_dropdown": False,
                 "fields": [
                     {
                         "key": "catalog_sync_interval_seconds",
@@ -14368,6 +14304,8 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
                 "group": "settings",
                 "title": "Personalization",
                 "subtitle": f"Control {assistant_possessive} recommendations and one Person's listening profile.",
+                "fields_popup": False,
+                "fields_dropdown": False,
                 "fields": [
                     {
                         "key": "recommendations_enabled",
@@ -14721,10 +14659,8 @@ def _save_person_link_action(values: Dict[str, Any], store: Any) -> Dict[str, An
         link.pop("extra_source", None)
         link.pop("extra", None)
     _save_person_link(person_id, link, store)
-    # The link now holds the real values; drop the test draft and its result,
-    # and close the link editor (the card collapses back to its compact form).
+    # The link now holds the real values; drop the test draft and its result.
     _clear_person_link_test_state(person_id, store)
-    _clear_person_link_edit_target(store)
     sync_note = ""
     if source:
         try:
@@ -14759,10 +14695,9 @@ def _save_person_link_action(values: Dict[str, Any], store: Any) -> Dict[str, An
 def _test_person_link_source_action(values: Dict[str, Any], store: Any) -> Dict[str, Any]:
     """Test one Person's link credentials from the form without saving them.
 
-    Tests whatever music source the form currently selects; the tab UI refetches
-    after every action, which resets unsaved form edits and drops success
-    messages — so record what was typed and how the test went; the link cards
-    prefill from it (see _person_link_items).
+    Tests whatever music source the form currently selects; the outcome is
+    recorded so its summary row stays on the link card after the tab's success
+    toast is gone (see _person_link_items).
     """
     person_id = _text(values.get("person_link_person_id"))
     name = _people_person_name(person_id, store) if person_id else ""
@@ -14860,6 +14795,8 @@ def _view_as_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                     if viewer
                     else [{"label": "HOUSEHOLD", "tone": "muted"}]
                 ),
+                "fields_popup": False,
+                "fields_dropdown": False,
                 "fields": [
                     {
                         "key": "view_as_person_id",
@@ -15036,22 +14973,6 @@ def handle_htmlui_tab_action(
     if action_name == "music_person_link_save":
         return _save_person_link_action(values, store)
 
-    if action_name == "music_person_link_edit":
-        person_id = _text(values.get("person_link_person_id"))
-        if not person_id:
-            person_id = _text(body.get("id")).replace("person:", "")
-        if person_id != "new" and person_id not in _person_links(store):
-            raise ValueError("Choose a Person to edit, or add a new Person link.")
-        _save_person_link_edit_target(person_id, store)
-        if person_id == "new":
-            return {"ok": True, "message": "Fill in the new Person's music link and press Link Person."}
-        name = _people_person_name(person_id, store) or person_id
-        return {"ok": True, "message": f"Editing {name}'s music link."}
-
-    if action_name == "music_person_link_edit_cancel":
-        _clear_person_link_edit_target(store)
-        return {"ok": True, "message": "Closed the music link editor."}
-
     if action_name in {
         "music_person_sleep_start_30",
         "music_person_sleep_start_60",
@@ -15083,8 +15004,6 @@ def handle_htmlui_tab_action(
         name = _people_person_name(person_id, store) or person_id
         _delete_person_link(person_id, store)
         _clear_person_link_test_state(person_id, store)
-        if _person_link_edit_target(store) == person_id:
-            _clear_person_link_edit_target(store)
         if _text(_settings(store).get("webui_view_as_person")) == person_id:
             _save_hash(store, SETTINGS_KEY, {"webui_view_as_person": ""})
         removed_link = _person_link(person_id, store)
