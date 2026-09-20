@@ -726,6 +726,174 @@ class CustomMusicCoreTests(unittest.TestCase):
         finally:
             self.core._provider = original_provider
 
+    # ---- Tater built-in AirPlay Input (v1.2.0+) ----
+
+    def test_airplay_receiver_settings_are_tater_owned(self):
+        core = self.core
+        # Tater v1.2.0+ owns the AirPlay Input receiver in main Tater code
+        # (Settings -> Voice -> AirPlay); the core ships no receiver settings.
+        for key in (
+            "airplay_receiver_enabled",
+            "airplay_receiver_name",
+            "airplay_receiver_pin",
+            "airplay_receiver_targets",
+        ):
+            self.assertNotIn(key, core.CORE_SETTINGS)
+        # A legacy save from a pre-3.8.2 UI is accepted but the keys are dropped.
+        result = core.handle_htmlui_tab_action(
+            action="music_save_settings",
+            payload={
+                "values": {
+                    "airplay_receiver_enabled": "on",
+                    "airplay_receiver_name": "Legacy Receiver",
+                    "airplay_receiver_targets": "airplay:stale",
+                    "default_shuffle": "off",
+                }
+            },
+            redis_client=self.redis,
+        )
+        self.assertTrue(result["ok"])
+        saved = self.redis.hgetall(core.SETTINGS_KEY)
+        for key in (
+            "airplay_receiver_enabled",
+            "airplay_receiver_name",
+            "airplay_receiver_targets",
+        ):
+            self.assertNotIn(key, saved)
+        self.assertEqual(saved.get("default_shuffle"), "off")
+
+    def stub_tater_airplay_input(self, settings):
+        tater_voice = types.ModuleType("tater_voice")
+        airplay_input = types.ModuleType("tater_voice.airplay_input")
+        airplay_input.load_settings = lambda: dict(settings)
+        tater_voice.airplay_input = airplay_input
+        originals = (
+            ("tater_voice", sys.modules.get("tater_voice")),
+            ("tater_voice.airplay_input", sys.modules.get("tater_voice.airplay_input")),
+        )
+        sys.modules["tater_voice"] = tater_voice
+        sys.modules["tater_voice.airplay_input"] = airplay_input
+        return originals
+
+    def stub_external_audio_status(self, status):
+        external_audio = types.ModuleType("external_audio")
+        external_audio.get_external_audio_status = lambda: dict(status)
+        return ("external_audio", sys.modules.get("external_audio")), external_audio
+
+    @staticmethod
+    def restore_stubs(originals):
+        for name, original in originals:
+            if original is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = original
+
+    def test_local_airplay_receiver_exclusion_uses_tater_settings(self):
+        core = self.core
+        tater_originals = self.stub_tater_airplay_input(
+            {
+                "enabled": True,
+                "receiver_name": "Tater Audio",
+                "receiver_pin": "",
+                "targets": ["airplay:tater"],
+            }
+        )
+        try:
+            outbound, local = core._split_local_airplay_receiver_options(
+                [
+                    {"value": "airplay:kitchen", "label": "AirPlay: Kitchen"},
+                    {"value": "airplay:tater", "label": "AirPlay: Tater Audio"},
+                ],
+                {},
+            )
+        finally:
+            self.restore_stubs(tater_originals)
+        self.assertEqual([row["value"] for row in outbound], ["airplay:kitchen"])
+        self.assertEqual(local, {"airplay:tater"})
+        # With no Tater module available, the pre-3.8.2 Music Core setting
+        # still names the receiver on older hosts.
+        outbound, local = core._split_local_airplay_receiver_options(
+            [
+                {"value": "airplay:kitchen", "label": "AirPlay: Kitchen"},
+                {"value": "airplay:tater", "label": "AirPlay: Tater Music"},
+            ],
+            {"airplay_receiver_name": "Tater Music"},
+        )
+        self.assertEqual([row["value"] for row in outbound], ["airplay:kitchen"])
+        self.assertEqual(local, {"airplay:tater"})
+
+    def test_airplay_card_is_status_only_and_off_by_default(self):
+        core = self.core
+        external_original, external_audio = self.stub_external_audio_status(
+            {"status": "disabled", "input_active": False}
+        )
+        sys.modules["external_audio"] = external_audio
+
+        class FakeEmbyProvider:
+            provider_id = "emby"
+            connected = True
+
+            def catalog(self):
+                return {"tracks": [], "artists": [], "albums": [], "genres": []}
+
+        original_provider = core._provider
+        core._provider = lambda client=None, provider_id="": FakeEmbyProvider()
+        try:
+            data = core.get_htmlui_tab_data()
+        finally:
+            core._provider = original_provider
+            self.restore_stubs([external_original])
+        card = next(
+            item
+            for item in data["ui"]["item_forms"]
+            if item.get("id") == "settings:airplay_receiver"
+        )
+        self.assertEqual(card["fields"], [])
+        self.assertNotIn("save_action", card)
+        self.assertNotIn("save_label", card)
+        self.assertEqual(card["title"], "Tater Audio")
+        self.assertIn("Tater Settings → Voice → AirPlay", card["detail"])
+        self.assertEqual(card["hero_badges"][0]["label"], "OFF")
+
+    def test_airplay_card_reflects_tater_builtin_settings(self):
+        core = self.core
+        tater_originals = self.stub_tater_airplay_input(
+            {
+                "enabled": True,
+                "receiver_name": "House Receiver",
+                "receiver_pin": "",
+                "targets": ["airplay:den"],
+            }
+        )
+        external_original, external_audio = self.stub_external_audio_status(
+            {"status": "ready", "input_active": False, "targets": ["airplay:den"]}
+        )
+        sys.modules["external_audio"] = external_audio
+
+        class FakeEmbyProvider:
+            provider_id = "emby"
+            connected = True
+
+            def catalog(self):
+                return {"tracks": [], "artists": [], "albums": [], "genres": []}
+
+        original_provider = core._provider
+        core._provider = lambda client=None, provider_id="": FakeEmbyProvider()
+        try:
+            data = core.get_htmlui_tab_data()
+        finally:
+            core._provider = original_provider
+            self.restore_stubs([external_original, *tater_originals])
+        card = next(
+            item
+            for item in data["ui"]["item_forms"]
+            if item.get("id") == "settings:airplay_receiver"
+        )
+        self.assertEqual(card["title"], "House Receiver")
+        self.assertEqual(card["fields"], [])
+        self.assertEqual(card["hero_badges"][0]["label"], "READY")
+        self.assertEqual(card["summary_rows"][0], {"label": "Receiver", "value": "House Receiver"})
+
     def test_core_system_tasks_shape(self):
         tasks = self.core.get_core_system_tasks()
         self.assertEqual(tasks["label"], "Personal Music Core")
