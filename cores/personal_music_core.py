@@ -54,7 +54,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.9.2"
+__version__ = "3.9.3"
 MIN_TATER_VERSION = "1.2.0"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby, Jellyfin, Subsonic, or Plex account or "
@@ -16799,18 +16799,18 @@ def run(stop_event: Optional[object] = None) -> None:
                 # Every queue slot (shared + each Person's) is advanced and
                 # kept topped up independently, so two People can listen to
                 # their own music in different rooms at the same time.
-                for queue_id in _active_queue_ids(store):
+                for queue_id in _active_queue_ids(redis_client):
                     try:
                         # Sleep timers first: an expired timer force-stops the
                         # queue, so no maintenance (or refill) runs afterwards.
-                        _sleep_timer_tick(store, queue_id)
+                        _sleep_timer_tick(redis_client, queue_id)
                         # Gaining-room resume delays: start queues that were
                         # moved and are waiting out their resume delay.
-                        _delayed_resume_tick(store, queue_id)
-                        _advance_finished_player(store, person_id=queue_id)
+                        _delayed_resume_tick(redis_client, queue_id)
+                        _advance_finished_player(redis_client, person_id=queue_id)
                         _schedule_continuation_refresh(
                             person_id=queue_id,
-                            client=store,
+                            client=redis_client,
                         )
                     except Exception as exc:
                         logger.warning(
