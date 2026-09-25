@@ -54,7 +54,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.9.1"
+__version__ = "3.9.2"
 MIN_TATER_VERSION = "1.2.0"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby, Jellyfin, Subsonic, or Plex account or "
@@ -16780,7 +16780,7 @@ def run(stop_event: Optional[object] = None) -> None:
                             # Same quiet skip as the household source: a Person's
                             # source that is configured but not connected yet
                             # must not log a failure every heartbeat.
-                            if not _provider(store, source_id, slot_id).connected:
+                            if not _provider(redis_client, source_id, slot_id).connected:
                                 continue
                             slot_payload = _catalog(provider_id=source_id, person_id=slot_id)
                             slot_synced = _as_float(slot_payload.get("synced_at"))
