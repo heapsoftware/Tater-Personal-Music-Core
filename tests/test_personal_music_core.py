@@ -2056,6 +2056,107 @@ class PerPersonLinkageTests(unittest.TestCase):
         self.assertTrue(art_url.startswith("http://emby.local:8096/Items/song1/Images/Primary?"))
 
 
+class UnconnectedCatalogErrorTests(unittest.TestCase):
+    """Voice play/search errors name the real fix, not "Connect Emby before syncing".
+
+    When the speaker does not resolve to a Person, the request falls back to the
+    household source; if that is unconnected the old message read like a sync
+    bug. The message must instead say who to link or what to connect.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.core = load_personal_music_core()
+
+    def setUp(self):
+        self.redis = FakeRedis()
+        self.core.redis_client = self.redis
+        self.core._shutdown_stream_server()
+
+    def tearDown(self):
+        self.core._shutdown_stream_server()
+
+    def stub_people(self, people):
+        original = self.core._PEOPLE_API_MODULE
+        self.core._PEOPLE_API_MODULE = types.SimpleNamespace(load_store=lambda _client=None: {"people": people})
+        self.addCleanup(setattr, self.core, "_PEOPLE_API_MODULE", original)
+
+    def test_unresolved_speaker_names_linked_persons_and_fallbacks(self):
+        self.stub_people(
+            [
+                {"id": "person_zoe", "display_name": "Zoe"},
+                {"id": "person_mia", "display_name": "Mia"},
+                {"id": "person_cas", "display_name": "Cas"},
+            ]
+        )
+        self.core._save_person_link(
+            "person_zoe",
+            {
+                "music_source": "emby",
+                "emby": {
+                    "server_url": "http://emby.local:8096",
+                    "username": "zoe",
+                    "password": "secret",
+                    "auth_mode": "user_token",
+                },
+            },
+            self.redis,
+        )
+        with self.assertRaises(ValueError) as caught:
+            self.core._play_request(
+                {"query": "some music", "targets": "office"},
+                {"platform": "homeassistant", "device_id": "native:office"},
+                self.redis,
+            )
+        message = str(caught.exception)
+        self.assertIn("could not match", message)
+        self.assertIn("household Emby", message)
+        self.assertIn("Zoe", message)
+        self.assertNotIn("Connect Emby before syncing", message)
+
+    def test_resolved_person_with_unfinished_link_names_their_card(self):
+        self.stub_people([{"id": "person_zoe", "display_name": "Zoe"}])
+        # A save that lost its credentials (e.g. a stale form) still produces a
+        # source-having link — the message must point at Zoe's card, not sync.
+        self.core._save_person_link(
+            "person_zoe",
+            {"music_source": "emby", "emby": {"auth_mode": "user_token"}},
+            self.redis,
+        )
+        with self.assertRaises(ValueError) as caught:
+            self.core._play_request(
+                {"query": "some music", "targets": "office"},
+                {"platform": "homeassistant", "people_resolution": {"master_user_id": "person_zoe"}},
+                self.redis,
+            )
+        message = str(caught.exception)
+        self.assertIn("Zoe's Emby link", message)
+        self.assertIn("Save Person Link", message)
+        self.assertNotIn("Connect Emby before syncing", message)
+
+    def test_no_links_at_all_points_at_the_household_source(self):
+        with self.assertRaises(ValueError) as caught:
+            self.core._play_request(
+                {"query": "some music", "targets": "office"},
+                {"platform": "homeassistant", "device_id": "native:office"},
+                self.redis,
+            )
+        message = str(caught.exception)
+        self.assertIn("household Emby", message)
+        self.assertIn("Personal Music Core settings", message)
+        self.assertNotIn("Connect Emby before syncing", message)
+
+    def test_household_sync_guard_message_is_unchanged_for_the_tab_flow(self):
+        # The people-tab save flow syncs directly; its dry guard wording is
+        # intact so existing UI copy and stats keep working.
+        with self.assertRaises(ValueError) as caught:
+            self.core._sync_catalog(self.redis, "emby", "")
+        self.assertEqual(
+            str(caught.exception),
+            "Connect Emby before syncing its music library.",
+        )
+
+
 def _track_row(number, title=None, duration=180.0):
     return {
         "id": f"track:{number}",

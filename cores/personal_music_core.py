@@ -54,7 +54,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.9.3"
+__version__ = "3.9.4"
 MIN_TATER_VERSION = "1.2.0"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby, Jellyfin, Subsonic, or Plex account or "
@@ -5651,6 +5651,50 @@ def _catalog_needs_artwork_refresh(
     return (
         _provider_id(payload.get("provider")) != _provider_id(provider_id)
         or _as_int(payload.get("artwork_schema"), 0, 0, 100) < CATALOG_ARTWORK_SCHEMA
+    )
+
+
+def _unconnected_catalog_error(
+    person_id: Any,
+    speaking_person_id: Any,
+    provider_id: Any,
+    client: Any = None,
+) -> str:
+    """Why a voice play/search refused to sync, phrased for Tater to say.
+
+    _sync_catalog_impl raises a dry "Connect Emby before syncing…" guard for
+    every unconnected case. Voice requests need the context Hydra lacks: who
+    the speaker resolved to (or didn't) decides whether the fix is a Person's
+    link, the Music Profile Person, or the household source.
+    """
+    store = client or globals().get("redis_client")
+    label = PROVIDER_LABELS.get(_provider_id(provider_id, ""), "music")
+    resolved = _text(speaking_person_id)
+    if resolved and _person_link_source(_person_link(resolved, client)):
+        name = _people_person_name(resolved, store)
+        return (
+            f"{name}'s {label} link is saved without its sign-in details. "
+            f"Open {name}'s music card in Personal Music Core settings, fill in "
+            f"the {label} credentials, and press Save Person Link."
+        )
+    # The request fell back to the household source (speaker unresolved, or a
+    # resolved Person with no music link of their own). Name the escape hatch.
+    linked = [
+        _people_person_name(linked_id, store)
+        for linked_id in _linked_person_ids(client)
+        if _people_person_name(linked_id, store)
+    ]
+    if linked:
+        who = " or ".join(linked[:2])
+        return (
+            f"I could not match who is speaking to a Person, and the household "
+            f"{label} source is not connected. Connect a household source in "
+            f"Personal Music Core settings, or set the Music Profile Person to "
+            f"{who} so requests like this use their library."
+        )
+    return (
+        f"The household {label} source is not connected. Connect it in "
+        f"Personal Music Core settings before asking for music by voice."
     )
 
 
@@ -11353,6 +11397,14 @@ def _play_request(
     selected_provider = _person_source_id(person_id, client)
     catalog = _person_catalog(client, selected_provider, person_id)
     if not isinstance(catalog.get("tracks"), list) or not catalog.get("tracks"):
+        # Raise the contextual message (who was speaking, what to connect)
+        # before the generic sync guard can produce "Connect Emby before…".
+        if not _provider(client, selected_provider, person_id).connected:
+            raise ValueError(
+                _unconnected_catalog_error(
+                    person_id, speaking_person_id, selected_provider, client
+                )
+            )
         catalog = _sync_catalog(client, selected_provider, person_id)
     query = _text(args.get("query") or args.get("music"))
     title = _text(args.get("title") or args.get("track") or args.get("song"))
@@ -11774,6 +11826,15 @@ async def run_hydra_kernel_tool(
         try:
             selected_provider = _person_source_id(active_person_id, store)
             if not (_person_catalog(store, selected_provider, active_person_id).get("tracks") or []):
+                if not _provider(store, selected_provider, active_person_id).connected:
+                    raise ValueError(
+                        _unconnected_catalog_error(
+                            active_person_id,
+                            _context_person_id(origin),
+                            selected_provider,
+                            store,
+                        )
+                    )
                 await asyncio.to_thread(_sync_catalog, store, selected_provider, active_person_id)
             matches = _search_tracks(
                 query=values.get("query"),
