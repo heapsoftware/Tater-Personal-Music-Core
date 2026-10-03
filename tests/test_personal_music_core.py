@@ -2699,6 +2699,35 @@ class MultiQueueTests(unittest.TestCase):
         self.assertEqual(core._player(self.redis, "person_a")["status"], "idle")
         self.assertEqual(self.stopped, [])
 
+    # ---- play failure logging ----
+
+    def test_failed_play_is_logged_and_stamps_the_player(self):
+        core = self.core
+        self.stub_playback()
+        self._originals["_play_track"] = core._play_track
+
+        def exploding_play(_track, _targets, **_kwargs):
+            raise RuntimeError("502 Server Error: Bad Gateway")
+
+        core._play_track = exploding_play
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"])
+        with self.assertLogs("personal_music_core", level="ERROR") as logged:
+            with self.assertRaises(ValueError) as caught:
+                core._start_player_index(0, person_id="person_a", client=self.redis)
+        # The log carries the person, the track, and the targets.
+        self.assertTrue(any("play failed" in row for row in logged.output), logged.output)
+        self.assertTrue(any("person_a" in row for row in logged.output), logged.output)
+        self.assertTrue(any("Kitchen" in row or "kitchen" in row for row in logged.output))
+        # The UI-facing error names the track and the reason.
+        self.assertIn("Jamming", str(caught.exception))
+        self.assertIn("502 Server Error", str(caught.exception))
+        # The player bar now explains itself instead of showing a bare error.
+        failed = core._player(self.redis, "person_a")
+        self.assertEqual(failed["status"], "error")
+        self.assertIn("502 Server Error", failed["last_error"])
+        # The satellite was stopped, not left playing a dead stream.
+        self.assertEqual(self.stopped, [["voice_core:native:kitchen"]])
+
     # ---- group volume, mute all / unmute all ----
 
     def stub_group_volume(self):
