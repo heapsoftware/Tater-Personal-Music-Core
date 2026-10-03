@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import hmac
 import importlib.util
@@ -10743,24 +10744,47 @@ def _start_player_index(
         start_position = max(0.0, _as_float(start_position_seconds))
         if duration > 0:
             start_position = min(duration, start_position)
-        result = _play_track(
-            track,
-            targets,
-            volume_percent=volume,
-            start_position_seconds=start_position,
-            mixed_sync_adjustment_ms=_mixed_sync_from_player_settings(
+        # The play handoff (stream proxy → satellite) is the one call whose
+        # failures previously vanished: they reached the UI as a bare error
+        # but never the Tater log. Log the traceback, stamp the player with a
+        # readable reason, and re-raise with context.
+        try:
+            result = _play_track(
+                track,
                 targets,
-                _selected_player_settings(targets, cfg, default_volume=volume),
-                _mixed_sync_adjustment(targets, cfg),
-            ),
-            player_settings=_selected_player_settings(
-                targets,
-                cfg,
-                default_volume=volume,
-            ),
-            airplay_group_id=reusable_airplay_group_id,
-            client=store,
-        )
+                volume_percent=volume,
+                start_position_seconds=start_position,
+                mixed_sync_adjustment_ms=_mixed_sync_from_player_settings(
+                    targets,
+                    _selected_player_settings(targets, cfg, default_volume=volume),
+                    _mixed_sync_adjustment(targets, cfg),
+                ),
+                player_settings=_selected_player_settings(
+                    targets,
+                    cfg,
+                    default_volume=volume,
+                ),
+                airplay_group_id=reusable_airplay_group_id,
+                client=store,
+            )
+        except Exception as exc:
+            logger.error(
+                "[Music] play failed person=%s track=%s targets=%s error=%s",
+                queue_id or "(shared queue)",
+                _track_label(track),
+                ", ".join(targets),
+                exc,
+                exc_info=True,
+            )
+            reason = _text(exc) or type(exc).__name__
+            failed_error = f"Playing {_track_label(track)} failed: {reason}"
+            with contextlib.suppress(Exception):
+                failed = _player(store, queue_id)
+                failed["status"] = "error"
+                failed["last_error"] = failed_error
+                failed["started_at"] = 0.0
+                _save_player(failed, store, queue_id)
+            raise ValueError(failed_error) from exc
         playback_result = {
             key: result.get(key)
             for key in (
