@@ -2617,6 +2617,88 @@ class MultiQueueTests(unittest.TestCase):
         finally:
             core._preferred_room_target = self._originals["_preferred_room_target"]
 
+    # ---- clear playlist ----
+
+    def test_clear_playlist_empties_queue_and_keeps_destinations(self):
+        core = self.core
+        self.stub_playback()
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"])
+        player = core._player(self.redis, "person_a")
+        player.update(
+            {
+                "smart_pool": [_track_row(9, "Sun Is Shining")],
+                "sleep_timer_ends_at": time.time() + 600,
+                "sleep_timer_minutes": 10,
+                "shuffle": True,
+                "repeat": "one",
+            }
+        )
+        core._save_player(player, self.redis, "person_a")
+
+        result = asyncio.run(
+            core.run_hydra_kernel_tool(
+                tool_id="personal_music_control",
+                args={"action": "clear"},
+                origin=self.origin_for("person_a"),
+                redis_client=self.redis,
+            )
+        )
+        self.assertTrue(result.get("ok"), result)
+        cleared = core._player(self.redis, "person_a")
+        # The playlist is fresh: idle, empty, no radio or pool left behind.
+        self.assertEqual(cleared["status"], "idle")
+        self.assertEqual(cleared["queue"], [])
+        self.assertEqual(cleared["queue_original"], [])
+        self.assertEqual(cleared["index"], -1)
+        self.assertEqual(cleared["current"], {})
+        self.assertFalse(cleared["shuffle"])
+        self.assertEqual(cleared["repeat"], "off")
+        self.assertEqual(cleared["smart_pool"], [])
+        self.assertEqual(cleared["radio_name"], "")
+        self.assertFalse(cleared["continuation_pending"])
+        self.assertNotIn("sleep_timer_ends_at", cleared)
+        self.assertNotIn("sleep_timer_minutes", cleared)
+        # Destinations, volume, and ownership survive the clear.
+        self.assertEqual(cleared["targets"], ["voice_core:native:kitchen"])
+        self.assertEqual(cleared["volume_percent"], 60)
+        self.assertEqual(cleared["person_id"], "person_a")
+        # Playing hardware was actually stopped, not just re-labelled idle.
+        self.assertEqual(self.stopped, [["voice_core:native:kitchen"]])
+
+    def test_clear_playlist_does_not_touch_other_queues(self):
+        core = self.core
+        self.stub_playback()
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"])
+        self.seed_playing_queue("person_b", ["voice_core:native:office"])
+        self.assertTrue(
+            asyncio.run(
+                core.run_hydra_kernel_tool(
+                    tool_id="personal_music_control",
+                    args={"action": "clear"},
+                    origin=self.origin_for("person_a"),
+                    redis_client=self.redis,
+                )
+            ).get("ok")
+        )
+        self.assertEqual(core._player(self.redis, "person_a")["queue"], [])
+        self.assertEqual(core._player(self.redis, "person_b")["status"], "playing")
+        self.assertEqual(self.stopped, [["voice_core:native:kitchen"]])
+
+    def test_clear_playlist_on_an_empty_queue_stays_ok(self):
+        core = self.core
+        self.stub_playback()
+        result = asyncio.run(
+            core.run_hydra_kernel_tool(
+                tool_id="personal_music_control",
+                args={"action": "clear"},
+                origin=self.origin_for("person_a"),
+                redis_client=self.redis,
+            )
+        )
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(core._player(self.redis, "person_a")["status"], "idle")
+        self.assertEqual(self.stopped, [])
+
     # ---- group volume, mute all / unmute all ----
 
     def stub_group_volume(self):
