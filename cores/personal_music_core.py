@@ -11265,6 +11265,53 @@ def _stop_player(*, person_id: Any = "", client: Any = None) -> Dict[str, Any]:
         return player
 
 
+def _clear_player(*, person_id: Any = "", client: Any = None) -> Dict[str, Any]:
+    """Stop playback and drop the queue's playlist back to fresh/never-played.
+
+    Keeps the Person's chosen destinations and volume; empties the queue, the
+    Smart Shuffle pool, radio state, and any sleep timer, so the playlist tab
+    is empty and the next play starts a brand-new playlist.
+    """
+    store = client or globals().get("redis_client")
+    queue_id = _queue_id_for_person(person_id)
+    with _state_lock:
+        player = _player(store, queue_id)
+        targets = _list(player.get("targets") or player.get("target"))
+        warnings = (
+            _stop_target(
+                targets,
+                expected_voice_core_sessions=_playback_voice_core_sessions(player),
+            )
+            if targets
+            else []
+        )
+        player.update(
+            {
+                "status": "idle",
+                "queue": [],
+                "queue_original": [],
+                "current": {},
+                "index": -1,
+                "started_at": 0.0,
+                "position_offset_seconds": 0.0,
+                "seek_position_pending": False,
+                "smart_pool": [],
+                "shuffle": False,
+                "repeat": "off",
+                "continuation_pending": False,
+                "radio_name": "",
+                "last_error": "",
+            }
+        )
+        _clear_delayed_resume(player)
+        for sleep_key in ("sleep_timer_ends_at", "sleep_timer_minutes", "sleep_timer_expired_at"):
+            player.pop(sleep_key, None)
+        if warnings:
+            player["warnings"] = warnings
+        _save_player(player, store, queue_id)
+        return player
+
+
 SLEEP_TIMER_MAX_MINUTES = 720
 
 
@@ -11684,7 +11731,7 @@ def get_hydra_kernel_tools(*, platform: str = "", **_kwargs) -> List[Dict[str, A
             "id": "personal_music_control",
             "description": (
                 "Control the Personal Music queue: next, previous, stop, replay, shuffle, repeat, "
-                "add more music to the queue, set a sleep timer, set one or more playback "
+                "add more music to the queue, clear the playlist, set a sleep timer, set one or more playback "
                 "destinations, or bind rooms to a Person. Each Person has their own queue, and "
                 "transport actions act on the music playing in the speaking room first, then that "
                 "Person's own queue. User-named screens (\"set targets to the office screen\") are "
@@ -11701,7 +11748,7 @@ def get_hydra_kernel_tools(*, platform: str = "", **_kwargs) -> List[Dict[str, A
             ),
             "usage": (
                 '{"function":"personal_music_control","arguments":'
-                '{"action":"next|previous|stop|replay|pause|resume|shuffle|repeat|add|sleep_timer|move|set_targets|'
+                '{"action":"next|previous|stop|replay|pause|resume|shuffle|repeat|add|clear|sleep_timer|move|set_targets|'
                 'bind_room|unbind_room|volume|mute_all|unmute_all",'
                 '"targets":["Kitchen","Living Room"],"enabled":true,"mode":"off|all|one",'
                 '"minutes":60,"volume_percent":70,"album":"","playlist":"","artist":"","genre":"","query":"",'
@@ -12132,6 +12179,10 @@ async def run_hydra_kernel_tool(
                 player = await asyncio.to_thread(_advance_player, -1, person_id=control_queue_id, client=store)
             elif action == "stop":
                 player = await asyncio.to_thread(_stop_player, person_id=control_queue_id, client=store)
+            elif action == "clear":
+                # Voice twin of the playlist tab's clear button: drop the queue
+                # fresh rather than just pausing it.
+                player = await asyncio.to_thread(_clear_player, person_id=control_queue_id, client=store)
             elif action == "replay":
                 current = _player(store, control_queue_id)
                 player = await asyncio.to_thread(
@@ -12351,8 +12402,8 @@ async def run_hydra_kernel_tool(
             else:
                 raise ValueError(
                     "Music control action must be next, previous, stop, replay, shuffle, repeat, "
-                    "add, sleep_timer, set_targets, bind_room, unbind_room, volume, mute_all, "
-                    "or unmute_all."
+                    "add, clear, sleep_timer, set_targets, bind_room, unbind_room, volume, "
+                    "mute_all, or unmute_all."
                 )
             targets = _list(player.get("targets") or player.get("target"))
             return {
@@ -12726,6 +12777,15 @@ def _player_item(
                 "tooltip": "Next track",
                 "working_text": "Loading next track...",
                 "success_text": "Next track started.",
+            },
+            {
+                "action": "music_ui_clear_queue",
+                "label": "🗑 Clear",
+                "aria_label": "Clear playlist",
+                "tooltip": "Stop playback and empty the playlist",
+                "tone": "danger",
+                "working_text": "Clearing the playlist...",
+                "success_text": "Playlist cleared.",
             },
             {
                 "action": "music_ui_mute_all",
@@ -16046,6 +16106,10 @@ def handle_htmlui_tab_action(
     if action_name == "music_ui_stop":
         _stop_player(person_id=viewer_person_id, client=store)
         return {"ok": True, "message": "Music stopped."}
+
+    if action_name == "music_ui_clear_queue":
+        _clear_player(person_id=viewer_person_id, client=store)
+        return {"ok": True, "message": "Playlist cleared — nothing is playing."}
 
     if action_name == "music_ui_pause":
         player = _pause_player(person_id=viewer_person_id, client=store)
