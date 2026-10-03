@@ -2157,6 +2157,141 @@ class UnconnectedCatalogErrorTests(unittest.TestCase):
         )
 
 
+class VoicePersonFallbackTests(unittest.TestCase):
+    """Stale speaker aliases still resolve to a Person by name, live.
+
+    Speaker profiles mint a new id whenever they are re-created, stranding
+    People aliases that stored the old id: Speaker ID keeps recognizing the
+    voice while people resolution finds no alias, so voice plays fall back to
+    the (often unconnected) household source. The fallback follows the voice
+    link dynamically instead: match the acoustically-matched speaker name
+    against Person display names and voice alias labels, only while an
+    enrolled profile with that name exists right now.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.core = load_personal_music_core()
+
+    def setUp(self):
+        self.redis = FakeRedis()
+        self.core.redis_client = self.redis
+        self.original_people = self.core._PEOPLE_API_MODULE
+        self.original_voice = self.core._VOICE_ALIAS_MODULE_CACHE
+        self.core._PEOPLE_API_MODULE = types.SimpleNamespace(
+            load_store=lambda _client=None: {
+                "people": [
+                    {
+                        "id": "person_steven",
+                        "display_name": "Steven",
+                        "aliases": [
+                            # Stale id from a re-enrolled profile: external_id
+                            # matches nothing live, but the label still names
+                            # this person's voice.
+                            {
+                                "platform": "voice_core",
+                                "external_id": "0b0bf72cdeadbeef",
+                                "label": "Steven",
+                                "kind": "speaker_id",
+                            }
+                        ],
+                    },
+                    {
+                        "id": "person_mom",
+                        "display_name": "Cecilia Mom",
+                        "aliases": [
+                            {
+                                "platform": "voice_core",
+                                "external_id": "6539c7df726849afaec00715ca34ae01",
+                                "label": "Mom",
+                                "kind": "speaker_id",
+                            }
+                        ],
+                    },
+                    {"id": "person_cece", "display_name": "Cecilia", "aliases": []},
+                ]
+            }
+        )
+        self.core._VOICE_ALIAS_MODULE_CACHE = types.SimpleNamespace(
+            speaker_identity_aliases=lambda: [
+                {
+                    "platform": "voice_core",
+                    # Live enrolled profile ids differ from the stored aliases.
+                    "external_id": "0e265ca2d55147449824911af52d0b15",
+                    "label": "Steven",
+                    "kind": "speaker_id",
+                },
+                {"platform": "voice_core", "external_id": "10f4f00cfecb4116a1f7fe63a7f44594", "label": "Cecilia"},
+                {"platform": "voice_core", "external_id": "6539c7df726849afaec00715ca34ae01", "label": "Mom"},
+            ]
+        )
+        self.addCleanup(setattr, self.core, "_PEOPLE_API_MODULE", self.original_people)
+        self.addCleanup(setattr, self.core, "_VOICE_ALIAS_MODULE_CACHE", self.original_voice)
+
+    def test_stale_alias_resolves_by_enrolled_profile_name(self):
+        # The acoustic match names the speaker; the stored external_id is dead.
+        origin = {
+            "speaker_name": "Steven",
+            "speaker_id": "0e265ca2d55147449824911af52d0b15",
+            "people_resolution": {"matched": False, "candidate_aliases": []},
+        }
+        self.assertEqual(self.core._voice_person_fallback(origin, self.redis), "person_steven")
+        self.assertEqual(self.core._context_person_id(origin), "person_steven")
+
+    def test_alias_label_matches_beyond_display_name(self):
+        # Cecilia Mom's enrolled alias label is "Mom": resolve via the label,
+        # not the display name.
+        origin = {
+            "speaker_name": "Mom",
+            "speaker_id": "6539c7df726849afaec00715ca34ae01",
+            "people_resolution": {"matched": False},
+        }
+        self.assertEqual(self.core._voice_person_fallback(origin, self.redis), "person_mom")
+
+    def test_unenrolled_name_does_not_resolve(self):
+        # Speaker matched acoustically but no enrolled profile exists for the
+        # name right now: stay unresolved rather than guess.
+        origin = {"speaker_name": "Cecilia Mom", "people_resolution": {"matched": False}}
+        self.assertEqual(self.core._voice_person_fallback(origin, self.redis), "")
+
+    def test_resolved_identity_skips_fallback(self):
+        # When Tater's alias resolution matched, its person wins untouched.
+        origin = {
+            "speaker_name": "Steven",
+            "speaker_id": "0e265ca2d55147449824911af52d0b15",
+            "people_resolution": {"matched": True, "master_user_id": "person_elsewhere"},
+        }
+        self.assertEqual(self.core._voice_person_fallback(origin, self.redis), "")
+        self.assertEqual(self.core._context_person_id(origin), "person_elsewhere")
+
+    def test_no_speaker_name_stays_unresolved(self):
+        self.assertEqual(self.core._voice_person_fallback({"people_resolution": {"matched": False}}, self.redis), "")
+        self.assertEqual(self.core._voice_person_fallback(None, self.redis), "")
+        # No enrolled profiles readable at all: never fall back.
+        self.core._VOICE_ALIAS_MODULE_CACHE = types.SimpleNamespace(
+            speaker_identity_aliases=lambda: []
+        )
+        self.assertEqual(
+            self.core._voice_person_fallback({"speaker_name": "Steven"}, self.redis), ""
+        )
+
+    def test_ambiguous_name_stays_unresolved(self):
+        # Two people claim the same voice name: refuse instead of picking one.
+        self.core._PEOPLE_API_MODULE = types.SimpleNamespace(
+            load_store=lambda _client=None: {
+                "people": [
+                    {"id": "person_a", "display_name": "Steven", "aliases": []},
+                    {
+                        "id": "person_b",
+                        "display_name": "Steven",
+                        "aliases": [{"platform": "voice_core", "external_id": "x", "label": "Steve"}],
+                    },
+                ]
+            }
+        )
+        self.assertEqual(self.core._voice_person_fallback({"speaker_name": "Steven"}, self.redis), "")
+
+
 def _track_row(number, title=None, duration=180.0):
     return {
         "id": f"track:{number}",

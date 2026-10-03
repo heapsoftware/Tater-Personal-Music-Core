@@ -54,7 +54,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.9.4"
+__version__ = "3.9.5"
 MIN_TATER_VERSION = "1.2.0"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby, Jellyfin, Subsonic, or Plex account or "
@@ -854,6 +854,8 @@ def _as_float(value: Any, default: float = 0.0) -> float:
 
 _PEOPLE_API_MODULE: Any = None
 _PEOPLE_API_UNAVAILABLE = False
+_VOICE_ALIAS_MODULE_CACHE: Any = None
+_VOICE_ALIAS_UNAVAILABLE = False
 
 
 def _people_api_module() -> Any:
@@ -919,6 +921,94 @@ def _people_person_options(client: Any = None) -> List[Dict[str, str]]:
     return options
 
 
+def _voice_alias_module() -> Any:
+    """Live enrolled-voice lookup (tater_voice.speaker_id), lazily cached.
+
+    Kept separate from the People API hook because tests stub each side
+    independently: speaker identity aliases come from enrolled profiles, not
+    the People store.
+    """
+    module = globals().get("_VOICE_ALIAS_MODULE_CACHE")
+    if module is not None:
+        return module
+    if _VOICE_ALIAS_UNAVAILABLE:
+        return None
+    try:
+        from tater_voice import speaker_id as speaker_id_module  # type: ignore
+
+        globals()["_VOICE_ALIAS_MODULE_CACHE"] = speaker_id_module
+        return speaker_id_module
+    except Exception:
+        globals()["_VOICE_ALIAS_UNAVAILABLE"] = True
+        return None
+
+
+def _enrolled_voice_ids_by_name(client: Any = None) -> Dict[str, str]:
+    """Casefolded enrolled speaker name -> current profile id.
+
+    Tater's speaker_id profiles mint a fresh id whenever they are re-created,
+    which strands any alias that stored the old id. Resolving by the profile's
+    label against the live list keeps the link valid across re-enrollment.
+    """
+    module = _voice_alias_module()
+    aliases_fn = getattr(module, "speaker_identity_aliases", None)
+    if not callable(aliases_fn):
+        return {}
+    out: Dict[str, str] = {}
+    try:
+        rows = aliases_fn() or []
+    except Exception:
+        return {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        label = _text(row.get("label"))
+        external_id = _text(row.get("external_id"))
+        platform = _text(row.get("platform")).casefold()
+        if label and external_id and platform == "voice_core" and label.casefold() not in out:
+            out[label.casefold()] = external_id
+    return out
+
+
+def _voice_person_fallback(origin: Any, client: Any = None) -> str:
+    """Resolve a voice Person when Tater's stored speaker alias went stale.
+
+    Runs only when the voice pipeline acoustically matched the speaker
+    (origin carries speaker_name) but people resolution came up empty —
+    normally a re-enrolled profile whose new id no longer matches the stored
+    alias. The person's voice link is followed live: name match against the
+    Person (and their voice alias labels, e.g. "Mom" -> Cecilia Mom) plus a
+    check that an enrolled profile with that name exists right now. Requires
+    exactly one match; anything ambiguous stays unresolved.
+    """
+    source = origin if isinstance(origin, dict) else {}
+    resolved = source.get("people_resolution")
+    if isinstance(resolved, dict) and (_text(resolved.get("master_user_id")) or resolved.get("matched")):
+        return ""
+    speaker_name = _text(source.get("speaker_name"))
+    if not speaker_name:
+        return ""
+    enrolled = _enrolled_voice_ids_by_name(client)
+    if not enrolled or speaker_name.casefold() not in enrolled:
+        return ""
+    matches: List[str] = []
+    for person in _people_person_rows(client):
+        person_id = _text(person.get("id"))
+        if not person_id:
+            continue
+        names = {_text(person.get("display_name")).casefold()}
+        for alias in person.get("aliases") or []:
+            if isinstance(alias, dict) and _text(alias.get("platform")) == "voice_core":
+                label = _text(alias.get("label") or alias.get("external_id"))
+                if label:
+                    names.add(label.casefold())
+        if speaker_name.casefold() in names:
+            matches.append(person_id)
+            if len(matches) > 1:
+                return ""
+    return matches[0] if matches else ""
+
+
 def _context_person_id(*sources: Any) -> str:
     for source in sources:
         if not isinstance(source, dict):
@@ -929,6 +1019,10 @@ def _context_person_id(*sources: Any) -> str:
             person_id = _text(candidate.get("master_user_id") or candidate.get("person_id"))
             if person_id:
                 return person_id
+    for source in sources:
+        person_id = _voice_person_fallback(source)
+        if person_id:
+            return person_id
     return ""
 
 
