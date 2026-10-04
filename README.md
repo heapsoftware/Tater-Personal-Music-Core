@@ -389,7 +389,14 @@ comes from:
   the strongest fresh signal — no Home Assistant needed. A Person counts as
   **home** until they haven't been seen for the **Follow-Me BLE Away Timeout**
   (default 90 s); after that the Away Behavior applies, so a dead battery or a
-  left-behind tag is treated the same as leaving the house.
+  left-behind tag is treated the same as leaving the house. On Tater v1.2.3+,
+  the core also resolves the saved address against Tater's identity-resolved
+  presence (registered devices, IRK, iBeacons) and pins the stable
+  **presence identity** it finds on the Person card automatically — so phones
+  that rotate their BLE address keep getting followed. Room state prefers
+  Tater's own stabilized room assignment over the raw strongest-signal
+  reading, so a device heard by several satellites in one room doesn't cause
+  spurious moves.
 
 Both sources produce the same room handoffs below; a Person can even mix
 sources (one tracked by Home Assistant, another by BLE) with the per-Person

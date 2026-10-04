@@ -1450,6 +1450,57 @@ class PerPersonLinkageTests(unittest.TestCase):
         finally:
             self.core._PEOPLE_API_MODULE = original_people
 
+    def test_link_save_carries_and_resets_the_presence_pin(self):
+        people = types.SimpleNamespace(
+            load_store=lambda _client=None: {
+                "people": [{"id": "person_zoe", "display_name": "Zoe"}]
+            }
+        )
+        original_people = self.core._PEOPLE_API_MODULE
+        self.core._PEOPLE_API_MODULE = people
+        self.redis.hset(
+            self.core.PERSON_LINKS_KEY,
+            mapping={
+                "person_zoe": json.dumps(
+                    {
+                        "music_source": "network_share",
+                        "network_share": {"root_path": self.share_root},
+                        "follow_me_ble_address": "aa:bb:cc:dd:ee:ff",
+                        "follow_me_presence_id": "presence-1",
+                    }
+                )
+            },
+        )
+        try:
+            # The save action rebuilds the link from form values, so the
+            # resolved pin must be carried across an unchanged address...
+            self.core._save_person_link_action(
+                {
+                    "person_link_person_id": "person_zoe",
+                    "person_link_source": "network_share",
+                    "person_link_share_root_path": self.share_root,
+                    "person_link_follow_me_ble_address": "AA:BB:CC:DD:EE:FF",
+                },
+                self.redis,
+            )
+            link = self.core._person_link("person_zoe", self.redis)
+            self.assertEqual(link["follow_me_presence_id"], "presence-1")
+            # ...but changing the address drops it so the next tick re-resolves.
+            self.core._save_person_link_action(
+                {
+                    "person_link_person_id": "person_zoe",
+                    "person_link_source": "network_share",
+                    "person_link_share_root_path": self.share_root,
+                    "person_link_follow_me_ble_address": "11:22:33:44:55:66",
+                },
+                self.redis,
+            )
+            self.assertNotIn(
+                "follow_me_presence_id", self.core._person_link("person_zoe", self.redis)
+            )
+        finally:
+            self.core._PEOPLE_API_MODULE = original_people
+
     def test_link_save_folder_playlists_override(self):
         people = types.SimpleNamespace(
             load_store=lambda _client=None: {
@@ -3534,6 +3585,11 @@ class FollowMeTests(unittest.TestCase):
         """Point Tater's native BLE snapshot at fakes (like stub_ha)."""
         core = self.core
         self.ble_devices = {}
+        # v1.2.3+ presence-identity lookups, keyed by the resolved presence id.
+        self.ble_devices_by_id = {}
+        # Full identity-resolved pass (no address/device_id filter): the
+        # registry Tater reports when the core resolves an address to a pin.
+        self.ble_full_devices = []
         self.ble_observations = []
         self.ble_queries = []
         self._originals["_tater_ble_snapshot"] = core._tater_ble_snapshot
@@ -3544,15 +3600,22 @@ class FollowMeTests(unittest.TestCase):
             str(name), ""
         )
 
-        def fake_snapshot(*, address, max_age_s, include_observations=False):
+        def fake_snapshot(*, address="", device_id="", max_age_s=90, include_observations=False):
             self.ble_queries.append(
                 {
                     "address": address,
+                    "device_id": device_id,
                     "max_age_s": max_age_s,
                     "include_observations": include_observations,
                 }
             )
-            devices = self.ble_devices.get(address)
+            if device_id:
+                devices = self.ble_devices_by_id.get(device_id) or []
+            elif address:
+                devices = self.ble_devices.get(address)
+            else:
+                # None simulates the module being unavailable.
+                devices = self.ble_full_devices
             if devices is None:  # None simulates the module being unavailable
                 return None
             snapshot = {
@@ -3562,11 +3625,30 @@ class FollowMeTests(unittest.TestCase):
                 "generated_ts": time.time(),
             }
             if include_observations:
-                # Simulated satellite observations: (room, rssi, age seconds ago).
-                snapshot["observations"] = [
-                    {"room": room, "rssi": rssi, "received_ts": snapshot["generated_ts"] - age}
-                    for room, rssi, age in self.ble_observations
-                ]
+                # Simulated satellite observations: (room, rssi, age seconds ago)
+                # for observation dicts, or (room, rssi, age, address) to test
+                # the device-scoped earshot probe.
+                snapshot["observations"] = []
+                for entry in self.ble_observations:
+                    if len(entry) == 4:
+                        room, rssi, age, address_seen = entry
+                        snapshot["observations"].append(
+                            {
+                                "room": room,
+                                "rssi": rssi,
+                                "received_ts": snapshot["generated_ts"] - age,
+                                "address": address_seen,
+                            }
+                        )
+                    else:
+                        room, rssi, age = entry
+                        snapshot["observations"].append(
+                            {
+                                "room": room,
+                                "rssi": rssi,
+                                "received_ts": snapshot["generated_ts"] - age,
+                            }
+                        )
             return snapshot
 
         core._tater_ble_snapshot = fake_snapshot
@@ -3624,7 +3706,14 @@ class FollowMeTests(unittest.TestCase):
         # timeout, without observations (no Prompt-Stop pass needs them).
         self.assertEqual(
             self.ble_queries,
-            [{"address": "aa:bb:cc:dd:ee:ff", "max_age_s": 90, "include_observations": False}],
+            [
+                {
+                    "address": "aa:bb:cc:dd:ee:ff",
+                    "device_id": "",
+                    "max_age_s": 90,
+                    "include_observations": False,
+                }
+            ],
         )
         # Not seen within the timeout: away, like HA's not_home.
         self.ble_devices["aa:bb:cc:dd:ee:ff"] = []
@@ -3750,6 +3839,212 @@ class FollowMeTests(unittest.TestCase):
             {"address": "aa:bb:cc:dd:ee:ff", "strongest_room": "Kitchen"}
         ]
         self.assertNotIn("room_changed_ts", core._ble_person_location(self.redis, link, probe_room_signal=True))
+
+    def test_ble_person_location_prefers_the_stabilized_location_room(self):
+        core = self.core
+        self.stub_ble()
+        link = {"follow_me_ble_address": "aa:bb:cc:dd:ee:ff"}
+        # Tater v1.2.3+ stabilizes the assigned room (location_room) over the
+        # raw strongest-signal reading; the core prefers it.
+        self.ble_devices["aa:bb:cc:dd:ee:ff"] = [
+            {
+                "address": "aa:bb:cc:dd:ee:ff",
+                "location_room": "Office",
+                "strongest_room": "Kitchen",
+                "strongest_rssi": -58,
+            }
+        ]
+        self.assertEqual(core._ble_person_location(self.redis, link)["state"], "Office")
+        # "Unknown" means the device drifted past its room's max radius — the
+        # honest per-radius read wins over... nothing: no raw room either, so
+        # the dead-zone Unknown rides through.
+        self.ble_devices["aa:bb:cc:dd:ee:ff"] = [
+            {
+                "address": "aa:bb:cc:dd:ee:ff",
+                "location_room": "Unknown",
+                "strongest_room": "",
+            }
+        ]
+        self.assertEqual(core._ble_person_location(self.redis, link)["state"], "Unknown")
+        # A device beyond its room's radius with a fresh raw reading reports
+        # that room instead of the stale assignment.
+        self.ble_devices["aa:bb:cc:dd:ee:ff"] = [
+            {
+                "address": "aa:bb:cc:dd:ee:ff",
+                "location_room": "Unknown",
+                "strongest_room": "Hallway",
+            }
+        ]
+        self.assertEqual(core._ble_person_location(self.redis, link)["state"], "Hallway")
+        # Pre-1.2.3 snapshots carry only strongest_room — same result as ever.
+        self.ble_devices["aa:bb:cc:dd:ee:ff"] = [
+            {"address": "aa:bb:cc:dd:ee:ff", "strongest_room": "Kitchen"}
+        ]
+        self.assertEqual(core._ble_person_location(self.redis, link)["state"], "Kitchen")
+
+    def test_ble_person_location_pins_presence_id_on_address_miss(self):
+        core = self.core
+        self.stub_ble()
+        self.redis.hset(
+            core.PERSON_LINKS_KEY,
+            mapping={
+                "person_a": json.dumps(
+                    {"follow_me_ble_address": "aa:bb:cc:dd:ee:ff", "follow_me_presence_source": "tater_ble"}
+                )
+            },
+        )
+        link = core._person_link("person_a", self.redis)
+        # The phone rotated its address: the saved one matches nothing.
+        self.ble_devices["aa:bb:cc:dd:ee:ff"] = []
+        rotated = {
+            "presence_id": "presence-1",
+            "identity_type": "irk",
+            "address": "d0:11:22:33:44:55",
+            "addresses": ["aa:bb:cc:dd:ee:ff", "d0:11:22:33:44:55"],
+            "strongest_room": "Office",
+            "strongest_rssi": -60,
+        }
+        self.ble_full_devices = [rotated]
+        self.ble_devices_by_id["presence-1"] = [dict(rotated)]
+        self.assertEqual(
+            core._ble_person_location(self.redis, link, person_id="person_a")["state"],
+            "Office",
+        )
+        # The full-resolved pass was queried unfiltered, then the pin was
+        # re-queried by id — and the pin persisted on the Person link.
+        self.assertEqual(
+            [row["address"] for row in self.ble_queries],
+            ["aa:bb:cc:dd:ee:ff", "", ""],
+        )
+        self.assertEqual(
+            self.ble_queries[2]["device_id"],
+            "presence-1",
+        )
+        self.assertEqual(
+            core._person_link("person_a", self.redis).get("follow_me_presence_id"),
+            "presence-1",
+        )
+        # Next tick: the pinned id short-circuits straight to the device.
+        self.ble_queries.clear()
+        link = core._person_link("person_a", self.redis)
+        self.assertEqual(
+            core._ble_person_location(self.redis, link, person_id="person_a")["state"],
+            "Office",
+        )
+        self.assertEqual(
+            self.ble_queries,
+            [
+                {
+                    "address": "",
+                    "device_id": "presence-1",
+                    "max_age_s": 90,
+                    "include_observations": False,
+                }
+            ],
+        )
+
+    def test_ble_person_location_never_pins_per_address_identities(self):
+        core = self.core
+        self.stub_ble()
+        self.redis.hset(
+            core.PERSON_LINKS_KEY,
+            mapping={
+                "person_a": json.dumps({"follow_me_ble_address": "aa:bb:cc:dd:ee:ff"})
+            },
+        )
+        link = core._person_link("person_a", self.redis)
+        self.ble_devices["aa:bb:cc:dd:ee:ff"] = []
+        # An unregistered device's fallback identity is just its address
+        # (ble-<mac>) — pinning it adds nothing and must be skipped.
+        self.ble_full_devices = [
+            {
+                "presence_id": "ble-aabbccddeeff",
+                "identity_type": "address",
+                "address": "aa:bb:cc:dd:ee:ff",
+                "addresses": ["aa:bb:cc:dd:ee:ff"],
+                "strongest_room": "Office",
+            }
+        ]
+        self.assertEqual(
+            core._ble_person_location(self.redis, link, person_id="person_a"),
+            {"state": "not_home", "source": "tater_ble"},
+        )
+        self.assertEqual(
+            core._person_link("person_a", self.redis).get("follow_me_presence_id"),
+            None,
+        )
+
+    def test_ble_person_location_uses_and_refreshes_the_pinned_presence_id(self):
+        core = self.core
+        self.stub_ble()
+        link = {
+            "follow_me_ble_address": "aa:bb:cc:dd:ee:ff",
+            "follow_me_presence_id": "presence-1",
+        }
+        device = {
+            "presence_id": "presence-1",
+            "address": "d0:11:22:33:44:55",
+            "addresses": ["aa:bb:cc:dd:ee:ff", "d0:11:22:33:44:55"],
+            "strongest_room": "Den",
+        }
+        self.ble_devices_by_id["presence-1"] = [device]
+        self.assertEqual(core._ble_person_location(self.redis, link)["state"], "Den")
+        self.assertEqual(self.ble_queries[0]["device_id"], "presence-1")
+        self.assertEqual(self.ble_queries[0]["address"], "")
+        # A stale pin (device gone) falls back to the saved address...
+        self.ble_devices_by_id["presence-1"] = []
+        self.ble_queries.clear()
+        self.ble_devices["aa:bb:cc:dd:ee:ff"] = [
+            {"address": "aa:bb:cc:dd:ee:ff", "strongest_room": "Kitchen"}
+        ]
+        self.assertEqual(core._ble_person_location(self.redis, link)["state"], "Kitchen")
+        self.assertEqual(self.ble_queries[-1]["address"], "aa:bb:cc:dd:ee:ff")
+        # ...and an address hit re-resolves the pin for the next tick.
+        current = device.copy()
+        current["presence_id"] = "presence-2"
+        current["identity_type"] = "irk"
+        current["strongest_room"] = "Kitchen"
+        self.ble_devices["aa:bb:cc:dd:ee:ff"] = [current]
+        self.ble_devices_by_id["presence-2"] = [dict(current)]
+        self.ble_queries.clear()
+        self.assertEqual(
+            core._ble_person_location(
+                self.redis, link, person_id="person_a"
+            )["state"],
+            "Kitchen",
+        )
+        self.assertEqual(
+            core._person_link("person_a", self.redis).get("follow_me_presence_id"),
+            "presence-2",
+        )
+
+    def test_ble_person_location_probe_scopes_observations_to_the_device(self):
+        core = self.core
+        self.stub_ble()
+        device = {
+            "presence_id": "presence-1",
+            "identity_type": "irk",
+            "address": "d0:11:22:33:44:55",
+            "addresses": ["aa:bb:cc:dd:ee:ff", "d0:11:22:33:44:55"],
+            "strongest_room": "Kitchen",
+            "strongest_rssi": -61,
+            "room_changed_ts": 1234.0,
+        }
+        self.ble_devices_by_id["presence-1"] = [device]
+        link = {
+            "follow_me_ble_address": "aa:bb:cc:dd:ee:ff",
+            "follow_me_presence_id": "presence-1",
+        }
+        # Someone else's key fob rests in the Kitchen advertising a much
+        # stronger signal — a device_id snapshot returns their observations
+        # too, so the earshot probe must ignore them.
+        self.ble_observations = [
+            ("Kitchen", -30, 0.2, "other:fob:mac"),
+            ("Kitchen", -61, 2.0, "d0:11:22:33:44:55"),
+        ]
+        probed = core._ble_person_location(self.redis, link, probe_room_signal=True)
+        self.assertEqual(probed["room_rssi"], -61)
+        self.assertAlmostEqual(probed["room_seen_age_s"], 2.0, delta=0.2)
 
     def test_follow_me_ble_prompt_stop_pauses_on_signal_decay_and_rewinds(self):
         core = self.core
