@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.12.0"
+__version__ = "3.13.0"
 MIN_TATER_VERSION = "1.2.0"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby, Jellyfin, Subsonic, or Plex account or "
@@ -4199,8 +4199,6 @@ class ProviderFieldSpec:
     # `kind` is "text" or "password"; password fields keep their saved value
     # when a form submits them blank.
     link_fields: Tuple[Dict[str, str], ...] = ()
-    primary_option_label = ""
-    extra_option_label = ""
 
     def form_key(self, prefix: str, key: str) -> str:
         return f"{prefix}_{self.form_token}_{key}"
@@ -4235,11 +4233,6 @@ class ProviderFieldSpec:
                     row["description"] = description
             rows.append(row)
         return rows
-
-    def source_options(self, kind: str) -> List[Dict[str, str]]:
-        """The picker rows this provider offers (empty when not selectable)."""
-        label = self.primary_option_label if kind == "primary" else self.extra_option_label
-        return [{"value": self.provider_id, "label": label}] if label else []
 
     def connection_detail(self, cfg: Dict[str, Any]) -> str:
         return _text(cfg.get(f"{self.provider_id}_server_url")) or (
@@ -4445,8 +4438,6 @@ class _EmbyProviderFieldSpec(_EmbyStyleProviderFieldSpec):
     provider_id = "emby"
     form_token = "emby"
     link_fields = _EMBY_LINK_FIELDS
-    primary_option_label = "Emby (own user/library)"
-    extra_option_label = "Emby (a second account or library)"
 
     def connection_detail(self, cfg: Dict[str, Any]) -> str:
         return _text(
@@ -4469,8 +4460,6 @@ class _JellyfinProviderFieldSpec(_EmbyStyleProviderFieldSpec):
     provider_id = "jellyfin"
     form_token = "jellyfin"
     link_fields = _EMBY_LINK_FIELDS
-    primary_option_label = "Jellyfin (own user/library)"
-    extra_option_label = "Jellyfin (a second account or library)"
 
     def connection_detail(self, cfg: Dict[str, Any]) -> str:
         return _text(cfg.get("jellyfin_server_url")) or (
@@ -4507,8 +4496,6 @@ class _SubsonicProviderFieldSpec(ProviderFieldSpec):
             "description": "Leave blank to keep the saved password.",
         },
     )
-    primary_option_label = "Subsonic (own server account)"
-    extra_option_label = "Subsonic (a second server account)"
 
     def build_provider(self, values: Dict[str, Any], stream_scope: str = "") -> Any:
         return SubsonicMusicProvider(
@@ -4613,8 +4600,6 @@ class _PlexProviderFieldSpec(ProviderFieldSpec):
             "description": "Pasted token for manual sign-in, or the resolved token. Leave blank to keep the saved token.",
         },
     )
-    primary_option_label = "Plex (own account)"
-    extra_option_label = "Plex (a second account)"
 
     def person_fields(
         self,
@@ -4746,8 +4731,6 @@ class _ShareProviderFieldSpec(ProviderFieldSpec):
             ),
         },
     )
-    primary_option_label = "Network share (own folder)"
-    extra_option_label = "Network share (a second folder)"
 
     def build_provider(self, values: Dict[str, Any], stream_scope: str = "") -> Any:
         del stream_scope  # Share streams scope themselves via their root path.
@@ -14144,21 +14127,78 @@ def _provider_fields(cfg: Dict[str, Any], provider_id: str) -> List[Dict[str, An
     return global_fields(cfg) if callable(global_fields) else []
 
 
+def _household_source_ids(client: Any = None) -> set[str]:
+    """Provider ids added to the household through the Sources tab's Add Source flow.
+
+    A provider stays listed once added, so its card exists before the connection
+    details are saved (it shows as Setup Needed until then). Sources paired by
+    older versions are never in this list; rendering includes them too.
+    """
+    added_key = "household_sources"
+    try:
+        added = json.loads(_text(_settings(client).get(added_key)) or "[]")
+    except Exception:
+        added = []
+    if not isinstance(added, list):
+        return set()
+    return {
+        _provider_id(_text(provider_id), "")
+        for provider_id in added
+        if _provider_id(_text(provider_id), "") in CATALOG_PROVIDER_IDS
+    }
+
+
+def _mark_household_source_added(provider_id: str, client: Any) -> None:
+    ids = sorted(_household_source_ids(client) | {_provider_id(provider_id, "")})
+    _save_hash(
+        client or globals().get("redis_client"),
+        SETTINGS_KEY,
+        {"household_sources": json.dumps(ids)},
+    )
+
+
+def _mark_household_source_removed(provider_id: str, client: Any) -> None:
+    ids = sorted(_household_source_ids(client) - {_provider_id(provider_id, "")})
+    _save_hash(
+        client or globals().get("redis_client"),
+        SETTINGS_KEY,
+        {"household_sources": json.dumps(ids)},
+    )
+
+
 def _provider_cards(
     cfg: Dict[str, Any],
     active_provider: str,
     client: Any = None,
 ) -> List[Dict[str, Any]]:
-    """Global source cards under Sources.
+    """Household source cards under Sources.
 
-    These describe the household's shared source, so the track badge reads the
-    global catalog stats — never a linked Person's personal library counts.
+    Only set-up sources are listed: providers added through the Add Source
+    flow (see _add_source_item) plus providers an earlier version already
+    paired. Each card's Edit popup carries just that provider's connection
+    fields (save via music_provider_connect), and Delete clears it entirely.
     """
+    del active_provider  # The badge reads catalog stats, not the active provider id.
+    added_ids = _household_source_ids(client)
     global_stats = _catalog_stats("", client)
     cards: List[Dict[str, Any]] = []
     for provider_id in CATALOG_PROVIDER_ORDER:
-        label = PROVIDER_LABELS[provider_id]
         connected = _paired(cfg, provider_id)
+        if provider_id not in added_ids and not connected:
+            continue
+        label = PROVIDER_LABELS[provider_id]
+        used_by = sorted(
+            {
+                _people_person_name(person_id, client) or person_id
+                for person_id, link in _person_links(client).items()
+                if not _person_link_source(link)
+            }
+        )
+        detail = _provider_connection_detail(cfg, provider_id)
+        if used_by:
+            detail += f" People playing the household source: {', '.join(used_by)}."
+        else:
+            detail += " No People play from it — the household plays it directly."
         actions: List[Dict[str, Any]] = [
             {
                 "action": "music_provider_connect",
@@ -14168,29 +14208,32 @@ def _provider_cards(
             }
         ]
         if connected:
-            actions.extend(
-                [
-                    {
-                        "action": "music_provider_activate",
-                        "label": "Rescan Library",
-                        "working_text": f"Loading the {label} library...",
-                        "success_text": f"{label} library loaded.",
-                    },
-                    {
-                        "action": "music_provider_disconnect",
-                        "label": "Disconnect",
-                        "tone": "danger",
-                        "confirm": f"Disconnect Personal Music Core from {label}?",
-                    },
-                ]
+            actions.append(
+                {
+                    "action": "music_provider_activate",
+                    "label": "Rescan Library",
+                    "working_text": f"Loading the {label} library...",
+                    "success_text": f"{label} library loaded.",
+                }
             )
+        actions.append(
+            {
+                "action": "music_provider_disconnect",
+                "label": "Delete Source",
+                "tone": "danger",
+                "confirm": (
+                    f"Delete the household {label} source and clear its saved connection "
+                    "details? People who were playing from it have no linked music after this."
+                ),
+            }
+        )
         cards.append(
             {
                 "id": f"provider:{provider_id}",
                 "group": "providers",
                 "title": label,
-                "subtitle": "Connected music source" if connected else "Not connected",
-                "detail": _provider_connection_detail(cfg, provider_id),
+                "subtitle": "Household shared source · " + ("Connected" if connected else "Setup needed"),
+                "detail": detail,
                 "hero_badges": [
                     {
                         "label": "CONNECTED" if connected else "SETUP NEEDED",
@@ -14207,8 +14250,11 @@ def _provider_cards(
                     },
                 ],
                 "fields": _provider_fields(cfg, provider_id),
-                "fields_popup": False,
-                "fields_dropdown": True,
+                "fields_popup": True,
+                "settings_label": "Edit",
+                "settings_title": f"{label} connection details",
+                "save_action": "music_provider_connect",
+                "save_label": "Save Source",
                 "actions": actions,
             }
         )
@@ -14575,38 +14621,27 @@ def _library_summary_value(
     Rendered on the card's detail line, whose host CSS wraps — the
     summary-row boxes ellipsis-truncate long values (e.g. sync errors).
     """
-    stats = _catalog_stats(person_id, store)
-    status = _text(stats.get("status"))
+    summary = _catalog_slot_summary_value(person_id, not_synced_hint=not_synced_hint, store=store)
     # A Person with a second linked source sums both libraries into one line.
     extra_source = _person_link_extra_source(_person_link(person_id, store))
-    if extra_source and status == "ok":
-        extra_stats = _catalog_stats(_person_extra_slot(person_id, extra_source), store)
-        if _text(extra_stats.get("status")) == "ok":
-            return (
-                f"{_as_int(stats.get('track_count'), 0, 0, 10**9) + _as_int(extra_stats.get('track_count'), 0, 0, 10**9)} tracks"
-                f" · {_as_int(stats.get('artist_count'), 0, 0, 10**9) + _as_int(extra_stats.get('artist_count'), 0, 0, 10**9)} artists"
-                f" · {_as_int(stats.get('album_count'), 0, 0, 10**9) + _as_int(extra_stats.get('album_count'), 0, 0, 10**9)} albums"
-                f" · {_as_int(stats.get('genre_count'), 0, 0, 10**9) + _as_int(extra_stats.get('genre_count'), 0, 0, 10**9)} genres"
-                f" · scanned {_format_time(max(_as_float(stats.get('synced_at')), _as_float(extra_stats.get('synced_at'))))}"
-            )
-        if _text(extra_stats.get("status")) == "error":
-            return (
-                f"{_library_summary_value(person_id, not_synced_hint=not_synced_hint, store=store)}"
-                f" · second source failed: {_text(extra_stats.get('error')) or 'unknown error'}"
-            )
-    if status == "syncing":
-        return "Syncing…"
-    if status == "error":
-        return f"Last sync failed: {_text(stats.get('error')) or 'unknown error'}"
-    if status != "ok":
-        return not_synced_hint
-    return (
-        f"{_as_int(stats.get('track_count'), 0, 0, 10**9)} tracks"
-        f" · {_as_int(stats.get('artist_count'), 0, 0, 10**9)} artists"
-        f" · {_as_int(stats.get('album_count'), 0, 0, 10**9)} albums"
-        f" · {_as_int(stats.get('genre_count'), 0, 0, 10**9)} genres"
-        f" · scanned {_format_time(stats.get('synced_at'))}"
-    )
+    if not extra_source:
+        return summary
+    stats = _catalog_stats(person_id, store)
+    extra_stats = _catalog_stats(_person_extra_slot(person_id, extra_source), store)
+    if _text(stats.get("status")) == "ok" and _text(extra_stats.get("status")) == "ok":
+        return (
+            f"{_as_int(stats.get('track_count'), 0, 0, 10**9) + _as_int(extra_stats.get('track_count'), 0, 0, 10**9)} tracks"
+            f" · {_as_int(stats.get('artist_count'), 0, 0, 10**9) + _as_int(extra_stats.get('artist_count'), 0, 0, 10**9)} artists"
+            f" · {_as_int(stats.get('album_count'), 0, 0, 10**9) + _as_int(extra_stats.get('album_count'), 0, 0, 10**9)} albums"
+            f" · {_as_int(stats.get('genre_count'), 0, 0, 10**9) + _as_int(extra_stats.get('genre_count'), 0, 0, 10**9)} genres"
+            f" · scanned {_format_time(max(_as_float(stats.get('synced_at')), _as_float(extra_stats.get('synced_at'))))}"
+        )
+    if _text(extra_stats.get("status")) == "error":
+        return (
+            f"{summary}"
+            f" · second source failed: {_text(extra_stats.get('error')) or 'unknown error'}"
+        )
+    return summary
 
 
 def _person_link_personalization_fields(
@@ -14836,129 +14871,279 @@ def _person_link_personalization_fields(
     ]
 
 
-def _person_link_extra_source_fields(
-    link: Dict[str, Any],
-    cfg: Dict[str, Any],
-) -> List[Dict[str, Any]]:
-    """Fields for a Person's optional second linked music source."""
-    extra_source = _person_link_extra_source(link)
-    values = link.get("extra") if isinstance(link.get("extra"), dict) else {}
-    options: List[Dict[str, str]] = [
-        {"value": "", "label": "None — one source is enough"}
-    ]
-    for provider_id in CATALOG_PROVIDER_ORDER:
-        spec = PROVIDER_FIELD_SPECS[provider_id]
-        options.extend(spec.source_options("extra"))
-    fields: List[Dict[str, Any]] = [
-        {
-            "key": "person_link_extra_source",
-            "label": "Second Music Source (optional)",
-            "type": "select",
-            "value": extra_source,
-            "options": options,
-            "description": (
-                "Also play from a second library — their own Emby/Jellyfin account, a Subsonic or "
-                "Plex server, or another share folder — merged into one catalog. It can even be a "
-                "second account on the same server (fill in that account's fields below)."
-            ),
-        },
-    ]
-    for provider_id in CATALOG_PROVIDER_ORDER:
-        if provider_id == "network_share":
-            fields.extend(
-                [
-                    {
-                        "key": "person_link_extra_share_root_path",
-                        "label": "Second Source — Mounted Share Folder",
-                        "type": "text",
-                        "value": _text(values.get("root_path")),
-                        "placeholder": "/mnt/music/<person>-more",
-                    }
-                ]
-            )
-            continue
-        fields.extend(
-            PROVIDER_FIELD_SPECS[provider_id].person_fields(
-                values,
-                prefix="person_link_extra",
-                label_prefix="Second Source — ",
-                with_descriptions=False,
-            )
-        )
-        # The keep-blank hint still shows on the extra source's secrets.
-        for field in fields:
-            if field["type"] == "password" and "description" not in field:
-                field["description"] = "Leave blank to keep the saved value."
-    return fields
+_ADD_SOURCE_SCOPE_HOUSEHOLD = "__household__"
 
 
-def _person_link_source_options(
-    kind: str,
-    *,
-    allow_blank: bool = True,
-) -> List[Dict[str, str]]:
-    """Picker rows for a Person link's Music Source (or second source)."""
-    options: List[Dict[str, str]] = []
-    if allow_blank:
-        options.append(
-            {"value": "", "label": "Use the global music source"}
-            if kind == "primary"
-            else {"value": "", "label": "None — one source is enough"}
-        )
-    for provider_id in CATALOG_PROVIDER_ORDER:
-        options.extend(PROVIDER_FIELD_SPECS[provider_id].source_options(kind))
-    return options
+def _add_source_item(store: Any) -> Dict[str, Any]:
+    """The Sources tab's Add Source card.
 
-
-def _person_link_source_fields(
-    link: Dict[str, Any],
-    cfg: Dict[str, Any],
-) -> List[Dict[str, Any]]:
-    """Every provider's fields for a Person link form.
-
-    The form shows all providers' fields at once (the source select cannot
-    re-render the card in the host UI), with each provider's stored values —
-    so switching a link between sources never loses what was already saved.
+    The add is staged: this card only records where the source belongs
+    (the household or one Person) and its type. The new list card then asks
+    for that source's connection details in its own Edit popup — the host's
+    modal cannot re-render on a source select, so one form cannot offer just
+    the chosen provider's fields.
     """
-    fields: List[Dict[str, Any]] = []
-    link_values = link if isinstance(link, dict) else {}
-    for provider_id in CATALOG_PROVIDER_ORDER:
-        values = (
-            link_values.get(provider_id)
-            if isinstance(link_values.get(provider_id), dict)
-            else {}
-        )
-        # Pre-fill the Emby server URL with the household's, exactly as this
-        # editor always did.
-        if provider_id == "emby" and not values.get("server_url"):
-            values = {
-                **values,
-                "server_url": _text(cfg.get("emby_server_url") or cfg.get("server_url")),
+    scope_options = [
+        {
+            "value": _ADD_SOURCE_SCOPE_HOUSEHOLD,
+            "label": "Household — the shared source everyone can play",
+        }
+    ]
+    scope_options.extend(
+        {"value": option["value"], "label": option["label"]}
+        for option in _people_person_options(store)
+        if option.get("value")
+    )
+    return {
+        "id": "source:add",
+        "group": "providers",
+        "title": "Add Source",
+        "subtitle": "Set up the household's shared source or one Person's own music library.",
+        "detail": (
+            "Pick who the source belongs to and its type, then press Add Source. The new card "
+            "asks for its connection details next, showing only that provider's fields."
+        ),
+        "hero_badges": [{"label": "SETUP", "tone": "muted"}],
+        "fields": [
+            {
+                "key": "source_add_scope",
+                "label": "Belongs To",
+                "type": "select",
+                "value": _ADD_SOURCE_SCOPE_HOUSEHOLD,
+                "options": scope_options,
+            },
+            {
+                "key": "source_add_provider",
+                "label": "Source Type",
+                "type": "select",
+                "value": "emby",
+                "options": [
+                    {"value": provider_id, "label": PROVIDER_LABELS[provider_id]}
+                    for provider_id in CATALOG_PROVIDER_ORDER
+                ],
+            },
+        ],
+        "save_action": "music_source_add",
+        "save_label": "Add Source",
+        "fields_popup": True,
+        "settings_label": "Add Source",
+        "settings_title": "Add a music source",
+    }
+
+
+def _person_source_values_filled(provider_id: str, values: Dict[str, Any]) -> bool:
+    """Whether a source's stored connection values carry anything real."""
+    spec = PROVIDER_FIELD_SPECS.get(provider_id)
+    if spec is None:
+        return False
+    values = values if isinstance(values, dict) else {}
+    return any(
+        _text(values.get(_text(field.get("key")))) for field in spec.link_fields
+    )
+
+
+def _catalog_slot_summary_value(
+    slot_id: Any,
+    *,
+    not_synced_hint: str,
+    store: Any = None,
+) -> str:
+    """Full-text sync state for one catalog slot, without summing other slots."""
+    stats = _catalog_stats(slot_id, store)
+    status = _text(stats.get("status"))
+    if status == "syncing":
+        return "Syncing…"
+    if status == "error":
+        return f"Last sync failed: {_text(stats.get('error')) or 'unknown error'}"
+    if status != "ok":
+        return not_synced_hint
+    return (
+        f"{_as_int(stats.get('track_count'), 0, 0, 10**9)} tracks"
+        f" · {_as_int(stats.get('artist_count'), 0, 0, 10**9)} artists"
+        f" · {_as_int(stats.get('album_count'), 0, 0, 10**9)} albums"
+        f" · {_as_int(stats.get('genre_count'), 0, 0, 10**9)} genres"
+        f" · scanned {_format_time(stats.get('synced_at'))}"
+    )
+
+
+def _person_source_target(
+    values: Dict[str, Any],
+    body: Dict[str, Any],
+    store: Any,
+) -> Tuple[str, str, str]:
+    """(person_id, provider_id, slot) behind one Sources-tab Person source card.
+
+    The card carries them as hidden form fields; they fall back to the card id
+    (person_source:<person_id>:<slot>) and the link's own stored state. A
+    second-source request on a link with no primary source acts on the primary
+    slot instead — the second source only exists beside a primary one.
+    """
+    card_id = _text(body.get("id"))
+    slot = _text(values.get("person_link_slot")).casefold()
+    person_id = _text(values.get("person_link_person_id"))
+    if not person_id and card_id.startswith("person_source:"):
+        person_id, _, id_slot = card_id.replace("person_source:", "").rpartition(":")
+        if not slot and id_slot in {"primary", "extra"}:
+            slot = id_slot
+    link = _person_link(person_id, store)
+    if not slot:
+        slot = "extra" if _person_link_extra_source(link) else "primary"
+    if slot not in {"primary", "extra"}:
+        slot = "primary"
+    if slot == "extra" and not _person_link_source(link):
+        slot = "primary"
+    provider_id = _provider_id(_text(values.get("person_link_source")), "")
+    if not provider_id:
+        stored = _person_link_extra_source(link) if slot == "extra" else _person_link_source(link)
+        provider_id = _provider_id(stored, "")
+    if not person_id:
+        raise ValueError("That source card is missing its Person. Re-check the Sources tab.")
+    if provider_id not in CATALOG_PROVIDER_IDS:
+        raise ValueError("This source no longer exists. Re-check the Sources tab.")
+    return person_id, provider_id, slot
+
+
+def _person_source_card(
+    cfg: Dict[str, Any],
+    store: Any,
+    person_id: str,
+    name: str,
+    slot: str,
+    provider_id: str,
+    values: Dict[str, Any],
+    test_state: Dict[str, Any],
+) -> Dict[str, Any]:
+    """One linked Person source (primary or second) as a Sources-tab card."""
+    label = PROVIDER_LABELS[provider_id]
+    spec = PROVIDER_FIELD_SPECS[provider_id]
+    role_label = "Primary source" if slot == "primary" else "Second source"
+    slot_id = person_id if slot == "primary" else _person_extra_slot(person_id, provider_id)
+    filled = _person_source_values_filled(provider_id, values)
+    stats = _catalog_stats(slot_id, store)
+    stats_status = _text(stats.get("status"))
+    not_synced_hint = (
+        "No connection details saved yet — press Edit to add them."
+        if not filled
+        else "The library has not been synced yet — press Edit, then Save Source to load it."
+    )
+    if not filled:
+        state_badges = [{"label": "SETUP NEEDED", "tone": "warn"}]
+    elif stats_status == "syncing":
+        state_badges = [{"label": "SYNCING", "tone": "muted"}]
+    elif stats_status == "error":
+        state_badges = [{"label": "SYNC FAILED", "tone": "danger"}]
+    else:
+        state_badges = [
+            {
+                "label": (
+                    f"{_as_int(stats.get('track_count'), 0, 0, 10**9)} TRACKS"
+                    if stats_status == "ok"
+                    else "0 TRACKS"
+                ),
+                "tone": "muted",
             }
-        spec = PROVIDER_FIELD_SPECS[provider_id]
-        fields.extend(spec.person_fields(values, prefix="person_link"))
-        if provider_id == "plex":
-            # The resolved Plex token is a link value, never a hand-typed form
-            # field, so the token box stays blank (keep-blank convention).
-            for field in fields:
-                if field["key"] == spec.form_key("person_link", "token"):
-                    field["value"] = ""
-    return fields
+        ]
+    confirm = (
+        (
+            f"Delete {name}'s {label} primary source? Their {PROVIDER_LABELS[_person_link_extra_source(_person_link(person_id, store))]} "
+            "second source becomes their primary source."
+        )
+        if slot == "primary" and _person_link_extra_source(_person_link(person_id, store))
+        else f"Delete {name}'s {label} {role_label.lower()}? It is removed from their music link."
+    )
+    fields: List[Dict[str, Any]] = [
+        {"key": "person_link_person_id", "type": "text", "value": person_id, "hidden": True},
+        # Select key shape from the link form so the test and save plumbing works unchanged.
+        {"key": "person_link_source", "type": "text", "value": provider_id, "hidden": True},
+        {"key": "person_link_slot", "type": "text", "value": slot, "hidden": True},
+    ]
+    field_values = dict(values) if isinstance(values, dict) else {}
+    # Pre-fill the Emby server URL with the household's, as the link editor always did.
+    if provider_id == "emby" and not field_values.get("server_url"):
+        field_values["server_url"] = _text(cfg.get("emby_server_url") or cfg.get("server_url"))
+    fields.extend(spec.person_fields(field_values, prefix="person_link"))
+    if provider_id == "plex":
+        # The resolved Plex token is a link value, never a hand-typed form
+        # field, so the token box stays blank (keep-blank convention).
+        for field in fields:
+            if field["key"] == spec.form_key("person_link", "token"):
+                field["value"] = ""
+    card: Dict[str, Any] = {
+        "id": f"person_source:{person_id}:{slot}",
+        "group": "providers",
+        "title": f"{name} · {label}",
+        "subtitle": f"{name}'s {role_label.lower()} · " + ("Connected" if filled else "Setup needed"),
+        "detail": _catalog_slot_summary_value(slot_id, not_synced_hint=not_synced_hint, store=store),
+        "hero_badges": [
+            {"label": "PRIMARY" if slot == "primary" else "SECOND SOURCE", "tone": "good" if filled else "warn"},
+            *state_badges,
+        ],
+        "fields": fields,
+        "fields_popup": True,
+        "settings_label": "Edit",
+        "settings_title": f"{name}'s {label} {role_label.lower()} details",
+        "save_action": "music_person_source_save",
+        "save_label": "Save Source",
+        "actions": [
+            {
+                "action": "music_person_link_test",
+                "label": "Test Connection",
+            },
+            {
+                "action": "music_person_source_delete",
+                "label": "Delete Source",
+                "tone": "danger",
+                "confirm": confirm,
+            },
+        ],
+    }
+    if _text(test_state.get("person_id")) == person_id and _provider_id(
+        _text((test_state.get("values") or {}).get("person_link_source")), ""
+    ) == provider_id:
+        _apply_person_link_test_state(card, test_state)
+    return card
+
+
+def _person_source_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
+    """Per-Person source cards under the Sources tab.
+
+    One card per linked source: the primary and, when one exists, the second
+    source. Each card's Edit popup carries just that source's provider fields;
+    Save stores them and re-syncs that slot, and Delete removes the source
+    (the second source is promoted when it survives).
+    """
+    items: List[Dict[str, Any]] = []
+    links = _person_links(store)
+    test_state = _person_link_test_state(store)
+    for person_id in sorted(links):
+        link = links[person_id]
+        name = _people_person_name(person_id, store) or person_id
+        primary = _person_link_source(link)
+        if primary in CATALOG_PROVIDER_IDS:
+            values = link.get(primary) if isinstance(link.get(primary), dict) else {}
+            items.append(
+                _person_source_card(cfg, store, person_id, name, "primary", primary, values, test_state)
+            )
+        extra = _person_link_extra_source(link)
+        if extra in CATALOG_PROVIDER_IDS:
+            extra_values = link.get("extra") if isinstance(link.get("extra"), dict) else {}
+            items.append(
+                _person_source_card(cfg, store, person_id, name, "extra", extra, extra_values, test_state)
+            )
+    return items
 
 
 def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
-    """Per-Person source links shown in the core tab's People section.
+    """Per-Person behavior cards shown in the core tab's People section.
 
     Linked People render as compact cards (name, library sync state, and their
-    actions); Settings opens the card's full settings form in the host's modal
+    actions); Settings opens the card's settings form in the host's modal
     (ui.item_fields_popup, Tater v1.2.0+), whose Save/Cancel round-trip straight
-    to music_person_link_save needs no core-side editor state.
+    to music_person_link_save needs no core-side editor state. The form carries
+    only the Person's playback settings — their sources (and their connection
+    details) are edited on the Sources tab, one source per card.
     """
     items: List[Dict[str, Any]] = []
-    person_options = _people_person_options(store)
-    if len(person_options) <= 1:
-        return items
-    linked_ids = set(_person_links(store))
     for person_id, link in sorted(_person_links(store).items()):
         name = _people_person_name(person_id, store) or person_id
         source = _person_link_source(link)
@@ -14983,7 +15168,8 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
         else:
             sleep_status = ""
         library_hint = (
-            "Their library has not been synced yet — press Settings, then Save Person Link to load it."
+            "Their library has not been synced yet — open their source on the Sources tab "
+            "and save its connection details."
             if source
             else "The shared library has not been synced yet — press Rescan Library on the source card."
         )
@@ -15030,13 +15216,6 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                         "hidden": True,
                     },
                     {
-                        "key": "person_link_source",
-                        "label": "Music Source",
-                        "type": "select",
-                        "value": source,
-                        "options": _person_link_source_options("primary"),
-                    },
-                    {
                         "key": "person_link_queue_conflict_mode",
                         "label": "Playback Conflicts",
                         "type": "select",
@@ -15053,22 +15232,16 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
                     },
                     *_follow_me_link_fields(cfg, link),
                     *_person_link_personalization_fields(cfg, link, store, person_id),
-                    *_person_link_extra_source_fields(link, cfg),
-                    *_person_link_source_fields(link, cfg),
         ]
         card["save_action"] = "music_person_link_save"
         card["save_label"] = "Save Person Link"
         card["fields_popup"] = True
         card["settings_label"] = "Settings"
-        card["settings_title"] = f"{name}'s music link settings"
+        card["settings_title"] = f"{name}'s music settings"
         card["actions"] = [
             {
                 "action": "music_view_as_switch",
                 "label": "View Their Music",
-            },
-            {
-                "action": "music_person_link_test",
-                "label": "Test Connection",
             },
             {
                 "action": "music_person_sleep_start_30",
@@ -15090,80 +15263,6 @@ def _person_link_items(cfg: Dict[str, Any], store: Any) -> List[Dict[str, Any]]:
             },
         ]
         items.append(card)
-    unlinked = [
-        option
-        for option in person_options
-        if option.get("value") and option["value"] not in linked_ids
-    ]
-    if unlinked:
-        new_card: Dict[str, Any] = {
-            "id": "person:new",
-            "group": "people",
-            "title": "Link a Person",
-            "subtitle": "Give one Person their own music source, library, and listening history.",
-            "detail": "Choose a Person, pick a source, and fill in that source's details.",
-            "hero_badges": [{"label": "NEW LINK", "tone": "muted"}],
-            "fields": [
-                {
-                    "key": "person_link_person_id",
-                    "label": "Person",
-                    "type": "select",
-                    "value": "",
-                    "options": unlinked,
-                },
-                {
-                    "key": "person_link_source",
-                    "label": "Music Source",
-                    "type": "select",
-                    "value": "emby",
-                    "options": _person_link_source_options("primary", allow_blank=False),
-                },
-                {
-                    "key": "person_link_queue_conflict_mode",
-                    "label": "Playback Conflicts",
-                    "type": "select",
-                    "value": _text(cfg.get("queue_conflict_mode") or DEFAULT_QUEUE_CONFLICT_MODE),
-                    "options": [
-                        {"value": "ask", "label": "Ask before taking over"},
-                        {"value": "auto_move", "label": "Auto-move / take over"},
-                    ],
-                    "description": (
-                        "When their music is playing elsewhere, or someone else's music is on "
-                        "the rooms they ask for: ask first, or move/take over automatically."
-                    ),
-                },
-                *_follow_me_link_fields(cfg, {}),
-                *_person_link_personalization_fields(cfg, {}, store),
-                *_person_link_extra_source_fields({}, cfg),
-                *_person_link_source_fields({}, cfg),
-            ],
-        }
-        new_card["save_action"] = "music_person_link_save"
-        new_card["save_label"] = "Link Person"
-        new_card["fields_popup"] = True
-        new_card["settings_label"] = "Add Person Link"
-        new_card["settings_title"] = "Link a Person to their own music"
-        new_card["actions"] = [
-            {
-                "action": "music_person_link_test",
-                "label": "Test Connection",
-            },
-        ]
-        items.append(new_card)
-    # Show the last connection-test outcome on the card it was run against, so
-    # it stays visible on the card after the success toast is gone.
-    state = _person_link_test_state(store)
-    if state.get("person_id"):
-        unlinked_ids = {option.get("value") for option in unlinked}
-        for card in items:
-            card_id = _text(card.get("id"))
-            if card_id == "person:new":
-                # The add-link card only exists for still-unlinked people.
-                if state["person_id"] not in unlinked_ids:
-                    continue
-                _apply_person_link_test_state(card, state)
-            elif card_id == f"person:{state['person_id']}":
-                _apply_person_link_test_state(card, state)
     return items
 
 
@@ -15280,7 +15379,9 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
     item_forms.extend(_facet_items(catalog, "genres", "Genre"))
     item_forms.extend(_facet_items(catalog, "artists", "Artist"))
     item_forms.extend(_facet_items(catalog, "albums", "Album"))
+    item_forms.append(_add_source_item(store))
     item_forms.extend(_provider_cards(cfg, active_provider, store))
+    item_forms.extend(_person_source_items(cfg, store))
     item_forms.extend(_person_link_items(cfg, store))
     item_forms.extend(
         [
@@ -15598,13 +15699,19 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
                     "item_group": "recommendations",
                     "empty_message": f"Play some music to help {assistant_name} build recommendations.",
                 },
-                {"key": "providers", "label": "Sources", "source": "items", "item_group": "providers"},
+                {
+                    "key": "providers",
+                    "label": "Sources",
+                    "source": "items",
+                    "item_group": "providers",
+                    "empty_message": "No music sources yet — press Add Source to set one up.",
+                },
                 {
                     "key": "people",
                     "label": "People",
                     "source": "items",
                     "item_group": "people",
-                    "empty_message": "Link a Person to give them their own music source and history.",
+                    "empty_message": "People with a music source (add one on the Sources tab) and their playback settings appear here.",
                 },
                 {
                     "key": "airplay",
@@ -15638,6 +15745,36 @@ def _provider_from_card(payload: Dict[str, Any], fallback: Any = "") -> str:
     return candidate
 
 
+def _resolve_built_link_values(
+    built: Dict[str, Any],
+    source: str,
+    existing_values: Dict[str, Any],
+    store: Any,
+) -> Dict[str, Any]:
+    """Finish a freshly built link value dict: resolve the Plex token or the
+    Emby-family user id now, so the stored link is immediately playable."""
+    if source == "plex" and not _text(built.get("token")):
+        # Resolve (and cache) the Plex token now so the link holds a
+        # complete, immediately playable state; a plex.tv failure surfaces
+        # through the sync error below rather than blocking the save.
+        try:
+            built = _plex_resolve_link_values(built, existing_values, store=store)
+        except Exception as exc:
+            logger.warning("[Music] Plex link token resolution failed: %s", exc)
+    elif source in ("emby", "jellyfin") and built.get("auth_mode") == "user_token" and not _text(
+        built.get("user_id")
+    ):
+        # Store the user id defensively so identity-based caches and
+        # scopes stay stable even if a later save carries a stale form.
+        try:
+            provider = PROVIDER_FIELD_SPECS[source].build_provider(built)
+            _token, user_id = provider.authenticate(client=store)
+            built["user_id"] = user_id
+        except Exception as exc:
+            logger.warning("[Music] %s link user-id resolution failed: %s", source, exc)
+    return built
+
+
 def _save_person_link_action(values: Dict[str, Any], store: Any) -> Dict[str, Any]:
     person_id = _text(values.get("person_link_person_id"))
     if not person_id:
@@ -15645,8 +15782,14 @@ def _save_person_link_action(values: Dict[str, Any], store: Any) -> Dict[str, An
     name = _people_person_name(person_id, store)
     if not name:
         raise ValueError("That Person no longer exists. Re-check Tater's People settings.")
-    source = _person_link_source({"music_source": values.get("person_link_source")})
     existing = _person_link(person_id, store)
+    if "person_link_source" in values:
+        source = _person_link_source({"music_source": values.get("person_link_source")})
+    else:
+        # Forms that carry no source select (the People tab's settings popup now
+        # keeps only the Person's playback settings) preserve the stored source;
+        # switching or adding sources happens on the Sources tab.
+        source = _person_link_source(existing)
     existing_values = (
         existing.get(source) if isinstance(existing.get(source), dict) else {}
     ) if source else {}
@@ -15775,57 +15918,31 @@ def _save_person_link_action(values: Dict[str, Any], store: Any) -> Dict[str, An
     if source:
         spec = PROVIDER_FIELD_SPECS[source]
         built = spec.build_values("person_link", values, existing_values)
-        if source == "plex" and not _text(built.get("token")):
-            # Resolve (and cache) the Plex token now so the link holds a
-            # complete, immediately playable state; a plex.tv failure surfaces
-            # through the sync error below rather than blocking the save.
-            try:
-                built = _plex_resolve_link_values(built, existing_values, store=store)
-            except Exception as exc:
-                logger.warning("[Music] Plex link token resolution failed: %s", exc)
-        elif source in ("emby", "jellyfin") and built.get("auth_mode") == "user_token" and not _text(
-            built.get("user_id")
-        ):
-            # Store the user id defensively so identity-based caches and
-            # scopes stay stable even if a later save carries a stale form.
-            try:
-                provider = spec.build_provider(built)
-                _token, user_id = provider.authenticate(client=store)
-                built["user_id"] = user_id
-            except Exception as exc:
-                logger.warning("[Music] %s link user-id resolution failed: %s", source, exc)
-        link[source] = built
+        link[source] = _resolve_built_link_values(built, source, existing_values, store)
     # Second linked source (optional): another provider account or share folder
     # on top of the primary, so one Person can listen across both.
-    extra_source = _provider_id(values.get("person_link_extra_source"), "")
-    if extra_source:
-        existing_extra = (
-            existing.get("extra") if isinstance(existing.get("extra"), dict) else {}
-        )
-        # Only keep secrets from a stored second source of the same kind.
-        existing_extra = existing_extra if _person_link_extra_source(existing) == extra_source else {}
-        built_extra = PROVIDER_FIELD_SPECS[extra_source].build_values(
-            "person_link_extra", values, existing_extra
-        )
-        if extra_source == "plex" and not _text(built_extra.get("token")):
-            try:
-                built_extra = _plex_resolve_link_values(built_extra, existing_extra, store=store)
-            except Exception as exc:
-                logger.warning("[Music] Plex extra-source token resolution failed: %s", exc)
-        elif extra_source in ("emby", "jellyfin") and built_extra.get(
-            "auth_mode"
-        ) == "user_token" and not _text(built_extra.get("user_id")):
-            try:
-                provider = PROVIDER_FIELD_SPECS[extra_source].build_provider(built_extra)
-                _token, user_id = provider.authenticate(client=store)
-                built_extra["user_id"] = user_id
-            except Exception as exc:
-                logger.warning("[Music] %s extra-source user-id resolution failed: %s", extra_source, exc)
-        link["extra"] = built_extra
-        link["extra_source"] = extra_source
-    else:
-        link.pop("extra_source", None)
-        link.pop("extra", None)
+    if "person_link_extra_source" in values:
+        extra_source = _provider_id(values.get("person_link_extra_source"), "")
+        if extra_source:
+            existing_extra = (
+                existing.get("extra") if isinstance(existing.get("extra"), dict) else {}
+            )
+            # Only keep secrets from a stored second source of the same kind.
+            existing_extra = existing_extra if _person_link_extra_source(existing) == extra_source else {}
+            built_extra = PROVIDER_FIELD_SPECS[extra_source].build_values(
+                "person_link_extra", values, existing_extra
+            )
+            link["extra"] = _resolve_built_link_values(built_extra, extra_source, existing_extra, store)
+            link["extra_source"] = extra_source
+        else:
+            link.pop("extra_source", None)
+            link.pop("extra", None)
+    elif isinstance(existing.get("extra"), dict) and _person_link_extra_source(existing):
+        # The form omitted the second-source select (the People tab's settings
+        # popup no longer edits sources; the Sources tab owns them) — keep the
+        # stored second source untouched.
+        link["extra"] = existing["extra"]
+        link["extra_source"] = _person_link_extra_source(existing)
     _save_person_link(person_id, link, store)
     # The link now holds the real values; drop the test draft and its result.
     _clear_person_link_test_state(person_id, store)
@@ -15860,6 +15977,167 @@ def _save_person_link_action(values: Dict[str, Any], store: Any) -> Dict[str, An
     return {"ok": True, "message": f"Saved {name}'s music link.{sync_note}"}
 
 
+def _add_source_action(values: Dict[str, Any], store: Any) -> Dict[str, Any]:
+    """The Sources tab's Add Source save: record where a new source belongs.
+
+    Staged add — this only creates the (unconfigured) household or Person
+    source entry; the new card's Edit popup holds the provider's connection
+    fields, and saving there tests and syncs it.
+    """
+    provider_id = _provider_id(_text(values.get("source_add_provider")), "")
+    if provider_id not in CATALOG_PROVIDER_IDS:
+        raise ValueError("Choose the type of music source to add.")
+    label = PROVIDER_LABELS[provider_id]
+    scope = _text(values.get("source_add_scope"))
+    if scope == _ADD_SOURCE_SCOPE_HOUSEHOLD:
+        if provider_id in _household_source_ids(store) or _paired(_settings(store), provider_id):
+            raise ValueError(f"{label} is already set up as a household source.")
+        _mark_household_source_added(provider_id, store)
+        return {
+            "ok": True,
+            "message": (
+                f"{label} added to the household sources. Press Edit on its card to "
+                "fill in the connection details."
+            ),
+        }
+    person_id = scope
+    name = _people_person_name(person_id, store)
+    if not name:
+        raise ValueError("Choose which Person this music source belongs to.")
+    link = dict(_person_link(person_id, store))
+    primary = _person_link_source(link)
+    extra = _person_link_extra_source(link)
+    if primary and extra:
+        raise ValueError(
+            f"{name} already has two music sources. Delete one on the Sources tab first."
+        )
+    # The first source they add becomes the primary; a second one (even the
+    # same type — a second account on the same server) joins the extra slot.
+    is_extra = bool(primary)
+    link["music_source"] = provider_id
+    if is_extra:
+        link["extra_source"] = provider_id
+        link["extra"] = {}
+    _save_person_link(person_id, link, store)
+    role = "second source" if is_extra else "primary source"
+    return {
+        "ok": True,
+        "message": (
+            f"{label} added as {name}'s {role}. Press Edit on its card to "
+            "fill in the connection details."
+        ),
+    }
+
+
+def _save_person_source_action(
+    values: Dict[str, Any],
+    body: Dict[str, Any],
+    store: Any,
+) -> Dict[str, Any]:
+    """Save one Person source's connection details from the Sources tab.
+
+    Only that card's slot is touched (primary, or the second source's extra
+    slot); the link's other fields — playback settings, Follow-Me, overrides —
+    are preserved, and the slot re-syncs on save.
+    """
+    person_id, source, slot = _person_source_target(values, body, store)
+    name = _people_person_name(person_id, store) or person_id
+    existing = _person_link(person_id, store)
+    if slot == "extra":
+        existing_values = existing.get("extra") if isinstance(existing.get("extra"), dict) else {}
+    else:
+        existing_values = existing.get(source) if isinstance(existing.get(source), dict) else {}
+    built = PROVIDER_FIELD_SPECS[source].build_values("person_link", values, existing_values)
+    built = _resolve_built_link_values(built, source, existing_values, store)
+    link = dict(existing)
+    if slot == "extra":
+        link["extra_source"] = source
+        link["extra"] = built
+    else:
+        link["music_source"] = source
+        link[source] = built
+    _save_person_link(person_id, link, store)
+    _clear_person_link_test_state(person_id, store)
+    slot_id = person_id if slot == "primary" else _person_extra_slot(person_id, source)
+    sync_note = ""
+    try:
+        catalog = _sync_catalog(store, source, slot_id)
+        sync_note = f" Loaded {len(catalog.get('tracks') or [])} tracks."
+    except Exception as exc:
+        sync_note = f" Their library did not load yet: {_text(exc)}"
+        _record_catalog_stats(
+            store,
+            slot_id,
+            {"status": "error", "error": _text(exc)[:200], "failed_at": time.time()},
+        )
+    return {"ok": True, "message": f"Saved {name}'s {PROVIDER_LABELS[source]} source.{sync_note}"}
+
+
+def _delete_person_source_action(
+    values: Dict[str, Any],
+    body: Dict[str, Any],
+    store: Any,
+) -> Dict[str, Any]:
+    """Delete one Person source from the Sources tab.
+
+    Deleting the primary source falls back to the household's shared music, or
+    promotes the second source to primary when one exists; deleting the second
+    source just drops it. The removed slots' catalogs are cleared and the
+    surviving slot re-syncs.
+    """
+    person_id, source, slot = _person_source_target(values, body, store)
+    name = _people_person_name(person_id, store) or person_id
+    existing = _person_link(person_id, store)
+    primary = _person_link_source(existing)
+    extra = _person_link_extra_source(existing)
+    link = dict(existing)
+    message = ""
+    if slot == "extra" and extra:
+        link.pop("extra_source", None)
+        link.pop("extra", None)
+        message = f"Deleted {name}'s second source ({PROVIDER_LABELS[extra]})."
+        cleared_slots = [_person_extra_slot(person_id, extra)]
+    else:
+        # The primary slot (or an extra-slot request with no second source saved).
+        if extra:
+            # Promote the second source so they keep a personal library. Values
+            # for the primary and (when both are the same type) the extra slot
+            # can share a link key, and the extra values win.
+            link["music_source"] = extra
+            link[extra] = dict(link.pop("extra") or {})
+            link.pop("extra_source", None)
+            if extra != primary:
+                link.pop(primary, None)
+            message = (
+                f"Deleted {name}'s {PROVIDER_LABELS[primary or source]} primary source. "
+                f"Their {PROVIDER_LABELS[extra]} source is now their primary source."
+            )
+            cleared_slots = [person_id, _person_extra_slot(person_id, extra)]
+            # The primary slot must re-sync from the promoted source.
+            _schedule_catalog_sync(person_id, store)
+        else:
+            link["music_source"] = ""
+            if primary:
+                link.pop(primary, None)
+            message = (
+                f"Deleted {name}'s {PROVIDER_LABELS[primary or source]} primary source. "
+                "They play from the household's shared music now."
+            )
+            cleared_slots = [person_id]
+    _save_person_link(person_id, link, store)
+    _clear_person_link_test_state(person_id, store)
+    for slot_key in cleared_slots:
+        try:
+            store.delete(_catalog_key(slot_key))
+        except Exception:
+            pass
+        try:
+            store.hdel(CATALOG_STATS_KEY, _catalog_stats_field(slot_key))
+        except Exception:
+            pass
+    return {"ok": True, "message": message}
+
+
 def _test_person_link_source_action(values: Dict[str, Any], store: Any) -> Dict[str, Any]:
     """Test one Person's link credentials from the form without saving them.
 
@@ -15878,6 +16156,9 @@ def _test_person_link_source_action(values: Dict[str, Any], store: Any) -> Dict[
     if not isinstance(existing, dict):
         existing = {}
     draft = {key: _text(values.get(key)) for key in PERSON_LINK_TEST_FIELD_KEYS}
+    # The resolved source rides the draft so the outcome row lands on the
+    # card it was run against (the new source cards carry no source select).
+    draft["person_link_source"] = source
 
     def _record(status: str, message: str) -> None:
         _save_person_link_test_state(person_id, draft, status, message, store)
@@ -15912,6 +16193,9 @@ def _disconnect_provider(provider_id: str, client: Any) -> Dict[str, Any]:
     spec = PROVIDER_FIELD_SPECS.get(provider_id)
     if spec is None:
         raise ValueError(f"{PROVIDER_LABELS.get(provider_id, provider_id)} support is not enabled in this build.")
+    # The Sources tab's Delete Source removes the card, whether it was added
+    # through the Add Source flow or paired by an older version.
+    _mark_household_source_removed(provider_id, client)
     disconnect = getattr(spec, "disconnect", None)
     if not callable(disconnect):
         return _disconnect_generic(provider_id, client)
@@ -16140,6 +16424,15 @@ def handle_htmlui_tab_action(
 
     if action_name == "music_person_link_save":
         return _save_person_link_action(values, store)
+
+    if action_name == "music_source_add":
+        return _add_source_action(values, store)
+
+    if action_name == "music_person_source_save":
+        return _save_person_source_action(values, body, store)
+
+    if action_name == "music_person_source_delete":
+        return _delete_person_source_action(values, body, store)
 
     if action_name in {
         "music_person_sleep_start_30",
