@@ -489,6 +489,7 @@ source needs, the system task explains what to enable.
 | Folder Playlists | blank | `Name=Folder` pairs that turn library folders into always-current playlists (see [Playlists](#playlists)); per-Person override on the link card (blank inherits the global list). |
 | Smart Shuffle | off | History-aware shuffle with on-the-fly multi-source mixing; per-Person override on the link card. |
 | Resume in Another Room | `Stay where it was` | What "resume my music" does from a room other than the paused queue's room: stay, follow to the speaking room, or ask over TTS (per-Person override on the link card). |
+| Voice Play Replies | per-Person | How the voice player confirms this Person's play requests — **Brief** replies with just "Ok"; **Short** gives one clean sentence using the speaker's friendly name instead of the internal player selector; **Detailed** is the full confirmation with queue details (set on each Person's link card). |
 | Follow-Me Presence | off | Master switch for following linked People room to room (see [Follow-Me presence](#follow-me-presence)). |
 | Follow-Me Presence Source | `Home Assistant` | Where each Person's location comes from: Home Assistant person entities or Tater's native BLE presence (per-Person override on the link card). |
 | Follow-Me BLE Away Timeout | `90` s | How long after the last satellite sighting a BLE-tracked Person still counts as home. |

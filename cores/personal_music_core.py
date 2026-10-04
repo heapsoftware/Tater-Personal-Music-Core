@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.11.0"
+__version__ = "3.12.0"
 MIN_TATER_VERSION = "1.2.0"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby, Jellyfin, Subsonic, or Plex account or "
@@ -507,6 +507,13 @@ PENDING_CONFIRM_KEY_PREFIX = "personal_music_core:pending:"
 PENDING_CONFIRM_TTL_SECONDS = 600.0
 QUEUE_CONFLICT_MODES = ("ask", "auto_move")
 DEFAULT_QUEUE_CONFLICT_MODE = "ask"
+# How Tater's voice reply is worded after this Person's play requests. The
+# spoken line itself is composed by Tater's Hydra final-render LLM from the
+# tool result's summary_for_user, so the mode only changes what the core hands
+# it to work from: "brief" leaves nothing to rephrase, "short" keeps one clean
+# sentence with friendly speaker names, "detailed" is the historical summary.
+VOICE_REPLY_MODES = ("brief", "detailed", "short")
+DEFAULT_VOICE_REPLY_MODE = "detailed"
 # Jarvis Screen browser playback destinations ("screen:<screen_key>"). The
 # profiles hash belongs to the Jarvis Screen core and is read-only here: the
 # screen core's uninstall sweep derives its Redis namespace generically, so
@@ -1255,6 +1262,12 @@ def _person_endless_mode(person_id: Any, cfg: Dict[str, Any], client: Any = None
         DEFAULT_ENDLESS_PLAYBACK_MODE,
         client,
     )
+
+
+def _person_voice_reply_mode(person_id: Any, client: Any = None) -> str:
+    """One Person's play-reply wording; unlinked or blank People get the detailed default."""
+    mode = _text(_person_link(person_id, client).get("voice_reply_mode"))
+    return mode if mode in VOICE_REPLY_MODES else DEFAULT_VOICE_REPLY_MODE
 
 
 def _person_endless_playlist(person_id: Any, cfg: Dict[str, Any], client: Any = None) -> str:
@@ -10487,6 +10500,35 @@ def _target_summary(targets: Any) -> str:
     return f"{len(values)} destinations"
 
 
+def _friendly_target_summary(targets: Any) -> str:
+    """Speaker label shaped for a short spoken summary — names, not selectors.
+
+    The detailed summary keeps the raw selector on purpose (historical wording);
+    this variant is what feeds Tater's reply LLM in "short" mode, since raw
+    tokens like voice_core:native:… are what it tends to garble.
+    """
+    values = _list(targets)
+    if not values:
+        return "no players"
+    if len(values) > 1:
+        return f"{len(values)} destinations"
+    target = _text(values[0])
+    if _is_screen_target(target):
+        return _screen_target_summary_label(target.casefold()[len(SCREEN_TARGET_PREFIX) :])
+    try:
+        options = _target_options()
+    except Exception:
+        options = []
+    for row in options:
+        if _text(row.get("value")).casefold() != target.casefold():
+            continue
+        compact = _compact_target_option(dict(row))
+        label = _text(compact.get("label"))
+        if label and label != target:
+            return label
+    return target
+
+
 def _track_label(track: Dict[str, Any]) -> str:
     title = _text(track.get("title")) or "Untitled"
     artist = _text(track.get("artist") or track.get("album_artist"))
@@ -12036,6 +12078,23 @@ def _play_request(
             _set_sleep_timer(sleep_minutes, person_id=speaking_person_id, client=client)
             sleep_note = f" The sleep timer stops it in {sleep_minutes} minute"
             sleep_note += "" if sleep_minutes == 1 else "s"
+    track_label = _track_label(player.get("current") or {})
+    reply_mode = _person_voice_reply_mode(speaking_person_id, client)
+    if reply_mode == "brief":
+        # Tater's reply LLM only rephrases what it is handed — leave it nothing.
+        summary = "Ok."
+    elif reply_mode == "short":
+        summary = (
+            f"Playing {track_label} on {_friendly_target_summary(targets)}."
+            + sleep_note
+        )
+    else:
+        summary = (
+            f"Playing {track_label} on {_target_summary(targets)}. "
+            f"The queue has {len(player.get('queue') or [])} track"
+            f"{'' if len(player.get('queue') or []) == 1 else 's'}, and continuous radio will keep it playing."
+            + sleep_note
+        )
     return {
         "ok": True,
         "provider": selected_provider,
@@ -12049,12 +12108,8 @@ def _play_request(
         else 0,
         "warnings": list(player.get("warnings") or []),
         "now_playing": _public_track(player.get("current") or {}),
-        "summary_for_user": (
-            f"Playing {_track_label(player.get('current') or {})} on {_target_summary(targets)}. "
-            f"The queue has {len(player.get('queue') or [])} track"
-            f"{'' if len(player.get('queue') or []) == 1 else 's'}, and continuous radio will keep it playing."
-            + sleep_note
-        ),
+        "voice_reply_mode": reply_mode,
+        "summary_for_user": summary,
     }
 
 
@@ -14751,6 +14806,33 @@ def _person_link_personalization_fields(
                 "already playing there — then it stays put); Ask me each time asks over TTS."
             ),
         },
+        {
+            "key": "person_link_voice_reply_mode",
+            "label": "Voice Play Replies",
+            "type": "select",
+            "value": _text(link.get("voice_reply_mode")) or DEFAULT_VOICE_REPLY_MODE,
+            "options": [
+                {
+                    "value": "brief",
+                    "label": "Brief — replies with just \"Ok\"",
+                },
+                {
+                    "value": "detailed",
+                    "label": "Detailed — full confirmation",
+                },
+                {
+                    "value": "short",
+                    "label": "Short — one line naming the speaker",
+                },
+            ],
+            "description": (
+                f"How {assistant_name}'s voice reply is worded after this Person's play "
+                "requests: Brief replies with just \"Ok\"; Short gives one clean sentence "
+                "using the speaker's friendly name (like \"Playing Blue Christmas by Elvis "
+                "Presley on the Kitchen\") instead of the internal player selector; Detailed "
+                "is the full confirmation with queue details that Tater uses today."
+            ),
+        },
     ]
 
 
@@ -15590,6 +15672,11 @@ def _save_person_link_action(values: Dict[str, Any], store: Any) -> Dict[str, An
         endless_mode = _text(existing.get("endless_playback_mode"))
     if endless_mode in ENDLESS_PLAYBACK_MODES:
         link["endless_playback_mode"] = endless_mode
+    reply_mode = _text(values.get("person_link_voice_reply_mode")).casefold()
+    if reply_mode not in VOICE_REPLY_MODES:
+        reply_mode = _text(existing.get("voice_reply_mode")).casefold()
+    if reply_mode in VOICE_REPLY_MODES:
+        link["voice_reply_mode"] = reply_mode
     if "person_link_endless_playback_playlist" in values:
         link["endless_playback_playlist"] = _text(
             values.get("person_link_endless_playback_playlist")
