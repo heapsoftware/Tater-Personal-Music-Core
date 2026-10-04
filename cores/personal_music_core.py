@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.9.7"
+__version__ = "3.9.8"
 MIN_TATER_VERSION = "1.2.0"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby, Jellyfin, Subsonic, or Plex account or "
@@ -1726,8 +1726,11 @@ def _uses_audio_sync_transcode(targets: Any) -> bool:
 
 
 def _stream_url_unreachable(url: Any) -> bool:
-    """Cheap HEAD probe: True when a playback target would fail to fetch this.
+    """Probe like the hardware would: True when a target's fetch of this fails.
 
+    A ranged GET, not HEAD — some media servers (Emby) acknowledge HEAD on a
+    request they would refuse to actually serve, so a HEAD probe reports
+    healthy and the playback target still gets handed a dead URL.
     Only used to decide whether the normalized-PCM sync URL still works before
     dispatching hardware; a refused sync request gets an original-container
     fallback instead of a session that dies before it starts.
@@ -1736,12 +1739,14 @@ def _stream_url_unreachable(url: Any) -> bool:
     if not wanted:
         return True
     try:
-        response = requests.head(
+        with requests.get(
             wanted,
+            headers={"Range": "bytes=0-2047"},
+            stream=True,
             timeout=(STREAM_PROBE_CONNECT_TIMEOUT_SECONDS, STREAM_PROBE_READ_TIMEOUT_SECONDS),
             allow_redirects=False,
-        )
-        return response.status_code >= 400
+        ) as response:
+            return response.status_code >= 400
     except Exception:
         return True
 
