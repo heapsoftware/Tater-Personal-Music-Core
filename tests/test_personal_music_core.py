@@ -2454,6 +2454,115 @@ class MultiQueueTests(unittest.TestCase):
         # Without a binding (or for a different person) nothing is invented.
         self.assertEqual(self.core._resolve_targets(person_id="person_b", client=self.redis), [])
 
+    # ---- legacy voice selector canonicalization ----
+
+    NATIVE_BASS_ROW = {
+        "value": "voice_core:native:g090device",
+        "label": "Tater Satellite: Bass (Kitchen • native:g090device)",
+    }
+    NATIVE_TREBLE_ROW = {
+        "value": "voice_core:native:other01",
+        "label": "Tater Satellite: Treble (Office • native:other01)",
+    }
+
+    def test_media_target_options_drop_legacy_voice_rows(self):
+        rows = self.core._media_target_options(
+            [
+                self.NATIVE_BASS_ROW,
+                {"value": "voice_core:stereo:pairab", "label": "Tater Stereo: Pair AB"},
+                {"value": "voice_core:bass", "label": "Tater Satellite: Bass"},
+                {"value": "voice_core:host:bass", "label": "Tater Satellite: bass 2"},
+                {"value": "ha:media_player.office", "label": "Office"},
+            ]
+        )
+        self.assertEqual(
+            [row["value"] for row in rows],
+            [
+                "voice_core:native:g090device",
+                "voice_core:stereo:pairab",
+                "ha:media_player.office",
+            ],
+        )
+
+    def test_canonical_voice_selector_maps_legacy_names_to_native(self):
+        options = [self.NATIVE_BASS_ROW, self.NATIVE_TREBLE_ROW]
+        canonical = self.core._canonical_voice_selector
+        # Bare device tokens and legacy prefixes map onto the native twin.
+        self.assertEqual(canonical("bass", options), "voice_core:native:g090device")
+        self.assertEqual(canonical("voice_core:bass", options), "voice_core:native:g090device")
+        # Native shapes — with or without the voice_core prefix — stay native.
+        self.assertEqual(canonical("voice_core:native:g090device", options), "voice_core:native:g090device")
+        self.assertEqual(canonical("native:g090device", options), "voice_core:native:g090device")
+        self.assertEqual(canonical("stereo:pairab", options), "voice_core:stereo:pairab")
+        # Screens and integrations resolve elsewhere; they pass through even
+        # when no option rows exist.
+        self.assertEqual(canonical("screen:office", options), "screen:office")
+        self.assertEqual(canonical("integration:sonos:den", options), "integration:sonos:den")
+        # Unresolvable selectors keep the legacy mapping (Tater's error then
+        # names the selector, and the core logs the failure).
+        self.assertEqual(canonical("voice_core:bass", [self.NATIVE_TREBLE_ROW]), "voice_core:bass")
+        self.assertEqual(canonical("ghost", [self.NATIVE_TREBLE_ROW]), "voice_core:ghost")
+        self.assertEqual(canonical("", options), "")
+
+    def test_resolve_targets_canonicalizes_legacy_origin_selectors(self):
+        self._originals["_target_options"] = self.core._target_options
+
+        def fake_target_options(*_args, **_kwargs):
+            return [self.NATIVE_BASS_ROW, self.NATIVE_TREBLE_ROW]
+
+        self.core._target_options = fake_target_options
+        try:
+            # A bare device token from a voice origin resolves to the satellite.
+            self.assertEqual(
+                self.core._resolve_targets(origin={"satellite_selector": "bass"}, client=self.redis),
+                ["voice_core:native:g090device"],
+            )
+            self.assertEqual(
+                self.core._resolve_targets(
+                    origin={"satellite_selector": "voice_core:bass"}, client=self.redis
+                ),
+                ["voice_core:native:g090device"],
+            )
+            # Native selectors pass through untouched.
+            self.assertEqual(
+                self.core._resolve_targets(
+                    origin={"satellite_selector": "voice_core:native:other01"}, client=self.redis
+                ),
+                ["voice_core:native:other01"],
+            )
+            # An explicit legacy selector in the request maps the same way.
+            self.assertEqual(
+                self.core._resolve_targets(["voice_core:bass"], client=self.redis),
+                ["voice_core:native:g090device"],
+            )
+            # Legacy rows never win a query match for music.
+            self.assertEqual(
+                self.core._resolve_targets(["treble"], client=self.redis),
+                ["voice_core:native:other01"],
+            )
+        finally:
+            self.core._target_options = self._originals["_target_options"]
+
+    def test_resolve_targets_filters_legacy_rows_from_options(self):
+        self._originals["_target_options"] = self.core._target_options
+
+        def fake_target_options(*_args, **_kwargs):
+            return [
+                self.NATIVE_BASS_ROW,
+                {"value": "voice_core:bass", "label": "Tater Satellite: Bass"},
+                {"value": "voice_core:host:bass", "label": "Tater Satellite: bass 2"},
+            ]
+
+        self.core._target_options = fake_target_options
+        try:
+            # With the legacy rows gone the bare name stays unambiguous.
+            self.assertEqual(
+                self.core._resolve_targets(["bass"], client=self.redis),
+                ["voice_core:native:g090device"],
+            )
+        finally:
+            self.core._target_options = self._originals["_target_options"]
+
     # ---- conflict handling ----
 
     def test_conflict_mode_resolution(self):
