@@ -8486,11 +8486,12 @@ class ScreenTargetTests(unittest.TestCase):
     def capture_media_kwargs(self):
         captured = {}
 
-        def play_media_url_targets(targets, url, **kwargs):
+        def play_media_url_targets(targets, url, shared_group_source=False, **kwargs):
             captured["targets"] = list(targets)
             captured["url"] = url
             captured["media_type"] = str(kwargs.get("media_type"))
             captured["filename"] = str(kwargs.get("filename"))
+            captured["shared_group_source"] = shared_group_source
             return {"ok": True, "sent_count": len(targets), "warnings": []}
 
         sys.modules["media_playback"].play_media_url_targets = play_media_url_targets
@@ -8531,6 +8532,33 @@ class ScreenTargetTests(unittest.TestCase):
         self.assertTrue(result.get("audio_sync_transcode_used"))
         self.assertEqual(self.stream_calls, [True])
         self.assertEqual(result.get("warnings") or [], [])
+
+    def test_group_playback_opt_into_shared_source(self):
+        # Tater v1.2.7 exposes shared_group_source on play_media_url_targets;
+        # the core opts every playback in (the host only applies it to 2+
+        # synchronized targets), matching the filed shared-relay request.
+        captured = self.capture_media_kwargs()
+        self.core._play_track(
+            _track_row(1, "Jamming"), ["voice_core:native:kitchen"], volume_percent=60
+        )
+        self.assertTrue(captured["shared_group_source"])
+
+    def test_host_without_shared_group_source_flag_still_plays(self):
+        # Older Tater hosts (pre-1.2.7) reject the kwarg: the gate must
+        # detect its absence and call playback without it.
+        media_module = sys.modules["media_playback"]
+
+        def play_media_url_targets(targets, url, **kwargs):
+            self.assertNotIn("shared_group_source", kwargs)
+            return {"ok": True, "sent_count": len(targets), "warnings": []}
+
+        original = media_module.play_media_url_targets
+        media_module.play_media_url_targets = play_media_url_targets
+        self.addCleanup(lambda: setattr(media_module, "play_media_url_targets", original))
+        result = self.core._play_track(
+            _track_row(1, "Jamming"), ["voice_core:native:kitchen"], volume_percent=60
+        )
+        self.assertEqual(result.get("ok"), True)
 
     def test_refused_everything_keeps_the_sync_url(self):
         # Both sync and original refused: keep the sync URL (hardware will
