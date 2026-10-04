@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.9.6"
+__version__ = "3.9.7"
 MIN_TATER_VERSION = "1.2.0"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby, Jellyfin, Subsonic, or Plex account or "
@@ -572,6 +572,8 @@ ACTIVITY_KEY = "personal_music_core:activity_feed"
 EMBY_AUTH_CACHE_KEY = "personal_music_core:emby:auth"
 MAX_ACTIVITY_EVENTS = 200
 REQUEST_TIMEOUT_SECONDS = 30
+STREAM_PROBE_CONNECT_TIMEOUT_SECONDS = 5.0
+STREAM_PROBE_READ_TIMEOUT_SECONDS = 10.0
 ARTWORK_CONNECT_TIMEOUT_SECONDS = 2.0
 ARTWORK_READ_TIMEOUT_SECONDS = 5.0
 ARTWORK_INFLIGHT_WAIT_TIMEOUT_SECONDS = 6.0
@@ -1721,6 +1723,27 @@ def _uses_audio_sync_transcode(targets: Any) -> bool:
         not _text(target).casefold().startswith(SCREEN_TARGET_PREFIX)
         for target in _list(targets)
     )
+
+
+def _stream_url_unreachable(url: Any) -> bool:
+    """Cheap HEAD probe: True when a playback target would fail to fetch this.
+
+    Only used to decide whether the normalized-PCM sync URL still works before
+    dispatching hardware; a refused sync request gets an original-container
+    fallback instead of a session that dies before it starts.
+    """
+    wanted = _text(url)
+    if not wanted:
+        return True
+    try:
+        response = requests.head(
+            wanted,
+            timeout=(STREAM_PROBE_CONNECT_TIMEOUT_SECONDS, STREAM_PROBE_READ_TIMEOUT_SECONDS),
+            allow_redirects=False,
+        )
+        return response.status_code >= 400
+    except Exception:
+        return True
 
 
 def _mixed_sync_from_player_settings(
@@ -10258,6 +10281,24 @@ def _play_track(
     source_url = provider.stream_url(track, audio_sync=audio_sync_transcode)
     if not source_url:
         raise RuntimeError(f"No stream is available for {_track_label(track)}.")
+    fallback_warning = ""
+    if audio_sync_transcode and _stream_url_unreachable(source_url):
+        # The normalized-PCM transcode (an upstream server-side job) refused
+        # the stream. Playing nothing is worse than losing cross-room clock
+        # sync: fall back to the original container, which targets decode
+        # natively, and say so.
+        fallback_url = provider.stream_url(track, audio_sync=False)
+        if fallback_url and fallback_url != source_url and not _stream_url_unreachable(fallback_url):
+            source_url = fallback_url
+            audio_sync_transcode = False
+            fallback_warning = (
+                "The music server rejected the synced-audio request — playing the original "
+                "format instead. Multi-room sync quality may drift until the server recovers."
+            )
+            logger.warning(
+                "[Music] sync transcode refused for %s; falling back to the original stream",
+                _track_label(track),
+            )
     if not hardware_targets:
         # Screen-only playback: the Jarvis Screen browser fetches the stream
         # URL itself (no audio_sync transcode — browsers decode original
@@ -10322,6 +10363,11 @@ def _play_track(
     result["audio_sync_transcode_used"] = audio_sync_transcode
     if audio_sync_transcode:
         result["audio_sync_transcode_profile"] = "audio_sync"
+    if fallback_warning:
+        result["warnings"] = [
+            *[row for row in _list(result.get("warnings")) if _text(row)],
+            fallback_warning,
+        ]
     return result
 
 
