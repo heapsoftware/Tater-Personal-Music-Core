@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.13.0"
+__version__ = "3.14.0"
 MIN_TATER_VERSION = "1.2.0"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby, Jellyfin, Subsonic, or Plex account or "
@@ -10540,6 +10540,27 @@ def _track_media_type(track: Dict[str, Any]) -> str:
     }.get(extension, "application/octet-stream")
 
 
+def _supports_shared_group_source() -> bool:
+    """True when the host accepts play_media_url_targets(shared_group_source=…).
+
+    Tater v1.2.7 added the flag so a synchronized group of two or more
+    satellites / AirPlay players streams through one shared upstream relay
+    (the stereo-pair path) instead of each target fetching the source itself.
+    Older hosts reject the kwarg, so callers must gate it.
+    """
+    try:
+        import inspect
+
+        from media_playback import play_media_url_targets
+
+        return (
+            "shared_group_source"
+            in inspect.signature(play_media_url_targets).parameters
+        )
+    except Exception:
+        return False
+
+
 def _play_track(
     track: Dict[str, Any],
     targets: Any,
@@ -10636,6 +10657,9 @@ def _play_track(
         airplay_group_id=_text(airplay_group_id),
         timeout_s=max(180.0, duration + 120.0),
         respect_reply_playback=False,
+        # Tater v1.2.7+: synchronize multi-speaker groups through one shared
+        # upstream stream (the host ignores it for single targets).
+        **({"shared_group_source": True} if _supports_shared_group_source() else {}),
     )
     if not isinstance(result, dict) or result.get("ok") is False:
         raise RuntimeError(_text((result or {}).get("error")) or "Music playback failed.")
