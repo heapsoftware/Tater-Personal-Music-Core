@@ -4590,6 +4590,245 @@ class FollowMeTests(unittest.TestCase):
             core._PEOPLE_API_MODULE = original_people
 
 
+class NativePlaybackFailureTests(unittest.TestCase):
+    """A failed native track logs its file and skips forward; 3 in a row stop."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.core = load_personal_music_core()
+
+    def setUp(self):
+        self.redis = FakeRedis()
+        self.core.redis_client = self.redis
+        self.core._shutdown_stream_server()
+        self.core._originals_holder = None
+        self.advances = []
+
+    @staticmethod
+    def restore_stubs(originals):
+        for name, original in originals:
+            if original is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = original
+
+    def stub_native_media(self, media_sessions):
+        native_satellite = types.ModuleType("tater_voice.native_satellite")
+        native_satellite.status_snapshot_sync = lambda: {"clients": dict(media_sessions)}
+        originals = (
+            ("tater_voice", sys.modules.get("tater_voice")),
+            ("tater_voice.native_satellite", sys.modules.get("tater_voice.native_satellite")),
+        )
+        sys.modules["tater_voice"] = types.ModuleType("tater_voice")
+        sys.modules["tater_voice"].native_satellite = native_satellite
+        sys.modules["tater_voice.native_satellite"] = native_satellite
+        self.addCleanup(self.restore_stubs, originals)
+
+    def stub_advance(self, *, advance_status="playing"):
+        self._original_advance = self.core._advance_player
+
+        def fake_advance(direction, *, person_id="", client=None):
+            self.advances.append({"direction": direction, "person_id": person_id})
+            player = self.core._player(client, person_id)
+            player.update(
+                {
+                    "status": advance_status,
+                    "index": 1,
+                    "current": self.core._player(client, person_id)["queue"][1],
+                    "playback_result": {
+                        "ok": True,
+                        "sent_count": 1,
+                        "voice_core_sent_count": 1,
+                        "voice_core_sessions": [
+                            {
+                                "session_id": "s2",
+                                "selectors": ["native:G090A"],
+                                "target": "native:G090A",
+                            }
+                        ],
+                    },
+                    "started_at": time.time(),
+                    "duration_seconds": 180.0,
+                    "playback_failure_streak": player.get("playback_failure_streak"),
+                }
+            )
+            self.core._save_player(player, client, person_id)
+            return player
+
+        self.core._advance_player = fake_advance
+
+    def restore_advance(self):
+        self.core._advance_player = self._original_advance
+
+    def seed_playing_queue(self):
+        """A playing two-track native queue owned by person_a."""
+        tracks = [_track_row(1, "Jamming"), _track_row(2, "Exodus")]
+        player = {
+            "status": "playing",
+            "provider": "emby",
+            "queue": tracks,
+            "queue_original": list(tracks),
+            "index": 0,
+            "current": dict(tracks[0]),
+            "targets": ["voice_core:native:kitchen"],
+            "target": "voice_core:native:kitchen",
+            "duration_seconds": 180.0,
+            "started_at": time.time() - 10.0,
+            "position_offset_seconds": 10.0,
+            "volume_percent": 50,
+            "warnings": [],
+        }
+        self.core._save_player(player, self.redis, "person_a")
+
+    def seed_failed_native_player(self, **streaks):
+        self.seed_playing_queue()
+        player = self.core._player(self.redis, "person_a")
+        player["playback_result"] = {
+            "ok": True,
+            "sent_count": 1,
+            "voice_core_sent_count": 1,
+            "media_session_sent_count": 1,
+            "voice_core_sessions": [
+                {
+                    "session_id": "s1",
+                    "selectors": ["native:G090A"],
+                    "target": "native:G090A",
+                }
+            ],
+        }
+        player.update(streaks)
+        self.core._save_player(player, self.redis, "person_a")
+
+    def test_failed_track_logs_file_and_skips_forward(self):
+        core = self.core
+        self.seed_playing_queue()
+        self.seed_failed_native_player()
+        self.stub_advance()
+        self.addCleanup(self.restore_advance)
+        media = {
+            "native:G090A": {
+                "media_session": {
+                    "session_id": "s1",
+                    "active": False,
+                    "finished_ts": 1.0,
+                    "ok": False,
+                }
+            }
+        }
+        self.stub_native_media(media)
+        # The log names the file so the user can find the bad rip.
+        with self.assertLogs("personal_music_core", level="WARNING") as logged:
+            player = self.core._reconcile_native_playback(
+                core._player(self.redis, "person_a"), self.redis, "person_a"
+            )
+        joined = "\n".join(logged.output)
+        self.assertIn("file may be damaged", joined)
+        self.assertIn("file=", joined)
+        # The queue moved on instead of parking as an error.
+        self.assertEqual(player["status"], "playing")
+        self.assertEqual(player["index"], 1)
+        self.assertEqual(player["playback_failure_streak"], 1)
+        self.assertIn(
+            "Skipped Jamming by Bob Marley — it failed to play; playing the next track.",
+            player["warnings"],
+        )
+        self.assertEqual(self.advances, [{"direction": 1, "person_id": "person_a"}])
+
+    def test_circuit_breaker_stops_after_three_consecutive_failures(self):
+        core = self.core
+        self.seed_playing_queue()
+        self.seed_failed_native_player(playback_failure_streak=3)
+        self.stub_advance()
+        self.addCleanup(self.restore_advance)
+        self.stub_native_media(
+            {
+                "native:G090A": {
+                    "media_session": {
+                        "session_id": "s1",
+                        "active": False,
+                        "finished_ts": 1.0,
+                        "ok": False,
+                    }
+                }
+            }
+        )
+        player = core._reconcile_native_playback(
+            core._player(self.redis, "person_a"), self.redis, "person_a"
+        )
+        self.assertEqual(player["status"], "error")
+        self.assertEqual(player["last_error"], "Playback failed on native:G090A.")
+        self.assertEqual(self.advances, [])
+
+    def test_streak_resets_when_playback_recovers(self):
+        core = self.core
+        self.seed_failed_native_player(
+            playback_failure_streak=2,
+            playback_result={
+                "ok": True,
+                "sent_count": 1,
+                "voice_core_sent_count": 1,
+                "voice_core_sessions": [
+                    {
+                        "session_id": "s1",
+                        "selectors": ["native:G090A"],
+                        "target": "native:G090A",
+                    }
+                ],
+            },
+        )
+        # Session is active: playback is healthy again.
+        self.stub_native_media(
+            {
+                "native:G090A": {
+                    "media_session": {"session_id": "s1", "active": True}
+                }
+            }
+        )
+        player = core._reconcile_native_playback(
+            core._player(self.redis, "person_a"), self.redis, "person_a"
+        )
+        self.assertEqual(player["status"], "playing")
+        self.assertEqual(player.get("playback_failure_streak"), 0)
+
+    def test_partial_target_failure_leaves_queue_running(self):
+        core = self.core
+        self.seed_playing_queue()
+        player = core._player(self.redis, "person_a")
+        player["targets"] = ["voice_core:native:kitchen", "voice_core:native:office"]
+        player["playback_result"] = {
+            "ok": True,
+            "sent_count": 2,
+            "voice_core_sent_count": 2,
+            "voice_core_sessions": [
+                {
+                    "session_id": "s1",
+                    "selectors": ["native:G090A"],
+                    "target": "native:G090A",
+                }
+            ],
+        }
+        self.core._save_player(player, self.redis, "person_a")
+        self.stub_native_media(
+            {
+                "native:G090A": {
+                    "media_session": {
+                        "session_id": "s1",
+                        "active": False,
+                        "finished_ts": 1.0,
+                        "ok": False,
+                    }
+                }
+            }
+        )
+        result = core._reconcile_native_playback(
+            core._player(self.redis, "person_a"), self.redis, "person_a"
+        )
+        # Not all dispatched sessions failed: log only, no skip, no error.
+        self.assertEqual(result["status"], "playing")
+        self.assertNotIn("playback_failure_streak", result)
+        self.assertEqual(self.advances, [])
+
+
 class ResumeDelayTests(unittest.TestCase):
     """Gaining-room resume delays: transfers, follow-me moves, away returns."""
 

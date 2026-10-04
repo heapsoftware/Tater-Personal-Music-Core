@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.10.0"
+__version__ = "3.11.0"
 MIN_TATER_VERSION = "1.2.0"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby, Jellyfin, Subsonic, or Plex account or "
@@ -494,6 +494,10 @@ PERSON_LINK_TEST_KEY = "personal_music_core:person_link_test"
 CATALOG_STATS_KEY = "personal_music_core:catalog_stats"
 CATALOG_KEY = "personal_music_core:catalog:v1"
 PLAYER_KEY = "personal_music_core:player"
+# Skip-on-failure circuit breaker: how many consecutive failed native tracks
+# are skipped (each logged with its file path) before the queue parks as an
+# error again. Guards against a dead music source machine-gunning the queue.
+MAX_CONSECUTIVE_TRACK_FAILURES = 3
 # Per-person queues live at "personal_music_core:player:<person_id>" while the
 # shared household queue stays at "personal_music_core:player" ("" queue id), so
 # existing installs keep their global player state untouched.
@@ -11809,6 +11813,13 @@ def _reconcile_native_playback(
         failure_details[target_name] = detail
 
     if not failed:
+        if _as_int(player.get("playback_failure_streak"), 0, 0, 1000):
+            # The next track started fine (or playback recovered): clear the
+            # skip-on-failure circuit breaker.
+            player["playback_failure_streak"] = 0
+            _save_player(
+                player, client, person_id if person_id else player.get("queue_id")
+            )
         return player
     detail_parts = [f"{name}: {failure_details[name]}" for name in failed if failure_details.get(name)]
     warning = "Playback failed on " + ", ".join(failed) + "."
@@ -11816,13 +11827,6 @@ def _reconcile_native_playback(
     if warning not in warnings:
         warnings.append(warning)
     player["warnings"] = warnings
-    logger.error(
-        "[Music] satellite playback failed person=%s track=%s targets=%s detail=%s",
-        _text(player.get("queue_id")),
-        _track_label(player.get("current") or {}),
-        ", ".join(failed),
-        (" " + "; ".join(detail_parts)) if detail_parts else " (satellite reported no error detail)",
-    )
     sent_count = _as_int(playback_result.get("sent_count"), len(sessions), 0, 10000)
     voice_core_sent_count = _as_int(
         playback_result.get("voice_core_sent_count"),
@@ -11833,15 +11837,77 @@ def _reconcile_native_playback(
     all_dispatched_targets_are_tracked_native_sessions = (
         len(sessions) >= voice_core_sent_count and sent_count <= voice_core_sent_count
     )
-    if len(failed) == len(sessions) and all_dispatched_targets_are_tracked_native_sessions:
-        player["status"] = "error"
-        player["last_error"] = warning
-        player["started_at"] = 0.0
-    _save_player(
-        player,
-        client,
-        person_id if person_id else player.get("queue_id"),
+    queue_owner_id = person_id if person_id else player.get("queue_id")
+    detail_suffix = (" " + "; ".join(detail_parts)) if detail_parts else " (satellite reported no error detail)"
+    skip_detail = (" " + "; ".join(detail_parts)) if detail_parts else ""
+    if not (
+        len(failed) == len(sessions) and all_dispatched_targets_are_tracked_native_sessions
+    ):
+        # Only some targets failed; the survivors are still playing. Surface
+        # the failure (as always) but leave the queue running.
+        logger.error(
+            "[Music] satellite playback failed person=%s track=%s targets=%s detail=%s",
+            _text(player.get("queue_id")),
+            _track_label(player.get("current") or {}),
+            ", ".join(failed),
+            detail_suffix,
+        )
+        _save_player(player, client, queue_owner_id)
+        return player
+
+    # Every dispatched native session failed: one bad file (or a dead source)
+    # used to park the whole queue as an error. Name the file in the log, then
+    # skip forward while the circuit breaker allows it; after
+    # MAX_CONSECUTIVE_TRACK_FAILURES consecutive failures — a dead server, not
+    # one bad rip — stop with the error as before so the queue isn't
+    # machine-gunned.
+    streak = _as_int(player.get("playback_failure_streak"), 0, 0, 1000) + 1
+    player["playback_failure_streak"] = streak
+    current = player.get("current") or {}
+    if streak < MAX_CONSECUTIVE_TRACK_FAILURES:
+        logger.warning(
+            "[Music] track failed to play — the file may be damaged or the target could "
+            "not decode it: %s (file=%s, target=%s, consecutive failures=%d%s) — skipping "
+            "to the next track",
+            _track_label(current),
+            _text(current.get("path")) or "(no file path on the queue row)",
+            ", ".join(failed),
+            streak,
+            skip_detail,
+        )
+        _save_player(player, client, queue_owner_id)
+        try:
+            _advance_player(1, person_id=queue_owner_id, client=client)
+        except Exception as exc:
+            logger.warning("[Music] skip after failed track could not advance: %s", _text(exc))
+        else:
+            advanced = _player(client, queue_owner_id)
+            if _text(advanced.get("status")).lower() == "playing":
+                skip_note = f"Skipped {_track_label(current)} — it failed to play; playing the next track."
+                advanced_warnings = [
+                    _text(value) for value in list(advanced.get("warnings") or []) if _text(value)
+                ]
+                if skip_note not in advanced_warnings:
+                    advanced_warnings.append(skip_note)
+                advanced["warnings"] = advanced_warnings
+                _save_player(advanced, client, queue_owner_id)
+                return advanced
+            # Queue genuinely ended (finished): leave _advance_player's result.
+            return advanced
+    # Circuit breaker tripped (or advancing raised): park as an error, as
+    # before, now with the failure history in the message.
+    logger.error(
+        "[Music] satellite playback failed person=%s track=%s targets=%s consecutive_failures=%d detail=%s",
+        _text(player.get("queue_id")),
+        _track_label(current),
+        ", ".join(failed),
+        streak,
+        detail_suffix,
     )
+    player["status"] = "error"
+    player["last_error"] = warning
+    player["started_at"] = 0.0
+    _save_player(player, client, queue_owner_id)
     return player
 
 

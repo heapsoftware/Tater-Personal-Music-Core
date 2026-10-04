@@ -124,6 +124,15 @@ way the file's format never decides whether it plays. Subsonic additionally
 asks for `format=wav` on non-decodable containers only (Navidrome and friends
 transcode those server-side).
 
+**Damaged files skip instead of stopping the queue.** When a track ends
+without the satellite completing it (a damaged file the firmware decoder
+chokes on, an empty download, a server hiccup), the core logs the track's
+file path and failure in the Tater log (`track failed to play — the file may
+be damaged or the target could not decode it: … file=…`) and automatically
+skips to the next queued track instead of parking the queue with an error.
+Three consecutive failures stop the queue as before, so a down or wedged
+music server doesn't machine-gun through the library.
+
 ### Network share (SMB/CIFS or NFS)
 
 Tater does **not** mount shares itself. Mount the share on the Tater **host** (or
