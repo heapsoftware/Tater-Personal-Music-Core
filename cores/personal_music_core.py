@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.9.5"
+__version__ = "3.9.6"
 MIN_TATER_VERSION = "1.2.0"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby, Jellyfin, Subsonic, or Plex account or "
@@ -11477,6 +11477,7 @@ def _reconcile_native_playback(
         return player
 
     failed: List[str] = []
+    failure_details: Dict[str, str] = {}
     for session in sessions:
         session_id = _text(session.get("session_id"))
         selectors = _list(session.get("selectors") or session.get("target"))
@@ -11493,16 +11494,35 @@ def _reconcile_native_playback(
         if not states or any(bool(state.get("active")) for state in states):
             continue
         finished_states = [state for state in states if _as_float(state.get("finished_ts")) > 0]
-        if finished_states and any(state.get("ok") is False for state in finished_states):
-            failed.append(_text(session.get("target")) or ", ".join(selectors))
+        failed_states = [state for state in finished_states if state.get("ok") is False]
+        if not failed_states:
+            continue
+        target_name = _text(session.get("target")) or ", ".join(selectors)
+        failed.append(target_name)
+        # Some satellite builds attach their own fetch/stream error text to the
+        # finished media session; surface it when present.
+        detail = "; ".join(
+            _text(state.get("error"))
+            for state in failed_states
+            if _text(state.get("error"))
+        )
+        failure_details[target_name] = detail
 
     if not failed:
         return player
+    detail_parts = [f"{name}: {failure_details[name]}" for name in failed if failure_details.get(name)]
     warning = "Playback failed on " + ", ".join(failed) + "."
     warnings = [_text(value) for value in list(player.get("warnings") or []) if _text(value)]
     if warning not in warnings:
         warnings.append(warning)
     player["warnings"] = warnings
+    logger.error(
+        "[Music] satellite playback failed person=%s track=%s targets=%s detail=%s",
+        _text(player.get("queue_id")),
+        _track_label(player.get("current") or {}),
+        ", ".join(failed),
+        (" " + "; ".join(detail_parts)) if detail_parts else " (satellite reported no error detail)",
+    )
     sent_count = _as_int(playback_result.get("sent_count"), len(sessions), 0, 10000)
     voice_core_sent_count = _as_int(
         playback_result.get("voice_core_sent_count"),
