@@ -29,14 +29,20 @@ yourself.
 
 Open Tater → **Personal Music** tab → **Sources**.
 
-**Sources is the single, global music source for the household** — one Emby,
-Jellyfin, Subsonic, or Plex login (or an Emby/Jellyfin API key), or one mounted
-share folder. This is the library that
-People *without* their own link hear, and what the dashboard player bar and
-client music use. It is **not** how each Person gets their own library: giving
-a Person their own provider account or share folder is done per-Person in the
-**People** section (see [Per-person links](#per-person-links)), which
-overrides the global source for that Person only.
+The **Sources** tab lists every set-up music source and who it links to — a
+**household source** (shared by everyone: one Emby, Jellyfin, Subsonic, or
+Plex login, or an Emby/Jellyfin API key, or one mounted share folder) plus each
+**Person's own source**. A household source is what the dashboard player bar
+and client music use; it is
+**not** how each Person gets their own library: adding a source with **Belongs
+To = one Person** (see [Per-person links](#per-person-links)) gives them their
+own provider account or share folder, which
+overrides the household source for that Person only.
+
+Press **Add Source** to set one up: pick who it belongs to and the source
+type, then fill in that provider's fields on the new card. **Edit** reworks
+the details (for example a server URL or password change); **Delete Source**
+removes it.
 
 ### Emby
 
@@ -57,7 +63,7 @@ overrides the global source for that Person only.
   (`/mnt/media/<user>/Music`). Use this when one
   mixed-content library holds a Person's music, TV, and movies and only the
   music should be indexed. Blank means the whole library is synced.
-- **Test Emby Connection** (on Person link cards) signs in and verifies the
+- **Test Emby Connection** (on source cards) signs in and verifies the
   Library Name and Library Folder resolve — a mismatch is reported there with
   the failing name, before anything is saved or synced.
 
@@ -88,7 +94,7 @@ styles):
 ### Plex
 
 One music library on a Plex Media Server, with three sign-in styles (a
-**Sign-In Style** select on both the Sources card and each Person's link card;
+**Sign-In Style** select on the household's Sources card and each Person's own source card;
 all of them converge on a server URL plus a token):
 
 - **Home user** (default): the owner signs in to plex.tv once, and the source
@@ -183,16 +189,20 @@ time.
 
 ## Per-person links
 
-**Personal Music** tab → **People** → **Add Person Link** (Edit opens the
-form in a modal; **Edit** on a linked Person's card reopens it). Each Person can get:
+**Personal Music** tab → **Sources** → **Add Source**. The Add Source card
+saves where the source belongs (the **Household — shared by everyone**, or one
+**Person**) and its type; the new card's **Edit** then asks for that provider's
+connection details and test/syncs them. The tab lists only the set-up sources,
+and each card shows who it links to. Each Person can get:
 
 - their own Emby or Jellyfin user/library on a shared server,
 - their own Subsonic account (Navidrome/Airsonic/Gonic included),
 - their own Plex account (three sign-in styles — see [Plex](#plex)),
 - their own subfolder on a mounted share (e.g. `/mnt/music/<person>`), or
-- **two sources at once** — a second linked source (any mix of the above)
-  merges into one catalog under the same card's **Second Music Source**
-  setting. The two sources are **parallel, not master/backup**: a track plays
+- **two sources at once** — add a second source for the same Person on the
+  **Sources** tab (it lands as their **Second Source** card, any mix of the
+  above) and both merge into one catalog. The two sources are **parallel, not
+  master/backup**: a track plays
   from wherever it lives, so "play Justin Timberlake" plays from whichever
   linked source has the artist.
 
@@ -279,9 +289,9 @@ pressing play, pause, or stop in the meantime cancels the wait and acts
 immediately. Each Person can set their own delay on their link card (blank =
 use the global setting; 0 = resume immediately).
 
-### Filling in a provider link on a Person's card
+### Filling in a provider source on the Sources tab
 
-For **Emby (own user/library)**, fill in the Person's card in **People**:
+For **Emby (own user/library)** — a Person's own source card — press **Edit**:
 
 - **Emby Server URL** is pre-filled with the global server from Sources — leave
   it as-is when the Person's account is on the same Emby server (the common

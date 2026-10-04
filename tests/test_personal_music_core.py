@@ -476,12 +476,13 @@ class CustomMusicCoreTests(unittest.TestCase):
             link = core._person_link("person_zoe", self.redis)
             self.assertEqual(link["emby"]["library_name"], "Zoe Media")
             self.assertEqual(link["emby"]["library_folder"], "Music")
-            # Every link card carries the form, so the folder field is there.
+            # The person's source card on the Sources tab carries the form, so
+            # the folder field is there.
             cards = {
                 item["id"]: item
-                for item in core._person_link_items(core._settings(self.redis), self.redis)
+                for item in core._person_source_items(core._settings(self.redis), self.redis)
             }
-            fields = {field["key"]: field for field in cards["person:person_zoe"]["fields"]}
+            fields = {field["key"]: field for field in cards["person_source:person_zoe:primary"]["fields"]}
             self.assertEqual(fields["person_link_emby_library_folder"]["value"], "Music")
         finally:
             core._PEOPLE_API_MODULE = original_people
@@ -1556,7 +1557,8 @@ class PerPersonLinkageTests(unittest.TestCase):
             self.assertIn("people", tab_keys)
             item_ids = [item.get("id") for item in data["ui"]["item_forms"]]
             self.assertIn("person:person_zoe", item_ids)
-            self.assertIn("person:new", item_ids)  # Ama is still unlinked
+            # The old add-link card is gone; Ama is linked from the Sources tab.
+            self.assertNotIn("person:new", item_ids)
         finally:
             self.core._PEOPLE_API_MODULE = original_people
 
@@ -1654,7 +1656,7 @@ class PerPersonLinkageTests(unittest.TestCase):
             upstream.shutdown()
             self.core._PEOPLE_API_MODULE = original_people
 
-    def test_person_link_cards_offer_emby_test_button(self):
+    def test_person_source_cards_offer_test_and_delete_buttons(self):
         people = types.SimpleNamespace(
             load_store=lambda _client=None: {
                 "people": [
@@ -1671,17 +1673,22 @@ class PerPersonLinkageTests(unittest.TestCase):
             data = self.core.get_htmlui_tab_data(redis_client=self.redis)
             cards = {item.get("id"): item for item in data["ui"]["item_forms"]}
             # Every card always carries its full form for the host's Edit modal
-            # (ui.item_fields_popup), plus its own Test Connection action.
-            for card_id in ("person:person_zoe", "person:new"):
-                card = cards[card_id]
-                self.assertTrue(card.get("fields"))
-                self.assertTrue(card.get("fields_popup"))
-                self.assertEqual(card.get("save_action"), "music_person_link_save")
-                self.assertTrue(card.get("settings_label"))
-                self.assertTrue(card.get("settings_title"))
-                actions = [a.get("action") for a in card.get("actions") or []]
-                self.assertIn("music_person_link_test", actions)
-                self.assertNotIn("music_person_link_edit", actions)
+            # (ui.item_fields_popup), plus Test Connection / Delete actions.
+            card = cards["person_source:person_zoe:primary"]
+            self.assertTrue(card.get("fields"))
+            self.assertTrue(card.get("fields_popup"))
+            self.assertEqual(card.get("save_action"), "music_person_source_save")
+            self.assertEqual(card.get("settings_label"), "Edit")
+            self.assertTrue(card.get("settings_title"))
+            actions = [a.get("action") for a in card.get("actions") or []]
+            self.assertIn("music_person_link_test", actions)
+            self.assertIn("music_person_source_delete", actions)
+            self.assertNotIn("music_person_link_edit", actions)
+            # The Add Source card stages the add: scope and type only.
+            add_card = cards["source:add"]
+            add_keys = [field["key"] for field in add_card["fields"]]
+            self.assertEqual(add_keys, ["source_add_scope", "source_add_provider"])
+            self.assertEqual(add_card.get("save_action"), "music_source_add")
         finally:
             self.core._PEOPLE_API_MODULE = original_people
 
@@ -1720,9 +1727,23 @@ class PerPersonLinkageTests(unittest.TestCase):
 
         self.core.EmbyMusicProvider = StubEmby
         try:
-            self.link_person()
+            self.redis.hset(
+                self.core.PERSON_LINKS_KEY,
+                mapping={
+                    "person_zoe": json.dumps(
+                        {
+                            "music_source": "emby",
+                            "emby": {
+                                "server_url": "http://emby.local:8096",
+                                "username": "zoe",
+                                "password": "saved-pw",
+                            },
+                        }
+                    )
+                },
+            )
             # A passing test returns its message for the host to toast, and the
-            # linked person's card keeps showing the outcome as a summary row.
+            # person's source card keeps showing the outcome as a summary row.
             draft = {
                 "person_link_person_id": "person_zoe",
                 "person_link_source": "emby",
@@ -1739,20 +1760,26 @@ class PerPersonLinkageTests(unittest.TestCase):
             cards = {item.get("id"): item for item in data["ui"]["item_forms"]}
             linked_rows = {
                 row["label"]: row["value"]
-                for row in cards["person:person_zoe"].get("summary_rows") or []
+                for row in cards["person_source:person_zoe:primary"].get("summary_rows") or []
             }
             self.assertIn("passed", " ".join(linked_rows))
-            # The form keeps the saved link's values; typed draft values are not
-            # prefilled back (the host preserves unsaved edits across refetches).
+            # The source card's form keeps the saved link's values; typed draft
+            # values are not prefilled back (the host preserves unsaved edits
+            # across refetches).
             linked_fields = {
                 field["key"]: field["value"]
-                for field in cards["person:person_zoe"]["fields"]
+                for field in cards["person_source:person_zoe:primary"]["fields"]
             }
-            self.assertEqual(linked_fields["person_link_share_root_path"], self.share_root)
-            self.assertEqual(linked_fields["person_link_emby_server_url"], "")
+            self.assertEqual(linked_fields["person_link_emby_server_url"], "http://emby.local:8096")
             self.assertEqual(linked_fields["person_link_emby_password"], "")
-            # A failing test for a not-yet-linked person shows its outcome on
-            # the add-link card without touching the form values.
+            # A failing test for an added-but-unconfigured source shows its
+            # outcome on that source card without touching the form values.
+            result = self.core.handle_htmlui_tab_action(
+                action="music_source_add",
+                payload={"values": {"source_add_scope": "person_ama", "source_add_provider": "emby"}},
+                redis_client=self.redis,
+            )
+            self.assertTrue(result["ok"], result)
             with self.assertRaises(ValueError):
                 self.core._test_person_link_source_action(
                     {
@@ -1767,13 +1794,13 @@ class PerPersonLinkageTests(unittest.TestCase):
             cards = {item.get("id"): item for item in data["ui"]["item_forms"]}
             new_rows = {
                 row["label"]: row["value"]
-                for row in cards["person:new"].get("summary_rows") or []
+                for row in cards["person_source:person_ama:primary"].get("summary_rows") or []
             }
             self.assertIn("failed", list(new_rows)[0])
             new_fields = {
-                field["key"]: field["value"] for field in cards["person:new"]["fields"]
+                field["key"]: field["value"] for field in cards["person_source:person_ama:primary"]["fields"]
             }
-            self.assertEqual(new_fields["person_link_person_id"], "")
+            self.assertEqual(new_fields["person_link_person_id"], "person_ama")
             self.assertEqual(new_fields["person_link_emby_password"], "")
             # Saving or removing the link clears the recorded test state.
             self.core._clear_person_link_test_state("person_ama", self.redis)
@@ -4614,7 +4641,8 @@ class FollowMeTests(unittest.TestCase):
             )
             cards = {item["id"]: item for item in core._person_link_items(core._settings(self.redis), self.redis)}
             self.assertIn("person:person_zoe", cards)
-            self.assertIn("person:new", cards)
+            # A link with no source of its own still renders (household music).
+            self.assertNotIn("person:new", cards)
             # The follow-me status shows on the card; its fields ride the form
             # the card's Edit modal opens.
             self.assertIn("Follow-me: in Kitchen → Kitchen", cards["person:person_zoe"]["subtitle"])
@@ -4624,10 +4652,9 @@ class FollowMeTests(unittest.TestCase):
             self.assertEqual(fields["person_link_follow_me_takeover_mode"]["value"], "ask")
             self.assertEqual(fields["person_link_follow_me_away_action"]["value"], "pause")
             self.assertIn("Follow-me: in Kitchen → Kitchen", cards["person:person_zoe"]["subtitle"])
-            # The add-link card carries the same fields, defaulted from settings.
-            new_fields = {field["key"]: field for field in cards["person:new"]["fields"]}
-            self.assertEqual(new_fields["person_link_follow_me_takeover_mode"]["value"], "auto")
-            self.assertEqual(new_fields["person_link_follow_me_away_action"]["value"], "keep_pause")
+            # The card no longer carries source fields; those live on the
+            # Sources tab's per-Person source cards.
+            self.assertNotIn("person_link_source", fields)
             # Error states are surfaced with a friendly label.
             core._save_follow_me_state(
                 "person_zoe",
@@ -6701,16 +6728,16 @@ class ProviderFoundationTests(unittest.TestCase):
         self.assertIn("AudioCodec=wav", seen["path"])
         self.assertIn("AudioSampleRate=44100", seen["path"])
 
-    def test_extra_source_picker_lists_every_catalog_provider(self):
-        fields = self.core._person_link_extra_source_fields({}, {})
-        select = next(field for field in fields if field["key"] == "person_link_extra_source")
-        values = {option["value"] for option in select["options"]}
-        self.assertEqual(
-            values,
-            {"", *self.core.CATALOG_PROVIDER_IDS},
+    def test_add_source_picker_lists_every_catalog_provider(self):
+        items = self.core._add_source_item(self.redis)
+        provider_select = next(
+            field for field in items["fields"] if field["key"] == "source_add_provider"
         )
+        values = {option["value"] for option in provider_select["options"]}
+        self.assertEqual(values, set(self.core.CATALOG_PROVIDER_IDS))
 
-    def test_person_link_forms_carry_every_provider_fields(self):
+
+    def test_people_link_forms_carry_no_provider_fields(self):
         people = types.SimpleNamespace(
             load_store=lambda _client=None: {
                 "people": [{"id": "person_zoe", "display_name": "Zoe"}]
@@ -6719,20 +6746,411 @@ class ProviderFoundationTests(unittest.TestCase):
         original_people = self.core._PEOPLE_API_MODULE
         self.core._PEOPLE_API_MODULE = people
         try:
+            self.redis.hset(
+                self.core.PERSON_LINKS_KEY,
+                mapping={
+                    "person_zoe": json.dumps(
+                        {"music_source": "emby", "emby": {"server_url": "http://emby.local:8096"}}
+                    )
+                },
+            )
             data = self.core.get_htmlui_tab_data(redis_client=self.redis)
             cards = {item.get("id"): item for item in data["ui"]["item_forms"]}
-            keys = {field["key"] for field in cards["person:new"]["fields"]}
-            self.assertIn("person_link_emby_server_url", keys)
-            self.assertIn("person_link_jellyfin_server_url", keys)
-            self.assertIn("person_link_subsonic_server_url", keys)
-            self.assertIn("person_link_plex_server_url", keys)
-            self.assertIn("person_link_share_root_path", keys)
-            # The second source's fields appear for every provider too.
-            self.assertIn("person_link_extra_jellyfin_server_url", keys)
-            self.assertIn("person_link_extra_subsonic_server_url", keys)
-            self.assertIn("person_link_extra_plex_auth_mode", keys)
+            # The People tab's settings form keeps only the Person's playback
+            # settings; source details moved to the Sources tab.
+            keys = {field["key"] for field in cards["person:person_zoe"]["fields"]}
+            self.assertIn("person_link_person_id", keys)
+            self.assertNotIn("person_link_source", keys)
+            self.assertNotIn("person_link_emby_server_url", keys)
+            self.assertNotIn("person_link_jellyfin_server_url", keys)
+            self.assertNotIn("person_link_subsonic_server_url", keys)
+            self.assertNotIn("person_link_plex_server_url", keys)
+            self.assertNotIn("person_link_share_root_path", keys)
+            self.assertNotIn("person_link_extra_jellyfin_server_url", keys)
+            self.assertNotIn("person_link_extra_subsonic_server_url", keys)
+            self.assertNotIn("person_link_extra_plex_auth_mode", keys)
+            # Only the linked source's own card (plus the add + household
+            # cards, when set up) carries its provider fields.
+            source_cards = [
+                item
+                for item in data["ui"]["item_forms"]
+                if item.get("group") == "providers" and item.get("id") != "source:add"
+            ]
+            self.assertEqual([card["id"] for card in source_cards], ["person_source:person_zoe:primary"])
+            card_keys = {field["key"] for field in source_cards[0]["fields"]}
+            self.assertIn("person_link_emby_server_url", card_keys)
         finally:
             self.core._PEOPLE_API_MODULE = original_people
+
+
+class SourcesTabTests(unittest.TestCase):
+    """Sources-tab add/edit/delete for household and per-Person sources."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.core = load_personal_music_core()
+        cls.helpers = sys.modules["helpers"]
+
+    def setUp(self):
+        self.redis = FakeRedis()
+        self.core.redis_client = self.redis
+
+    def stub_people(self, *people):
+        rows = [{"id": pid, "display_name": name} for pid, name in people]
+        self._original_people = self.core._PEOPLE_API_MODULE
+        self.core._PEOPLE_API_MODULE = types.SimpleNamespace(load_store=lambda _client=None: {"people": rows})
+
+    def restore_people(self):
+        self.core._PEOPLE_API_MODULE = self._original_people
+
+    def seed_link(self, person_id="person_zoe", **link):
+        self.redis.hset(
+            self.core.PERSON_LINKS_KEY,
+            mapping={person_id: json.dumps(link)},
+        )
+
+    def run_action(self, action, values):
+        return self.core.handle_htmlui_tab_action(
+            action=action,
+            payload={"values": values},
+            redis_client=self.redis,
+        )
+
+    # ---- add ----
+
+    def test_add_household_source_stages_an_entry(self):
+        try:
+            self.stub_people(("person_zoe", "Zoe"))
+            result = self.run_action(
+                "music_source_add",
+                {"source_add_scope": "__household__", "source_add_provider": "subsonic"},
+            )
+            self.assertTrue(result["ok"], result)
+            self.assertIn("Edit", result["message"])
+            self.assertEqual(self.core._household_source_ids(self.redis), {"subsonic"})
+            # The card list gains exactly one household source card, marked
+            # setup-needed, with save (Edit) and delete wired.
+            cards = self.core._provider_cards({}, "subsonic", self.redis)
+            self.assertEqual([card["id"] for card in cards], ["provider:subsonic"])
+            card = cards[0]
+            self.assertIn("SETUP NEEDED", [badge["label"] for badge in card["hero_badges"]])
+            self.assertEqual(card.get("save_action"), "music_provider_connect")
+            self.assertEqual(card.get("settings_label"), "Edit")
+            actions = [a.get("action") for a in card.get("actions") or []]
+            self.assertIn("music_provider_disconnect", actions)
+            # Adding the same household source twice is refused.
+            with self.assertRaises(ValueError):
+                self.run_action(
+                    "music_source_add",
+                    {"source_add_scope": "__household__", "source_add_provider": "subsonic"},
+                )
+        finally:
+            self.restore_people()
+
+    def test_add_person_source_fills_primary_then_second_slot(self):
+        try:
+            self.stub_people(("person_zoe", "Zoe"))
+            result = self.run_action(
+                "music_source_add",
+                {"source_add_scope": "person_zoe", "source_add_provider": "emby"},
+            )
+            self.assertTrue(result["ok"], result)
+            link = self.core._person_link("person_zoe", self.redis)
+            self.assertEqual(link["music_source"], "emby")
+            # A second source joins the extra slot.
+            self.run_action(
+                "music_source_add",
+                {"source_add_scope": "person_zoe", "source_add_provider": "subsonic"},
+            )
+            link = self.core._person_link("person_zoe", self.redis)
+            self.assertEqual(link["extra_source"], "subsonic")
+            self.assertEqual(link["extra"], {})
+            # A third source is refused.
+            with self.assertRaises(ValueError):
+                self.run_action(
+                    "music_source_add",
+                    {"source_add_scope": "person_zoe", "source_add_provider": "plex"},
+                )
+            # Both of the person's sources render as their own cards.
+            cards = self.core._person_source_items(self.core._settings(self.redis), self.redis)
+            self.assertEqual(
+                [card["id"] for card in cards],
+                ["person_source:person_zoe:primary", "person_source:person_zoe:extra"],
+            )
+            self.assertIn("Zoe", cards[0]["title"])
+            self.assertIn("SETUP NEEDED", [badge["label"] for badge in cards[0]["hero_badges"]])
+        finally:
+            self.restore_people()
+
+    # ---- edit (save) ----
+
+    def test_save_person_source_updates_only_its_slot(self):
+        try:
+            self.stub_people(("person_zoe", "Zoe"))
+            self.redis.hset(
+                self.core.PERSON_LINKS_KEY,
+                mapping={
+                    "person_zoe": json.dumps(
+                        {
+                            "music_source": "emby",
+                            "emby": {"server_url": "http://old.local:8096", "password": "saved-pw"},
+                            "follow_me_person_entity": "person.zoe",
+                            "extra_source": "network_share",
+                            "extra": {"root_path": "/mnt/music/other"},
+                        }
+                    )
+                },
+            )
+            self.core._sync_catalog = lambda *args, **kwargs: {"tracks": [{"id": 1}, {"id": 2}]}
+            values = {
+                "person_link_person_id": "person_zoe",
+                "person_link_source": "emby",
+                "person_link_slot": "primary",
+                "person_link_emby_server_url": "http://new.local:8096",
+                "person_link_emby_username": "zoe",
+                "person_link_emby_password": "",
+            }
+            result = self.core.handle_htmlui_tab_action(
+                action="music_person_source_save",
+                payload={"values": values, "id": "person_source:person_zoe:primary"},
+                redis_client=self.redis,
+            )
+            link = self.core._person_link("person_zoe", self.redis)
+            self.assertEqual(link["emby"]["server_url"], "http://new.local:8096")
+            # A blank password keeps the saved one; the rest of the link stays.
+            self.assertEqual(link["emby"]["password"], "saved-pw")
+            self.assertEqual(link["follow_me_person_entity"], "person.zoe")
+            self.assertEqual(link["extra"], {"root_path": "/mnt/music/other"})
+            self.assertTrue(result["ok"], result)
+        finally:
+            self.restore_people()
+
+    def test_save_person_second_source_slot(self):
+        self.core._sync_catalog = lambda *args, **kwargs: {"tracks": [{"id": 1}]}
+        try:
+            self.stub_people(("person_zoe", "Zoe"))
+            self.redis.hset(
+                self.core.PERSON_LINKS_KEY,
+                mapping={
+                    "person_zoe": json.dumps(
+                        {
+                            "music_source": "emby",
+                            "emby": {"server_url": "http://emby.local:8096"},
+                            "extra_source": "subsonic",
+                            "extra": {"server_url": "https://old.example.com"},
+                        }
+                    )
+                },
+            )
+            result = self.core.handle_htmlui_tab_action(
+                action="music_person_source_save",
+                payload={
+                    "values": {
+                        "person_link_person_id": "person_zoe",
+                        "person_link_source": "subsonic",
+                        "person_link_slot": "extra",
+                        "person_link_subsonic_server_url": "https://new.example.com",
+                        "person_link_subsonic_username": "zoe",
+                        "person_link_subsonic_password": "pw",
+                    },
+                    "id": "person_source:person_zoe:extra",
+                },
+                redis_client=self.redis,
+            )
+            self.assertTrue(result["ok"], result)
+            link = self.core._person_link("person_zoe", self.redis)
+            self.assertEqual(link["extra_source"], "subsonic")
+            self.assertEqual(link["extra"]["server_url"], "https://new.example.com")
+            # The primary slot was untouched.
+            self.assertEqual(link["emby"], {"server_url": "http://emby.local:8096"})
+            self.assertEqual(link["follow_me_person_entity"] if "follow_me_person_entity" in link else None, None)
+        finally:
+            self.restore_people()
+
+    # ---- delete ----
+
+    def test_delete_person_second_source(self):
+        try:
+            self.stub_people(("person_zoe", "Zoe"))
+            self.seed_link(
+                person_id="person_zoe",
+                **{"music_source": "emby", "emby": {"server_url": "http://emby.local:8096"},
+                   "extra_source": "subsonic", "subsonic": {"server_url": "https://x"},
+                   "extra": {"server_url": "https://x"}},
+            )
+            result = self.core.handle_htmlui_tab_action(
+                action="music_person_source_delete",
+                payload={
+                    "values": {
+                        "person_link_person_id": "person_zoe",
+                        "person_link_source": "subsonic",
+                        "person_link_slot": "extra",
+                    },
+                    "id": "person_source:person_zoe:extra",
+                },
+                redis_client=self.redis,
+            )
+            self.assertTrue(result["ok"], result)
+            link = self.core._person_link("person_zoe", self.redis)
+            self.assertEqual(link["music_source"], "emby")
+            self.assertNotIn("extra_source", link)
+            self.assertNotIn("extra", link)
+        finally:
+            self.restore_people()
+
+    def test_delete_person_primary_promotes_the_second_source(self):
+        try:
+            self.stub_people(("person_zoe", "Zoe"))
+            self.seed_link(
+                person_id="person_zoe",
+                **{"music_source": "emby", "emby": {"server_url": "http://emby.local:8096"},
+                   "extra_source": "subsonic", "extra": {"server_url": "https://sub.local"}},
+            )
+            promote_calls = []
+            self.core._schedule_catalog_sync = (
+                lambda *args, **kwargs: promote_calls.append(args) or False
+            )
+            result = self.core.handle_htmlui_tab_action(
+                action="music_person_source_delete",
+                payload={
+                    "values": {
+                        "person_link_person_id": "person_zoe",
+                        "person_link_source": "emby",
+                        "person_link_slot": "primary",
+                    },
+                    "id": "person_source:person_zoe:primary",
+                },
+                redis_client=self.redis,
+            )
+            self.assertTrue(result["ok"], result)
+            self.assertIn("now their primary source", result["message"])
+            link = self.core._person_link("person_zoe", self.redis)
+            self.assertEqual(link["music_source"], "subsonic")
+            self.assertEqual(link["subsonic"], {"server_url": "https://sub.local"})
+            self.assertNotIn("emby", link)
+            self.assertNotIn("extra", link)
+            self.assertNotIn("extra_source", link)
+            self.assertEqual(promote_calls, [("person_zoe", self.redis)])
+        finally:
+            self.restore_people()
+
+    def test_delete_person_primary_falls_back_to_household(self):
+        try:
+            self.stub_people(("person_zoe", "Zoe"))
+            self.redis.hset(
+                self.core.PERSON_LINKS_KEY,
+                mapping={
+                    "person_zoe": json.dumps(
+                        {
+                            "music_source": "subsonic",
+                            "subsonic": {"server_url": "https://sub.local"},
+                            "follow_me_person_entity": "person.zoe",
+                        }
+                    )
+                },
+            )
+            result = self.core.handle_htmlui_tab_action(
+                action="music_person_source_delete",
+                payload={
+                    "values": {
+                        "person_link_person_id": "person_zoe",
+                        "person_link_source": "subsonic",
+                        "person_link_slot": "primary",
+                    },
+                    "id": "person_source:person_zoe:primary",
+                },
+                redis_client=self.redis,
+            )
+            self.assertTrue(result["ok"], result)
+            link = self.core._person_link("person_zoe", self.redis)
+            self.assertEqual(link["music_source"], "")
+            self.assertNotIn("subsonic", link)
+            # Their playback overrides survive the source deletion.
+            self.assertEqual(link["follow_me_person_entity"], "person.zoe")
+        finally:
+            self.restore_people()
+
+    # ---- the link save keeps stored sources ----
+
+    def test_people_link_save_without_source_fields_keeps_both_sources(self):
+        try:
+            self.stub_people(("person_zoe", "Zoe"))
+            self.seed_link(
+                person_id="person_zoe",
+                **{"music_source": "emby", "emby": {"server_url": "http://emby.local:8096"},
+                   "extra_source": "subsonic", "extra": {"server_url": "https://sub.local"},
+                   "follow_me_person_entity": "person.zoe"},
+            )
+            # A People-tab settings save now carries no source fields at all;
+            # the stored sources and their values must survive untouched.
+            result = self.core._save_person_link_action(
+                {
+                    "person_link_person_id": "person_zoe",
+                    "person_link_follow_me_entity": "person.zoe",
+                },
+                self.redis,
+            )
+            self.assertTrue(result["ok"], result)
+            link = self.core._person_link("person_zoe", self.redis)
+            self.assertEqual(link["music_source"], "emby")
+            self.assertEqual(link["emby"]["server_url"], "http://emby.local:8096")
+            self.assertEqual(link["extra_source"], "subsonic")
+            self.assertEqual(link["extra"]["server_url"], "https://sub.local")
+            self.assertEqual(link["follow_me_person_entity"], "person.zoe")
+        finally:
+            self.restore_people()
+
+    # ---- the Sources tab lists only set-up sources ----
+
+    def test_sources_tab_lists_only_set_up_sources(self):
+        try:
+            self.stub_people(("person_zoe", "Zoe"))
+            provider_stub_original = self.core._provider
+            provider = types.SimpleNamespace(provider_id="emby", connected=True)
+
+            def stub_provider(client=None, provider_id=""):
+                if self.core._provider_id(provider_id, "") == "emby":
+                    return provider
+                return provider_stub_original(client, provider_id)
+
+            self.core._provider = stub_provider
+            self.redis.hset(
+                self.core.PERSON_LINKS_KEY,
+                mapping={
+                    "person_zoe": json.dumps(
+                        {
+                            "music_source": "emby",
+                            "emby": {"server_url": "http://emby.local:8096"},
+                            "extra_source": "subsonic",
+                            "extra": {},
+                        }
+                    )
+                },
+            )
+            data = self.core.get_htmlui_tab_data(redis_client=self.redis)
+            ids = [item.get("id") for item in data["ui"]["item_forms"] if item.get("group") == "providers"]
+            # Set-up sources only: the paired household Emby, plus Zoe's two
+            # sources. Jellyfin/Subsonic/Plex/Share household cards stay hidden.
+            self.assertEqual(
+                ids,
+                ["source:add", "provider:emby", "person_source:person_zoe:primary", "person_source:person_zoe:extra"],
+            )
+            # An added-but-unconfigured household source is listed too.
+            self.redis.hset(
+                self.core.SETTINGS_KEY,
+                mapping={"household_sources": json.dumps(["jellyfin"])},
+            )
+            data = self.core.get_htmlui_tab_data(redis_client=self.redis)
+            ids = [item.get("id") for item in data["ui"]["item_forms"] if item.get("group") == "providers"]
+            self.assertIn("provider:jellyfin", ids)
+            jellyfin = next(item for item in data["ui"]["item_forms"] if item.get("id") == "provider:jellyfin")
+            self.assertIn("SETUP NEEDED", [badge["label"] for badge in jellyfin["hero_badges"]])
+            self.assertNotIn("provider:subsonic", ids)
+            self.assertNotIn("provider:plex", ids)
+            self.assertNotIn("provider:network_share", ids)
+        finally:
+            self.core._provider = provider_stub_original
+            self.restore_people()
 
 
 class SubsonicProviderTests(unittest.TestCase):
