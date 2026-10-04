@@ -7291,6 +7291,87 @@ class ScreenTargetTests(unittest.TestCase):
 
     # ---- screen-only playback never drives hardware ----
 
+    # ---- sync-transcode refusal falls back to the original container ----
+
+    def script_probe(self, results):
+        """_stream_url_unreachable answers with the scripted list, in order."""
+        scripted = list(results)
+        calls = []
+        self._originals["_stream_url_unreachable"] = self.core._stream_url_unreachable
+
+        def fake_probe(url):
+            calls.append(str(url))
+            return scripted.pop(0) if scripted else True
+
+        self.core._stream_url_unreachable = fake_probe
+        self.addCleanup(
+            lambda: self._originals.pop("_stream_url_unreachable", None)
+        )
+        return calls
+
+    def capture_media_kwargs(self):
+        captured = {}
+
+        def play_media_url_targets(targets, url, **kwargs):
+            captured["targets"] = list(targets)
+            captured["url"] = url
+            captured["media_type"] = str(kwargs.get("media_type"))
+            captured["filename"] = str(kwargs.get("filename"))
+            return {"ok": True, "sent_count": len(targets), "warnings": []}
+
+        sys.modules["media_playback"].play_media_url_targets = play_media_url_targets
+        self.media_calls.append("captured")
+        return captured
+
+    def test_sync_refusal_falls_back_to_the_original_container(self):
+        # Emby's transcode side refuses (?sync=1 would 502 today): the SAT
+        # still gets playing music via the original MP3.
+        probes = self.script_probe([True, False])
+        captured = self.capture_media_kwargs()
+        track = {**_track_row(1, "Jamming"), "path": "/music/songs/Jamming.mp3"}
+        result = self.core._play_track(
+            track, ["voice_core:native:kitchen"], volume_percent=60
+        )
+        # First probe saw the sync URL, second saw the fallback.
+        self.assertEqual(probes[0].endswith("~wav"), True)
+        self.assertEqual(probes[1].endswith("~wav"), False)
+        self.assertEqual(captured["url"], "http://stream/track:1")
+        self.assertEqual(captured["media_type"], "audio/mpeg")
+        self.assertFalse(str(captured["filename"]).endswith(".sync.wav"))
+        self.assertFalse(result.get("audio_sync_transcode_used"))
+        self.assertEqual(self.stream_calls, [True, False])
+        self.assertTrue(
+            any("original" in str(row) for row in result.get("warnings") or []),
+            result.get("warnings"),
+        )
+
+    def test_healthy_sync_transcode_keeps_the_wav_source(self):
+        probes = self.script_probe([False])
+        captured = self.capture_media_kwargs()
+        result = self.core._play_track(
+            _track_row(1, "Jamming"), ["voice_core:native:kitchen"], volume_percent=60
+        )
+        self.assertEqual(len(probes), 1)
+        self.assertEqual(captured["media_type"], "audio/wav")
+        self.assertTrue(str(captured["filename"]).endswith(".sync.wav"))
+        self.assertTrue(result.get("audio_sync_transcode_used"))
+        self.assertEqual(self.stream_calls, [True])
+        self.assertEqual(result.get("warnings") or [], [])
+
+    def test_refused_everything_keeps_the_sync_url(self):
+        # Both sync and original refused: keep the sync URL (hardware will
+        # report the failure and the queue marks ERROR as before).
+        self.script_probe([True, True])
+        captured = self.capture_media_kwargs()
+        result = self.core._play_track(
+            _track_row(1, "Jamming"), ["voice_core:native:kitchen"], volume_percent=60
+        )
+        self.assertEqual(captured["media_type"], "audio/wav")
+        self.assertTrue(result.get("audio_sync_transcode_used"))
+        self.assertEqual(self.stream_calls, [True, False])
+
+    # ---- screen-only playback never drives hardware ----
+
     def test_screen_only_play_track_never_calls_media_playback(self):
         sys.modules["media_playback"].play_media_url_targets = lambda *_a, **_k: (
             (_ for _ in ()).throw(AssertionError("screen-only playback must not drive hardware"))
@@ -7325,8 +7406,9 @@ class ScreenTargetTests(unittest.TestCase):
         )
         self.assertEqual(self.media_calls, [["voice_core:native:kitchen"]])
         self.assertEqual(result.get("screen_targets"), ["screen:office"])
-        # Speakers in the group still get the WAV transcode.
-        self.assertEqual(self.stream_calls, [True])
+        # Speakers in the group get the WAV transcode; the unreachable fake
+        # URL also triggers the original-container fallback probe.
+        self.assertEqual(self.stream_calls, [True, False])
 
     # ---- stopping ----
 
