@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.9.8"
+__version__ = "3.9.9"
 MIN_TATER_VERSION = "1.2.0"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby, Jellyfin, Subsonic, or Plex account or "
@@ -10021,6 +10021,81 @@ def _preferred_room_target(room_names: Iterable[str], client: Any = None) -> str
         return ""
 
 
+def _media_target_options(options: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Drop voice_core targets Tater can no longer play media on.
+
+    The voice pipeline's media route 410s every selector that is not a native
+    satellite or stereo pair ("Legacy satellite playback has been removed"),
+    so legacy `voice_core:<name>` rows must never win a music destination —
+    announcements to them may still work elsewhere, but media never will.
+    """
+    return [
+        row
+        for row in options
+        if isinstance(row, dict)
+        and (
+            not _text(row.get("value")).casefold().startswith("voice_core:")
+            or _is_native_target(row.get("value"))
+        )
+    ]
+
+
+def _canonical_voice_selector(selector: Any, options: List[Dict[str, Any]] = ()) -> str:
+    """Playable target for a voice origin's satellite selector.
+
+    Voice turns can carry a bare device token ("bass") or a legacy
+    ``voice_core:<name>`` selector instead of a ``native:`` one, and Tater
+    refuses media playback for anything else. Match the satellite against the
+    live native/stereo target list first — value, alias, or label — and keep
+    the raw mapping only when nothing else fits.
+    """
+    token = _text(selector)
+    if not token:
+        return token
+    lowered = token.casefold()
+    if _is_native_target(token):
+        return token if lowered.startswith("voice_core:") else f"voice_core:{token}"
+    if lowered.startswith(("screen:", "integration:")):
+        # Screens and integration devices resolved elsewhere; their shape is
+        # final and not voice_core's business.
+        return token
+    bare = (
+        token[len("voice_core:") :].strip()
+        if lowered.startswith("voice_core:")
+        else token
+    )
+    if not bare:
+        return token
+    if _is_native_target(bare):
+        return f"voice_core:{bare}"
+    candidates = (
+        list(options)
+        if options
+        else _media_target_options(_target_options())
+    )
+    matched = _target_from_query(bare, candidates)
+    if matched and _is_native_target(matched):
+        if matched.casefold() != token.casefold():
+            logger.warning(
+                "[Music] legacy voice selector %s mapped to native target %s",
+                token,
+                matched,
+            )
+        return matched
+    return token if lowered.startswith("voice_core:") else f"voice_core:{token}"
+
+
+def _canonicalize_voice_targets(targets: Any, options: List[Dict[str, Any]] = ()) -> List[str]:
+    """Normalize resolved targets: legacy selectors map to their native twins,
+    then paired satellites collapse into their stereo-pair destination."""
+    values = _list(targets)
+    if not values:
+        return []
+    return _normalize_stereo_targets(
+        [_canonical_voice_selector(target, options) for target in values]
+    )
+
+
 def _is_screen_target(value: Any) -> bool:
     return _text(value).casefold().startswith(SCREEN_TARGET_PREFIX)
 
@@ -10133,6 +10208,7 @@ def _resolve_targets(
         options,
         _settings(store),
     )
+    options = _media_target_options(options)
     if explicit_room_names:
         resolved_rooms = [
             preferred_by_room.get(room_name) or _room_target_from_query(room_name, options)
@@ -10140,7 +10216,7 @@ def _resolve_targets(
         ]
         if any(not target for target in resolved_rooms):
             return []
-        return _normalize_stereo_targets(resolved_rooms)
+        return _canonicalize_voice_targets(resolved_rooms, options)
 
     if requested_values:
         # Jarvis Screen destinations resolve first: user-named screens ("on the
@@ -10168,7 +10244,7 @@ def _resolve_targets(
             explicit.append(target)
         if any(not target for target in explicit):
             return []
-        return _normalize_stereo_targets(explicit)
+        return _canonicalize_voice_targets(explicit, options)
 
     if room_names:
         resolved_rooms = [
@@ -10177,7 +10253,7 @@ def _resolve_targets(
         ]
         if any(not target for target in resolved_rooms):
             return []
-        return _normalize_stereo_targets(resolved_rooms)
+        return _canonicalize_voice_targets(resolved_rooms, options)
 
     selector = _origin_value(
         context,
@@ -10186,9 +10262,7 @@ def _resolve_targets(
         "device_selector",
     )
     if selector:
-        return _normalize_stereo_targets(
-            [selector if selector.startswith("voice_core:") else f"voice_core:{selector}"]
-        )
+        return _canonicalize_voice_targets([selector], options)
     # A Person's bound rooms ("the Kitchen plays my music") win over the
     # household default destinations when nothing more specific was said.
     bound_targets = [
@@ -10197,11 +10271,11 @@ def _resolve_targets(
     ]
     resolved_bound = [target for target in bound_targets if target]
     if resolved_bound:
-        return _normalize_stereo_targets(resolved_bound)
+        return _canonicalize_voice_targets(resolved_bound, options)
     cfg = _settings(store)
     defaults = _list(cfg.get("default_targets") or cfg.get("default_target"))
     resolved_defaults = [_target_from_query(value, options) for value in defaults]
-    return _normalize_stereo_targets([target for target in resolved_defaults if target])
+    return _canonicalize_voice_targets([target for target in resolved_defaults if target], options)
 
 
 def _resolve_target(
@@ -13175,13 +13249,18 @@ def get_client_music_state(
         target_options,
         cfg,
     )
+    # Legacy voice selectors cannot play media; keep them out of the player
+    # picker so they are never offered or saved as a music destination.
+    target_options = _media_target_options(target_options)
     saved_player_targets = _list(player.get("targets") or player.get("target"))
     saved_player_targets = [
         target
         for target in saved_player_targets
         if target.casefold() not in local_airplay_targets
     ]
-    player_targets = _canonical_option_targets(saved_player_targets, target_options)
+    # Saved rows heal here too: a legacy `voice_core:<name>` target saved
+    # before the native migration re-maps onto its native satellite.
+    player_targets = _canonicalize_voice_targets(saved_player_targets, target_options)
     if player_targets != saved_player_targets:
         player["targets"] = player_targets
         _save_player(player, store)
@@ -14809,6 +14888,9 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
         target_options,
         cfg,
     )
+    # Legacy voice selectors cannot play media; keep them out of the settings
+    # picker so they are never offered as a default music destination.
+    target_options = _media_target_options(target_options)
     saved_player_targets = [
         target
         for target in saved_player_targets
@@ -14819,8 +14901,8 @@ def get_htmlui_tab_data(*, redis_client=None, **_kwargs) -> Dict[str, Any]:
         for target in saved_default_targets
         if target.casefold() not in local_airplay_targets
     ]
-    saved_player_targets = _canonical_option_targets(saved_player_targets, target_options)
-    saved_default_targets = _canonical_option_targets(saved_default_targets, target_options)
+    saved_player_targets = _canonicalize_voice_targets(saved_player_targets, target_options)
+    saved_default_targets = _canonicalize_voice_targets(saved_default_targets, target_options)
     saved_targets = _list([*saved_player_targets, *saved_default_targets])
     player = dict(player)
     player["targets"] = saved_player_targets
