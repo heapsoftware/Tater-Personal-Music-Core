@@ -2754,6 +2754,119 @@ class MultiQueueTests(unittest.TestCase):
         self.assertEqual(len(self.played), 1)
         self.assertEqual(self.played[0]["targets"], ["voice_core:native:office"])
 
+    def seed_voice_reply_mode(self, person_id, mode):
+        link = self.core._person_link(person_id, self.redis)
+        if mode:
+            link["voice_reply_mode"] = mode
+        self.core._save_person_link(person_id, link, self.redis)
+
+    def test_default_reply_mode_is_detailed(self):
+        core = self.core
+        # Unlinked and unknown People get the historical detailed wording.
+        self.assertEqual(core._person_voice_reply_mode("", self.redis), "detailed")
+        self.assertEqual(core._person_voice_reply_mode("person_a", self.redis), "detailed")
+        self.seed_voice_reply_mode("person_a", "not_a_mode")
+        self.assertEqual(core._person_voice_reply_mode("person_a", self.redis), "detailed")
+
+    def test_play_request_reply_modes(self):
+        core = self.core
+        self.stub_playback()
+        self.stub_play_request(["voice_core:native:kitchen"])
+        result = core._play_request(
+            {"query": "reggae"},
+            self.origin_for("person_a"),
+            self.redis,
+        )
+        # Detailed stays the historical, unmodified wording.
+        self.assertEqual(
+            result["summary_for_user"],
+            "Playing Requested Song by Bob Marley on voice_core:native:kitchen. The queue has 1 track, "
+            "and continuous radio will keep it playing.",
+        )
+
+        self.seed_voice_reply_mode("person_a", "brief")
+        result = core._play_request(
+            {"query": "reggae"},
+            self.origin_for("person_a"),
+            self.redis,
+        )
+        self.assertEqual(result["summary_for_user"], "Ok.")
+        self.assertEqual(result["voice_reply_mode"], "brief")
+
+        self.seed_voice_reply_mode("person_a", "short")
+        self._originals["_target_options"] = core._target_options
+        core._target_options = lambda *args, **kwargs: [
+            {"value": "voice_core:native:kitchen", "label": "Kitchen speaker"}
+        ]
+        try:
+            result = core._play_request(
+                {"query": "reggae"},
+                self.origin_for("person_a"),
+                self.redis,
+            )
+        finally:
+            core._target_options = self._originals["_target_options"]
+        self.assertEqual(result["summary_for_user"], "Playing Requested Song by Bob Marley on Kitchen speaker.")
+
+    def test_short_reply_falls_back_to_the_selector_without_labels(self):
+        core = self.core
+        self.stub_playback()
+        self.stub_play_request(["voice_core:native:kitchen"])
+        self.seed_voice_reply_mode("person_a", "short")
+        # No target options resolvable: the selector stands in as the label.
+        self._originals["_target_options"] = core._target_options
+        core._target_options = lambda *args, **kwargs: []
+        try:
+            result = core._play_request(
+                {"query": "reggae"},
+                self.origin_for("person_a"),
+                self.redis,
+            )
+        finally:
+            core._target_options = self._originals["_target_options"]
+        self.assertEqual(
+            result["summary_for_user"],
+            "Playing Requested Song by Bob Marley on voice_core:native:kitchen.",
+        )
+
+    def test_link_save_round_trips_the_reply_mode(self):
+        core = self.core
+        people = types.SimpleNamespace(
+            load_store=lambda _client=None: {
+                "people": [{"id": "person_zoe", "display_name": "Zoe"}]
+            }
+        )
+        original_people = core._PEOPLE_API_MODULE
+        core._PEOPLE_API_MODULE = people
+        try:
+            values = {
+                "person_link_person_id": "person_zoe",
+                "person_link_source": "",
+                "person_link_voice_reply_mode": "brief",
+            }
+            self.assertTrue(core._save_person_link_action(values, self.redis)["ok"])
+            self.assertEqual(
+                core._person_voice_reply_mode("person_zoe", self.redis), "brief"
+            )
+            # An invalid value keeps the saved one instead of wiping it.
+            values["person_link_voice_reply_mode"] = "nonsense"
+            self.assertTrue(core._save_person_link_action(values, self.redis)["ok"])
+            self.assertEqual(
+                core._person_voice_reply_mode("person_zoe", self.redis), "brief"
+            )
+        finally:
+            core._PEOPLE_API_MODULE = original_people
+
+    def test_personalization_fields_carry_the_reply_mode(self):
+        core = self.core
+        self.seed_voice_reply_mode("person_a", "short")
+        link = core._person_link("person_a", self.redis)
+        fields = core._person_link_personalization_fields({}, link, self.redis, "person_a")
+        field = next(row for row in fields if row.get("key") == "person_link_voice_reply_mode")
+        self.assertEqual(field["type"], "select")
+        self.assertEqual(field["value"], "short")
+        self.assertEqual([row["value"] for row in field["options"]], ["brief", "detailed", "short"])
+
     def test_control_actions_follow_the_room_queue(self):
         core = self.core
         self.stub_playback()
