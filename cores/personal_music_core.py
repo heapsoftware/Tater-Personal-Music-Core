@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.9.9"
+__version__ = "3.10.0"
 MIN_TATER_VERSION = "1.2.0"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby, Jellyfin, Subsonic, or Plex account or "
@@ -6615,14 +6615,20 @@ def _tater_ble_available() -> bool:
 
 def _tater_ble_snapshot(
     *,
-    address: str,
+    address: str = "",
+    device_id: str = "",
     max_age_s: int,
     include_observations: bool = False,
 ) -> Dict[str, Any] | None:
-    """Tater's native BLE presence snapshot for one address (None when absent).
+    """Tater's native BLE presence snapshot (None when absent).
 
     The core runs inside Tater, so the snapshot comes from the host module
     directly — no HTTP, no auth. Indirection so tests can stub the module.
+
+    address filters on the raw satellite-reported MAC; device_id (v1.2.3+)
+    filters on the host's identity-resolved presence id, which groups every
+    address one device has been seen as (registered IRK / iBeacon identities).
+    An empty query returns every device seen within max_age_s.
     """
     try:
         from tater_voice import native_ble
@@ -6630,14 +6636,109 @@ def _tater_ble_snapshot(
         logger.debug("[Music] Tater native BLE presence unavailable: %s", exc)
         return None
     try:
-        return native_ble.snapshot(
-            address=address,
-            max_age_s=max_age_s,
-            include_observations=include_observations,
-        )
+        payload: Dict[str, Any] = {
+            "address": address,
+            "max_age_s": max_age_s,
+            "include_observations": include_observations,
+        }
+        if device_id:
+            # v1.2.3+ only: snapshot() rejects unknown kwargs on older hosts.
+            payload["device_id"] = device_id
+        return native_ble.snapshot(**payload)
     except Exception as exc:
         logger.debug("[Music] Tater native BLE snapshot failed: %s", exc)
         return None
+
+
+def _snapshot_devices(snapshot: Any) -> List[Dict[str, Any]]:
+    """Valid device rows from a BLE snapshot ([] when unavailable or absent)."""
+    if not isinstance(snapshot, dict) or not snapshot.get("ok"):
+        return []
+    return [row for row in snapshot.get("devices") or [] if isinstance(row, dict)]
+
+
+def _ble_device_addresses(device: Dict[str, Any]) -> set:
+    """Every address the device row is known under (address + addresses list)."""
+    addresses = set()
+    for raw in [device.get("address")] + list(device.get("addresses") or []):
+        token = _text(raw).lower()
+        if token:
+            addresses.add(token)
+    return addresses
+
+
+def _pin_worthy_tater_presence(device: Dict[str, Any], address: str) -> bool:
+    """Whether a BLE device's presence id outlives one raw address.
+
+    Devices not registered in Tater's Presence interface fall back to a
+    per-address identity (ble-<mac>) — pinning that adds nothing over the
+    address lookup itself. Registered / IRK / iBeacon identities survive
+    address rotation, which is what the pin is for.
+    """
+    presence_id = _text(device.get("presence_id"))
+    if not presence_id:
+        return False
+    if _text(device.get("identity_type")) != "address":
+        return True
+    return presence_id != f"ble-{address.replace(':', '')}"
+
+
+def _resolve_tater_ble_presence_id(
+    *,
+    address: str,
+    max_age_s: int,
+) -> str:
+    """Tater presence id whose device last advertised this address ("" when none).
+
+    Full-registry pass over the host's identity-resolved device rows: matches
+    the saved address against everything each device has been seen as, so a
+    rotated or IRK-resolved address still pins its device. Age-limited like
+    any lookup, so a device away for longer than max_age_s resolves to "".
+    """
+    try:
+        snapshot = _tater_ble_snapshot(
+            max_age_s=max_age_s,
+            include_observations=False,
+        )
+    except Exception as exc:
+        logger.debug("[Music] Tater BLE presence-id resolution failed: %s", exc)
+        return ""
+    for device in _snapshot_devices(snapshot):
+        if address in _ble_device_addresses(device) and _pin_worthy_tater_presence(
+            device, address
+        ):
+            return _text(device.get("presence_id"))
+    return ""
+
+
+def _remember_tater_ble_presence_id(
+    person_id: Any,
+    presence_id: Any,
+    client: Any = None,
+) -> bool:
+    """Pin a resolved presence id on the Person link (best effort, once).
+
+    Follow-Me runs inside the tick loop while the card may be saved in the
+    UI, so the stored link is re-read and only the pin is merged into it.
+    """
+    wanted_person = _text(person_id)
+    wanted_pin = _text(presence_id)
+    if not wanted_person or not wanted_pin:
+        return False
+    try:
+        current = _person_link(wanted_person, client)
+        if not isinstance(current, dict):
+            return False
+        if _text(current.get("follow_me_presence_id")) == wanted_pin:
+            return False
+        current["follow_me_presence_id"] = wanted_pin
+        _save_person_link(wanted_person, current, client)
+        return True
+    except Exception as exc:
+        logger.debug(
+            "[Music] Could not pin Tater BLE presence id for %s: %s", wanted_person, exc
+        )
+        return False
 
 
 def _ble_person_location(
@@ -6645,13 +6746,21 @@ def _ble_person_location(
     link: Dict[str, Any],
     *,
     probe_room_signal: bool = False,
+    person_id: Any = None,
 ) -> Dict[str, Any]:
     """Current Tater BLE location for a Person link: {"state": ...} or {"error": ...}.
 
-    Same shape as _ha_person_location: the zone is the strongest_room of the
-    Person's device (which satellite heard it last with the best fresh signal),
-    or "not_home" when nothing saw it within the away timeout. Zone "Unknown"
-    means the satellite has no room — the tick treats it as a dead zone.
+    Same shape as _ha_person_location: the zone is the device's room — Tater's
+    stabilized room assignment (v1.2.3+ location_room) when present, otherwise
+    the satellite that heard it last with the best fresh signal (strongest_room)
+    — or "not_home" when nothing saw it within the away timeout. Zone "Unknown"
+    means the satellite has no room or the device drifted past its room's max
+    radius — the tick treats it as a dead zone.
+
+    Lookup order (v1.2.3+ presence-identity pinning): a presence id pinned on
+    the link wins, since it survives BLE address rotation; otherwise the saved
+    address is queried directly, and when that matches nothing an
+    identity-resolved full pass tries to pin the device id for next time.
 
     With probe_room_signal (Follow-Me BLE Prompt-Stop), the snapshot also
     carries the per-satellite observations so the result can report how
@@ -6663,30 +6772,96 @@ def _ble_person_location(
     address = _normalize_ble_address((link or {}).get("follow_me_ble_address"))
     if not address:
         return {"error": "ble_address_invalid"}
-    snapshot = _tater_ble_snapshot(
-        address=address,
-        max_age_s=_follow_me_ble_max_age(client=client),
-        include_observations=probe_room_signal,
-    )
+    max_age_s = _follow_me_ble_max_age(client=client)
+    presence_id = _text(link.get("follow_me_presence_id"))
+    device: Dict[str, Any] = {}
+    snapshot: Dict[str, Any] | None = None
+    address_snapshot_ok = False
+    used_device_id = False
+
+    if presence_id:
+        snapshot = _tater_ble_snapshot(
+            device_id=presence_id,
+            max_age_s=max_age_s,
+            include_observations=probe_room_signal,
+        )
+        devices = _snapshot_devices(snapshot)
+        if devices:
+            device = devices[0]
+            used_device_id = True
+        else:
+            # Stale pin (device unregistered, link overwritten elsewhere):
+            # fall back to the address and let the resolution pass re-pin.
+            presence_id = ""
+            snapshot = None
+    if not device:
+        snapshot = _tater_ble_snapshot(
+            address=address,
+            max_age_s=max_age_s,
+            include_observations=probe_room_signal,
+        )
+        devices = _snapshot_devices(snapshot)
+        address_snapshot_ok = bool(isinstance(snapshot, dict) and snapshot.get("ok"))
+        if devices:
+            device = devices[0]
+            # Self-heal the pin from an address hit too: when the device is
+            # registered host-side its presence id is stable across rotations,
+            # so catching it here (before the address ever goes stale) covers
+            # the same failure mode for free.
+            if person_id and _pin_worthy_tater_presence(device, address):
+                _remember_tater_ble_presence_id(
+                    person_id, device.get("presence_id"), client
+                )
+    if not device and address_snapshot_ok:
+        # Nothing is advertising the saved address: the Person is away, or the
+        # address has rotated into an identity the host resolved elsewhere.
+        # Only the full pass can tell those apart — away devices are also
+        # absent from it (the same max-age limit applies), so a miss here
+        # still reads as not_home.
+        resolved = _resolve_tater_ble_presence_id(address=address, max_age_s=max_age_s)
+        if resolved and resolved != presence_id:
+            snapshot = _tater_ble_snapshot(
+                device_id=resolved,
+                max_age_s=max_age_s,
+                include_observations=probe_room_signal,
+            )
+            devices = _snapshot_devices(snapshot)
+            if devices:
+                presence_id = resolved
+                device = devices[0]
+                used_device_id = True
+                _remember_tater_ble_presence_id(person_id, resolved, client)
     if not isinstance(snapshot, dict) or not snapshot.get("ok"):
         return {"error": "tater_ble_unavailable"}
-    devices = snapshot.get("devices") or []
-    if not devices:
+    if not device:
         return {"state": "not_home", "source": "tater_ble"}
-    device = devices[0] if isinstance(devices[0], dict) else {}
+    # Prefer Tater's stabilized room assignment; when the device drifted past
+    # its assigned room's max radius the host reports that honestly as
+    # "Unknown" rather than the stale assignment — fall back to whichever raw
+    # room the device actually reads strongest in (host pre-1.2.3 snapshots
+    # only carry strongest_room at all).
+    room = _text(device.get("location_room"))
+    if not room or room.casefold() == "unknown":
+        room = _text(device.get("strongest_room")) or "Unknown"
     location = {
-        "state": _text(device.get("strongest_room")) or "Unknown",
+        "state": room,
         "source": "tater_ble",
         "ble_rssi": _as_int(device.get("strongest_rssi"), -127, -127, 20),
         "ble_signal": _text(device.get("signal")),
         "last_seen_age_s": _as_float(device.get("last_seen_age_s")),
     }
     if probe_room_signal:
-        room = _text(location.get("state"))
         generated_ts = _as_float(snapshot.get("generated_ts"))
+        # A device_id snapshot's observations cover every device — scope the
+        # earshot scan to the addresses this device resolves under.
+        known_addresses = _ble_device_addresses(device) if used_device_id else set()
         freshest: Dict[str, Any] = {}
         for row in snapshot.get("observations") or []:
             if not isinstance(row, dict) or _text(row.get("room")) != room:
+                continue
+            if known_addresses and (
+                _text(row.get("address")).lower() not in known_addresses
+            ):
                 continue
             received_ts = _as_float(row.get("received_ts"))
             if received_ts <= 0:
@@ -7157,7 +7332,7 @@ def _follow_me_tick(client: Any = None) -> Dict[str, Any]:
                 if not _normalize_ble_address(link.get("follow_me_ble_address")):
                     continue
                 location = _ble_person_location(
-                    store, link, probe_room_signal=prompt_stop_enabled
+                    store, link, probe_room_signal=prompt_stop_enabled, person_id=person_id
                 )
             else:
                 entity = _text(link.get("follow_me_person_entity"))
@@ -15400,10 +15575,17 @@ def _save_person_link_action(values: Dict[str, Any], store: Any) -> Dict[str, An
     if "person_link_follow_me_entity" in values:
         link["follow_me_person_entity"] = _text(values.get("person_link_follow_me_entity")).strip()
     if "person_link_follow_me_ble_address" in values:
+        new_address = _text(values.get("person_link_follow_me_ble_address")).strip().lower()
         # Tater reports addresses lowercased; store them the same way.
-        link["follow_me_ble_address"] = _text(
-            values.get("person_link_follow_me_ble_address")
-        ).strip().lower()
+        link["follow_me_ble_address"] = new_address
+        # The resolved presence-identity pin was resolved from the saved
+        # address; changing the address drops the pin so the next Follow-Me
+        # tick re-resolves it. Same address carries the pin through the save.
+        if _text(existing.get("follow_me_ble_address")) == new_address:
+            if _text(existing.get("follow_me_presence_id")):
+                link["follow_me_presence_id"] = _text(existing.get("follow_me_presence_id"))
+        else:
+            link.pop("follow_me_presence_id", None)
     if "person_link_follow_me_room_overrides" in values:
         link["follow_me_room_overrides"] = _text(
             values.get("person_link_follow_me_room_overrides")
