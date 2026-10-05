@@ -3074,6 +3074,143 @@ class MultiQueueTests(unittest.TestCase):
         self.assertFalse(missing.get("ok"))
         self.assertIn("percentage", missing["error"]["message"])
 
+    def test_volume_action_accepts_relative_voice_requests(self):
+        core = self.core
+        self.stub_playback()
+        self.stub_group_volume()
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"])  # volume 60
+
+        # "Turn it up a bit": direction up, default step is 10.
+        louder = asyncio.run(
+            core.run_hydra_kernel_tool(
+                tool_id="personal_music_control",
+                args={"action": "volume", "direction": "up"},
+                origin=self.origin_for("person_a"),
+                redis_client=self.redis,
+            )
+        )
+        self.assertTrue(louder.get("ok"), louder)
+        self.assertEqual(self.volume_calls, [70])
+        self.assertEqual(core._player(self.redis, "person_a")["volume_percent"], 70)
+
+        # "A bit quieter": down step measured against the group's level.
+        quieter = asyncio.run(
+            core.run_hydra_kernel_tool(
+                tool_id="personal_music_control",
+                args={"action": "volume", "direction": "down"},
+                origin=self.origin_for("person_a"),
+                redis_client=self.redis,
+            )
+        )
+        self.assertTrue(quieter.get("ok"), quieter)
+        self.assertEqual(self.volume_calls, [70, 60])
+
+        # A signed delta is accepted directly: 60 - 15 = 45.
+        delta = asyncio.run(
+            core.run_hydra_kernel_tool(
+                tool_id="personal_music_control",
+                args={"action": "volume", "delta_percent": -15},
+                origin=self.origin_for("person_a"),
+                redis_client=self.redis,
+            )
+        )
+        self.assertTrue(delta.get("ok"), delta)
+        self.assertEqual(self.volume_calls, [70, 60, 45])
+        self.assertEqual(core._player(self.redis, "person_a")["volume_percent"], 45)
+
+        # "A bit" can be sized: step_percent 5 on top of 45.
+        sized = asyncio.run(
+            core.run_hydra_kernel_tool(
+                tool_id="personal_music_control",
+                args={"action": "volume", "direction": "up", "step_percent": 5},
+                origin=self.origin_for("person_a"),
+                redis_client=self.redis,
+            )
+        )
+        self.assertTrue(sized.get("ok"), sized)
+        self.assertEqual(self.volume_calls, [70, 60, 45, 50])
+
+    def test_voice_volume_step_is_an_admin_setting(self):
+        core = self.core
+        self.stub_playback()
+        self.stub_group_volume()
+        core._save_hash(self.redis, core.SETTINGS_KEY, {"voice_volume_step_percent": 25})
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"])  # volume 60
+
+        # "Decrease the volume" steps by the admin's configured size, not the
+        # built-in default.
+        result = asyncio.run(
+            core.run_hydra_kernel_tool(
+                tool_id="personal_music_control",
+                args={"action": "volume", "direction": "down"},
+                origin=self.origin_for("person_a"),
+                redis_client=self.redis,
+            )
+        )
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(self.volume_calls, [35])
+        self.assertEqual(core._player(self.redis, "person_a")["volume_percent"], 35)
+
+        # And a per-request step still overrides the admin default.
+        sized = asyncio.run(
+            core.run_hydra_kernel_tool(
+                tool_id="personal_music_control",
+                args={"action": "volume", "direction": "up", "step_percent": 5},
+                origin=self.origin_for("person_a"),
+                redis_client=self.redis,
+            )
+        )
+        self.assertTrue(sized.get("ok"), sized)
+        self.assertEqual(self.volume_calls, [35, 40])
+
+    def test_relative_volume_clamps_at_the_ends_and_reports_them(self):
+        core = self.core
+        self.stub_playback()
+        self.stub_group_volume()
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"])  # volume 60
+        player = core._player(self.redis, "person_a")
+        player["volume_percent"] = 95
+        core._save_player(player, self.redis, "person_a")
+
+        # 95 + "up a bit" (10) clamps to 100 and reports the new level.
+        top = asyncio.run(
+            core.run_hydra_kernel_tool(
+                tool_id="personal_music_control",
+                args={"action": "volume", "direction": "up"},
+                origin=self.origin_for("person_a"),
+                redis_client=self.redis,
+            )
+        )
+        self.assertTrue(top.get("ok"), top)
+        self.assertEqual(self.volume_calls, [100])
+        self.assertEqual(core._player(self.redis, "person_a")["volume_percent"], 100)
+
+        # "Louder" again: already at 100% — said honestly, no extra hardware
+        # volume call re-sent.
+        again = asyncio.run(
+            core.run_hydra_kernel_tool(
+                tool_id="personal_music_control",
+                args={"action": "volume", "direction": "up"},
+                origin=self.origin_for("person_a"),
+                redis_client=self.redis,
+            )
+        )
+        self.assertTrue(again.get("ok"), again)
+        self.assertEqual(self.volume_calls, [100])
+        self.assertIn("already at 100%", again["summary_for_user"])
+
+        # And back down works from the edge.
+        down = asyncio.run(
+            core.run_hydra_kernel_tool(
+                tool_id="personal_music_control",
+                args={"action": "volume", "direction": "down", "step_percent": 25},
+                origin=self.origin_for("person_a"),
+                redis_client=self.redis,
+            )
+        )
+        self.assertTrue(down.get("ok"), down)
+        self.assertEqual(self.volume_calls, [100, 75])
+
     def test_mute_all_and_unmute_all_round_trip(self):
         core = self.core
         self.stub_playback()
