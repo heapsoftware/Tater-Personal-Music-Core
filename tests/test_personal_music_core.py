@@ -2419,7 +2419,7 @@ class MultiQueueTests(unittest.TestCase):
         self.core._play_track = fake_play_track
         self._originals["_stop_target"] = self.core._stop_target
 
-        def fake_stop_target(targets, *, expected_voice_core_sessions=None):
+        def fake_stop_target(targets, *, expected_voice_core_sessions=None, authoritative=False):
             self.stopped.append(list(targets))
             return []
 
@@ -3253,7 +3253,7 @@ class FollowMeTests(unittest.TestCase):
         self.core._play_track = fake_play_track
         self._originals["_stop_target"] = self.core._stop_target
 
-        def fake_stop_target(targets, *, expected_voice_core_sessions=None):
+        def fake_stop_target(targets, *, expected_voice_core_sessions=None, authoritative=False):
             self.stopped.append(list(targets))
             return []
 
@@ -5006,7 +5006,7 @@ class ResumeDelayTests(unittest.TestCase):
         self.core._play_track = fake_play_track
         self._originals["_stop_target"] = self.core._stop_target
 
-        def fake_stop_target(targets, *, expected_voice_core_sessions=None):
+        def fake_stop_target(targets, *, expected_voice_core_sessions=None, authoritative=False):
             self.stopped.append(list(targets))
             return []
 
@@ -5383,7 +5383,7 @@ class ResumeRoomTests(unittest.TestCase):
         self.core._play_track = fake_play_track
         self._originals["_stop_target"] = self.core._stop_target
 
-        def fake_stop_target(targets, *, expected_voice_core_sessions=None):
+        def fake_stop_target(targets, *, expected_voice_core_sessions=None, authoritative=False):
             self.stopped.append(list(targets))
             return []
 
@@ -5829,7 +5829,7 @@ class EndlessPlaybackTests(unittest.TestCase):
         self.core._play_track = fake_play_track
         self._originals["_stop_target"] = self.core._stop_target
 
-        def fake_stop_target(targets, *, expected_voice_core_sessions=None):
+        def fake_stop_target(targets, *, expected_voice_core_sessions=None, authoritative=False):
             self.stopped.append(list(targets))
             return []
 
@@ -8760,6 +8760,181 @@ class ScreenTargetTests(unittest.TestCase):
             self.core.get_media_urls(None, self.redis),
             {"stream": "", "art": ""},
         )
+
+
+class AuthoritativeVoiceStopTests(unittest.TestCase):
+    """A spoken stop must end the music actually sounding near the speaker.
+
+    Regression (v3.14.1): Tater's voice origin carries the satellite only as
+    device_id, so "the queue playing near you" never matched and transport
+    actions fell back to the resolved Person's own queue — Steven's idle queue
+    with a stale recorded session id, whose matched-session stop is a silent
+    no-op, while the music kept playing.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.core = load_personal_music_core()
+
+    def setUp(self):
+        self.redis = FakeRedis()
+        self.core.redis_client = self.redis
+        self.core._shutdown_stream_server()
+
+    def tearDown(self):
+        self.core._shutdown_stream_server()
+
+    def seed_person(self, person_id, targets, *, status="playing", sessions=None):
+        tracks = [_track_row(1, "Jamming"), _track_row(2, "Exodus")]
+        player = {
+            "person_id": person_id,
+            "status": status,
+            "provider": "emby",
+            "queue": tracks,
+            "queue_original": list(tracks),
+            "index": 0,
+            "current": dict(tracks[0]),
+            "targets": list(targets),
+            "target": list(targets)[0] if targets else "",
+            "volume_percent": 60,
+        }
+        if sessions is not None:
+            player["playback_result"] = {"ok": True, "voice_core_sessions": sessions}
+        self.core._register_queue(person_id, self.redis)
+        self.core._save_player(player, self.redis, person_id)
+        return player
+
+    def test_voice_stop_with_device_id_only_origin_hits_the_room_queue(self):
+        core = self.core
+        self.seed_person("person_cecilia", ["voice_core:native:G090LF1072841H4G"])
+        self.seed_person(
+            "person_steven",
+            ["voice_core:native:G090LF1072841H4G"],
+            status="idle",
+            sessions=[
+                {
+                    "session_id": "stale-session",
+                    "selectors": ["native:G090LF1072841H4G"],
+                    "target": "native:G090LF1072841H4G",
+                }
+            ],
+        )
+        calls = []
+        original_stop_target = core._stop_target
+
+        def fake_stop_target(targets, *, expected_voice_core_sessions=None, authoritative=False):
+            calls.append((list(targets), authoritative))
+            return []
+
+        core._stop_target = fake_stop_target
+        try:
+            result = asyncio.run(
+                core.run_hydra_kernel_tool(
+                    tool_id="personal_music_control",
+                    args={"action": "stop"},
+                    origin={
+                        "people_resolution": {"master_user_id": "person_steven"},
+                        "device_id": "native:G090LF1072841H4G",
+                    },
+                    redis_client=self.redis,
+                )
+            )
+        finally:
+            core._stop_target = original_stop_target
+        self.assertTrue(result.get("ok"), result)
+        # The room's playing queue stopped; the resolved Person's idle queue
+        # was never touched.
+        self.assertEqual(core._player(self.redis, "person_cecilia")["status"], "stopped")
+        self.assertEqual(core._player(self.redis, "person_steven")["status"], "idle")
+        self.assertEqual(calls, [(["voice_core:native:G090LF1072841H4G"], True)])
+
+    def test_authoritative_stop_clears_stale_recorded_session_on_speakers(self):
+        core = self.core
+        self.seed_person(
+            "person_cecilia",
+            ["voice_core:native:G090LF1072841H4G"],
+            sessions=[
+                {
+                    "session_id": "stale-session",
+                    "selectors": ["native:G090LF1072841H4G"],
+                    "target": "native:G090LF1072841H4G",
+                }
+            ],
+        )
+        commands = []
+        matched_calls = []
+
+        native_satellite = types.ModuleType("tater_voice.native_satellite")
+        native_satellite.send_command = lambda sel, cmd, payload=None, **_kw: (
+            commands.append((sel, cmd, payload)),
+            {"ok": True},
+        )[1]
+        native_satellite.run_on_runtime_loop = lambda value, timeout=None: value
+        stereo_pairs = types.ModuleType("tater_voice.stereo_pairs")
+        stereo_pairs.is_stereo_selector = lambda value: False
+        stereo_pairs.get_pair = lambda value: {}
+        tater_voice = types.ModuleType("tater_voice")
+        tater_voice.native_satellite = native_satellite
+        tater_voice.stereo_pairs = stereo_pairs
+        media_playback = types.ModuleType("media_playback")
+
+        def fake_stop_media_sync(selectors, *, expected_sessions=None, **_kwargs):
+            matched_calls.append(list(expected_sessions or []))
+            return []
+
+        media_playback._voice_core_stop_media_sync = fake_stop_media_sync
+        announcement_targets = types.ModuleType("announcement_targets")
+
+        def split_announcement_targets(values, **_kwargs):
+            # The host strips the voice_core: prefix and returns member
+            # selectors (matches the recorded session "selectors" shape).
+            return {
+                "voice_core_selectors": [
+                    value.split("voice_core:", 1)[-1] for value in values
+                ],
+                "airplay_players": [],
+                "sonos_speakers": [],
+                "integration_devices": [],
+                "homeassistant_media_players": [],
+            }
+
+        announcement_targets.split_announcement_targets = split_announcement_targets
+        for name, module in (
+            ("tater_voice", tater_voice),
+            ("tater_voice.native_satellite", native_satellite),
+            ("tater_voice.stereo_pairs", stereo_pairs),
+            ("media_playback", media_playback),
+            ("announcement_targets", announcement_targets),
+        ):
+            original = sys.modules.get(name)
+            sys.modules[name] = module
+            self.addCleanup(
+                lambda n=name, o=original: (sys.modules.pop(n, None) if o is None else sys.modules.__setitem__(n, o))
+            )
+
+        # Authoritative: the stale recorded session is ignored and the live
+        # media session on the speaker is stopped outright.
+        core._stop_player(person_id="person_cecilia", client=self.redis, authoritative=True)
+        self.assertEqual(
+            commands,
+            [("native:G090LF1072841H4G", "media.session.stop", {"reason": "music_core_stop"})],
+        )
+        self.assertEqual(matched_calls, [])
+
+        # Programmatic stop keeps the matched-session behaviour untouched.
+        commands.clear()
+        core._stop_player(person_id="person_cecilia", client=self.redis)
+        self.assertEqual(commands, [])
+        self.assertEqual(len(matched_calls), 1)
+
+    def test_occupied_targets_are_pair_normalized_consistently(self):
+        core = self.core
+        # No stereo pairs in this test env, so normalization is identity — the
+        # occupied map must still key on every raw queue target.
+        self.seed_person("person_cecilia", ["voice_core:native:kitchen", "voice_core:native:hall"])
+        occupied = core._occupied_targets(self.redis)
+        self.assertEqual(occupied["voice_core:native:kitchen"], "person_cecilia")
+        self.assertEqual(occupied["voice_core:native:hall"], "person_cecilia")
 
 
 if __name__ == "__main__":

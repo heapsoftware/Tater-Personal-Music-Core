@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.14.0"
+__version__ = "3.14.1"
 MIN_TATER_VERSION = "1.2.0"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby, Jellyfin, Subsonic, or Plex account or "
@@ -6251,7 +6251,9 @@ def _occupied_targets(client: Any = None) -> Dict[str, str]:
         player = _player(store, queue_id)
         if _text(player.get("status")).lower() not in {"playing", "paused"}:
             continue
-        for target in _list(player.get("targets") or player.get("target")):
+        for target in _normalize_stereo_targets(
+            _list(player.get("targets") or player.get("target"))
+        ):
             occupied[target] = queue_id
     return occupied
 
@@ -10715,10 +10717,53 @@ def _playback_voice_core_sessions(player: Dict[str, Any]) -> List[Dict[str, Any]
     ]
 
 
+def _blind_stop_voice_core_selectors(
+    selectors: Any,
+    *,
+    reason: str = "music_core_stop",
+) -> List[str]:
+    """Stop the live media session on each voice_core selector, id unmatched.
+
+    An explicit stop has to end whatever is actually sounding on the target
+    speakers. Recorded session ids go stale — a relay restart or the
+    next-track advance mints a new one — and the matched-session stop then
+    quietly skips, leaving music playing while the tool reports success.
+    """
+    warnings: List[str] = []
+    try:
+        from tater_voice import native_satellite, stereo_pairs
+
+        for selector in _list(selectors):
+            pair = stereo_pairs.get_pair(selector) if stereo_pairs.is_stereo_selector(selector) else {}
+            members = (
+                [_text(pair.get("left_selector")), _text(pair.get("right_selector"))]
+                if isinstance(pair, dict) and pair
+                else [selector]
+            )
+            for member in members:
+                if not member:
+                    continue
+                try:
+                    native_satellite.run_on_runtime_loop(
+                        native_satellite.send_command(
+                            member,
+                            "media.session.stop",
+                            {"reason": reason},
+                        ),
+                        timeout=8.0,
+                    )
+                except Exception as exc:
+                    warnings.append(f"{member}: {exc}")
+    except Exception as exc:
+        warnings.append(_text(exc))
+    return warnings
+
+
 def _stop_target(
     targets: Any,
     *,
     expected_voice_core_sessions: Any = None,
+    authoritative: bool = False,
 ) -> List[str]:
     warnings: List[str] = []
     # Screen destinations are browser-side only: there is no session to stop
@@ -10739,11 +10784,15 @@ def _stop_target(
     selectors = list(grouped.get("voice_core_selectors") or [])
     if selectors:
         try:
-            sessions = [
-                dict(row)
-                for row in list(expected_voice_core_sessions or [])
-                if isinstance(row, dict) and _text(row.get("session_id"))
-            ]
+            sessions = (
+                [
+                    dict(row)
+                    for row in list(expected_voice_core_sessions or [])
+                    if isinstance(row, dict) and _text(row.get("session_id"))
+                ]
+                if not authoritative
+                else []
+            )
             if sessions:
                 from media_playback import _voice_core_stop_media_sync
 
@@ -10755,30 +10804,7 @@ def _stop_target(
                     )
                 )
             else:
-                from tater_voice import native_satellite, stereo_pairs
-
-                for selector in selectors:
-                    members = [selector]
-                    pair = stereo_pairs.get_pair(selector) if stereo_pairs.is_stereo_selector(selector) else {}
-                    if isinstance(pair, dict) and pair:
-                        members = [
-                            _text(pair.get("left_selector")),
-                            _text(pair.get("right_selector")),
-                        ]
-                    for member in members:
-                        if not member:
-                            continue
-                        try:
-                            native_satellite.run_on_runtime_loop(
-                                native_satellite.send_command(
-                                    member,
-                                    "media.session.stop",
-                                    {"reason": "music_core_stop"},
-                                ),
-                                timeout=8.0,
-                            )
-                        except Exception as exc:
-                            warnings.append(f"{member}: {exc}")
+                warnings.extend(_blind_stop_voice_core_selectors(selectors))
         except Exception as exc:
             warnings.append(_text(exc))
 
@@ -11613,7 +11639,12 @@ def _resume_player(*, person_id: Any = "", client: Any = None) -> Dict[str, Any]
     )
 
 
-def _stop_player(*, person_id: Any = "", client: Any = None) -> Dict[str, Any]:
+def _stop_player(
+    *,
+    person_id: Any = "",
+    client: Any = None,
+    authoritative: bool = False,
+) -> Dict[str, Any]:
     store = client or globals().get("redis_client")
     queue_id = _queue_id_for_person(person_id)
     with _state_lock:
@@ -11623,6 +11654,7 @@ def _stop_player(*, person_id: Any = "", client: Any = None) -> Dict[str, Any]:
             _stop_target(
                 targets,
                 expected_voice_core_sessions=_playback_voice_core_sessions(player),
+                authoritative=authoritative,
             )
             if targets
             else []
@@ -11639,10 +11671,23 @@ def _stop_player(*, person_id: Any = "", client: Any = None) -> Dict[str, Any]:
         if warnings:
             player["warnings"] = warnings
         _save_player(player, store, queue_id)
+        if authoritative:
+            logger.info(
+                "[Music] Stop %s targets=%s recorded_sessions=%s reports=%s",
+                _text(queue_id) or "household",
+                targets,
+                [_text(row.get("session_id")) for row in _playback_voice_core_sessions(player)],
+                warnings or "none",
+            )
         return player
 
 
-def _clear_player(*, person_id: Any = "", client: Any = None) -> Dict[str, Any]:
+def _clear_player(
+    *,
+    person_id: Any = "",
+    client: Any = None,
+    authoritative: bool = False,
+) -> Dict[str, Any]:
     """Stop playback and drop the queue's playlist back to fresh/never-played.
 
     Keeps the Person's chosen destinations and volume; empties the queue, the
@@ -11658,6 +11703,7 @@ def _clear_player(*, person_id: Any = "", client: Any = None) -> Dict[str, Any]:
             _stop_target(
                 targets,
                 expected_voice_core_sessions=_playback_voice_core_sessions(player),
+                authoritative=authoritative,
             )
             if targets
             else []
@@ -12278,6 +12324,7 @@ def _origin_room_targets(origin: Optional[Dict[str, Any]], client: Any = None) -
         "satellite_selector",
         "voice_core_selector",
         "device_selector",
+        "device_id",
     )
     if selector:
         candidates.add(selector if selector.startswith("voice_core:") else f"voice_core:{selector}")
@@ -12650,11 +12697,22 @@ async def run_hydra_kernel_tool(
             elif action == "previous":
                 player = await asyncio.to_thread(_advance_player, -1, person_id=control_queue_id, client=store)
             elif action == "stop":
-                player = await asyncio.to_thread(_stop_player, person_id=control_queue_id, client=store)
+                logger.info(
+                    "[Music] Voice stop: near queue %r, person fallback %r",
+                    _queue_playing_near(origin, store),
+                    _context_person_id(origin),
+                )
+                # Authoritative: end whatever is sounding on the queue's
+                # speakers even if the recorded session ids went stale.
+                player = await asyncio.to_thread(
+                    _stop_player, person_id=control_queue_id, client=store, authoritative=True
+                )
             elif action == "clear":
                 # Voice twin of the playlist tab's clear button: drop the queue
                 # fresh rather than just pausing it.
-                player = await asyncio.to_thread(_clear_player, person_id=control_queue_id, client=store)
+                player = await asyncio.to_thread(
+                    _clear_player, person_id=control_queue_id, client=store, authoritative=True
+                )
             elif action == "replay":
                 current = _player(store, control_queue_id)
                 player = await asyncio.to_thread(
@@ -14080,7 +14138,7 @@ def run_client_music_action(
         elif command == "previous":
             updated = _advance_player(-1, client=store)
         elif command == "stop":
-            updated = _stop_player(client=store)
+            updated = _stop_player(client=store, authoritative=True)
         elif command == "replay":
             updated = _start_player_index(
                 _as_int(player.get("index"), 0, 0, 100000),
@@ -16933,11 +16991,11 @@ def handle_htmlui_tab_action(
         }
 
     if action_name == "music_ui_stop":
-        _stop_player(person_id=viewer_person_id, client=store)
+        _stop_player(person_id=viewer_person_id, client=store, authoritative=True)
         return {"ok": True, "message": "Music stopped."}
 
     if action_name == "music_ui_clear_queue":
-        _clear_player(person_id=viewer_person_id, client=store)
+        _clear_player(person_id=viewer_person_id, client=store, authoritative=True)
         return {"ok": True, "message": "Playlist cleared — nothing is playing."}
 
     if action_name == "music_ui_pause":
