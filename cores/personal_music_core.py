@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.15.0"
+__version__ = "3.16.0"
 MIN_TATER_VERSION = "1.2.0"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby, Jellyfin, Subsonic, or Plex account or "
@@ -106,6 +106,10 @@ SMART_SHUFFLE_RECENT_EVENTS = 40
 # of the selection in a pool it draws from as the queue drains (mixing sources
 # on the fly instead of building one enormous queue up front).
 SMART_SHUFFLE_QUEUE_WINDOW = 30
+
+# Default step for relative voice volume requests: "turn it up a bit"
+# ("Voice Volume Step (%)" admin setting).
+VOICE_VOLUME_STEP_PERCENT = 10
 
 CORE_SETTINGS = {
     "category": "Personal Music Core Settings",
@@ -216,6 +220,16 @@ CORE_SETTINGS = {
                 "What to do when requested rooms are already playing someone else's music, or a "
                 "Person asks for music while their own music plays elsewhere. Each Person can "
                 "override this on their link card in the People section."
+            ),
+        },
+        "voice_volume_step_percent": {
+            "label": "Voice Volume Step (%)",
+            "type": "number",
+            "default": VOICE_VOLUME_STEP_PERCENT,
+            "description": (
+                "How far a relative spoken volume request moves the group: \"turn it up a bit\", "
+                "\"increase the volume\", or \"a bit quieter\" steps the group's level by this many "
+                "percentage points. A per-request step (or a signed delta) still overrides it."
             ),
         },
         "voice_stop_scope": {
@@ -12275,7 +12289,12 @@ def get_hydra_kernel_tools(*, platform: str = "", **_kwargs) -> List[Dict[str, A
                 "or genre on top of what is playing — with Smart Shuffle on, several sources mix "
                 "together on the fly. Use the volume action when the user asks to set the volume "
                 "across the whole speaker group (\"set all speakers to 70 percent\") — it sets every "
-                "destination in the group to the same absolute level. Use mute_all / unmute_all when "
+                "destination in the group to the same absolute level. For relative requests like "
+                "\"turn it up a bit\", \"louder\", \"quieter\", or \"increase the volume a bit\", pass "
+                "direction up|down — the step comes from the admin's Voice Volume Step setting "
+                "(default 10 percent, pass step_percent to size \"a bit\" per request) — "
+                "or a signed delta_percent like 10 or -10, against the group's current level. "
+                "Use mute_all / unmute_all when "
                 "the user asks to mute or unmute every speaker at once. Use the sleep_timer action "
                 "(minutes, 0 cancels) when the user asks for music to stop after a while, e.g. "
                 "\"play my music for an hour\"; the timer force-stops playback and overrides endless "
@@ -12286,7 +12305,8 @@ def get_hydra_kernel_tools(*, platform: str = "", **_kwargs) -> List[Dict[str, A
                 '{"action":"next|previous|stop|replay|pause|resume|shuffle|repeat|add|clear|sleep_timer|move|set_targets|'
                 'bind_room|unbind_room|volume|mute_all|unmute_all",'
                 '"targets":["Kitchen","Living Room"],"enabled":true,"mode":"off|all|one",'
-                '"minutes":60,"volume_percent":70,"album":"","playlist":"","artist":"","genre":"","query":"",'
+                '"minutes":60,"volume_percent":70,"direction":"up|down","delta_percent":10,"step_percent":10,'
+                '"album":"","playlist":"","artist":"","genre":"","query":"",'
                 '"person":"person_id"}}'
             ),
         },
@@ -12370,6 +12390,11 @@ def _voice_stop_scope(cfg: Dict[str, Any]) -> str:
     """Which queue spoken transport commands act on, from the global setting."""
     scope = _text(cfg.get("voice_stop_scope")).casefold()
     return "person" if scope == "person" else "room"
+
+
+def _voice_volume_step(cfg: Dict[str, Any]) -> int:
+    """How far a relative spoken volume request steps the group's level."""
+    return _as_int(cfg.get("voice_volume_step_percent"), VOICE_VOLUME_STEP_PERCENT, 1, 100)
 
 
 def _control_queue_id(origin: Optional[Dict[str, Any]], client: Any = None) -> str:
@@ -12905,16 +12930,46 @@ async def run_hydra_kernel_tool(
                 requested = values.get("volume_percent")
                 if requested in (None, ""):
                     requested = values.get("volume")
-                if requested in (None, ""):
+                delta_requested = values.get("delta_percent")
+                if delta_requested in (None, ""):
+                    delta_requested = values.get("delta")
+                direction = _text(values.get("direction")).casefold()
+                if requested in (None, "") and delta_requested in (None, "") and not direction:
                     raise ValueError(
-                        'Say a percentage, e.g. "set all speakers to 70 percent".'
+                        'Say a percentage or a direction, e.g. "set all speakers to 70 percent" '
+                        'or "turn it up a bit".'
                     )
-                volume = _as_int(requested, 75, 0, 100)
-                live_result = await asyncio.to_thread(
-                    _set_player_volume, player, volume, store=store
-                )
-                _apply_mute_warnings(player, live_result)
-                _save_player(player, store, control_queue_id)
+                current_volume = _as_int(player.get("volume_percent"), 75, 0, 100)
+                if requested in (None, "") and (delta_requested not in (None, "") or direction):
+                    # Relative request: "increase volume a bit", "a bit quieter".
+                    step = _as_int(
+                        values.get("step_percent"),
+                        _voice_volume_step(_settings(store)),
+                        1,
+                        100,
+                    )
+                    delta = _as_int(delta_requested, 0, -200, 200)
+                    if not delta:
+                        delta = -step if direction in {
+                            "down",
+                            "quieter",
+                            "quiet",
+                            "lower",
+                            "softer",
+                            "reduce",
+                            "decrease",
+                        } else step
+                    volume = max(0, min(100, current_volume + delta))
+                    already_at = volume == current_volume
+                else:
+                    volume = _as_int(requested, 75, 0, 100)
+                    already_at = False
+                if not already_at:
+                    live_result = await asyncio.to_thread(
+                        _set_player_volume, player, volume, store=store
+                    )
+                    _apply_mute_warnings(player, live_result)
+                    _save_player(player, store, control_queue_id)
                 targets = _list(player.get("targets") or player.get("target"))
                 # Screen playback plays at each screen's own browser volume;
                 # the requested level stays stored and applies when speakers
@@ -12922,12 +12977,16 @@ async def run_hydra_kernel_tool(
                 screen_only = bool(targets) and all(
                     _is_screen_target(target) for target in targets
                 )
-                summary = (
-                    f"Every speaker in the group is now at {volume}%."
-                    if len(targets) > 1
-                    else f"Volume set to {volume}%."
-                )
-                if screen_only:
+                if already_at:
+                    summary = (
+                        f"The volume is already at {current_volume}%. "
+                        "Nothing more it can go in that direction."
+                    )
+                elif len(targets) > 1:
+                    summary = f"Every speaker in the group is now at {volume}%."
+                else:
+                    summary = f"Volume set to {volume}%."
+                if screen_only and not already_at:
                     summary = (
                         f"Queued {volume}% for the group — screen playback uses each "
                         "screen's own volume control until speakers are targeted too."
