@@ -8927,6 +8927,108 @@ class AuthoritativeVoiceStopTests(unittest.TestCase):
         self.assertEqual(commands, [])
         self.assertEqual(len(matched_calls), 1)
 
+    def test_person_scope_stops_the_speakers_own_music(self):
+        core = self.core
+        core._save_hash(self.redis, core.SETTINGS_KEY, {"voice_stop_scope": "person"})
+        # Cecilia's music plays in the garden; another Person's queue plays on
+        # the satellite she speaks at (origin device_id). Person scope ignores
+        # the room and stops her own queue wherever it plays.
+        self.seed_person("person_cecilia", ["voice_core:native:garden"])
+        self.seed_person("person_b", ["voice_core:native:kitchen"])
+        calls = []
+        original_stop_target = core._stop_target
+
+        def fake_stop_target(targets, *, expected_voice_core_sessions=None, authoritative=False):
+            calls.append((list(targets), authoritative))
+            return []
+
+        core._stop_target = fake_stop_target
+        try:
+            result = asyncio.run(
+                core.run_hydra_kernel_tool(
+                    tool_id="personal_music_control",
+                    args={"action": "stop"},
+                    origin={
+                        "people_resolution": {"master_user_id": "person_cecilia"},
+                        "device_id": "native:kitchen",
+                    },
+                    redis_client=self.redis,
+                )
+            )
+        finally:
+            core._stop_target = original_stop_target
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(calls, [(["voice_core:native:garden"], True)])
+        self.assertEqual(core._player(self.redis, "person_cecilia")["status"], "stopped")
+        # The other room's music kept playing.
+        self.assertEqual(core._player(self.redis, "person_b")["status"], "playing")
+
+    def test_room_scope_is_the_default_and_hits_the_room_queue(self):
+        core = self.core
+        self.seed_person("person_cecilia", ["voice_core:native:garden"])
+        self.seed_person("person_b", ["voice_core:native:kitchen"])
+        calls = []
+        original_stop_target = core._stop_target
+
+        def fake_stop_target(targets, *, expected_voice_core_sessions=None, authoritative=False):
+            calls.append((list(targets), authoritative))
+            return []
+
+        core._stop_target = fake_stop_target
+        try:
+            result = asyncio.run(
+                core.run_hydra_kernel_tool(
+                    tool_id="personal_music_control",
+                    args={"action": "stop"},
+                    origin={
+                        "people_resolution": {"master_user_id": "person_cecilia"},
+                        "device_id": "native:kitchen",
+                    },
+                    redis_client=self.redis,
+                )
+            )
+        finally:
+            core._stop_target = original_stop_target
+        self.assertTrue(result.get("ok"), result)
+        # Default room scope: the music playing on the speaking satellite.
+        self.assertEqual(calls, [(["voice_core:native:kitchen"], True)])
+        self.assertEqual(core._player(self.redis, "person_b")["status"], "stopped")
+        self.assertEqual(core._player(self.redis, "person_cecilia")["status"], "playing")
+
+    def test_person_scope_falls_back_to_the_room_when_person_has_no_destinations(self):
+        core = self.core
+        core._save_hash(self.redis, core.SETTINGS_KEY, {"voice_stop_scope": "person"})
+        # Never-played Person (no targets yet) stops the room's music rather
+        # than silently stopping nothing.
+        self.seed_person("person_cecilia", [])
+        self.seed_person("person_b", ["voice_core:native:kitchen"])
+        calls = []
+        original_stop_target = core._stop_target
+
+        def fake_stop_target(targets, *, expected_voice_core_sessions=None, authoritative=False):
+            calls.append((list(targets), authoritative))
+            return []
+
+        core._stop_target = fake_stop_target
+        try:
+            result = asyncio.run(
+                core.run_hydra_kernel_tool(
+                    tool_id="personal_music_control",
+                    args={"action": "stop"},
+                    origin={
+                        "people_resolution": {"master_user_id": "person_cecilia"},
+                        "device_id": "native:kitchen",
+                    },
+                    redis_client=self.redis,
+                )
+            )
+        finally:
+            core._stop_target = original_stop_target
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(calls, [(["voice_core:native:kitchen"], True)])
+        self.assertEqual(core._player(self.redis, "person_b")["status"], "stopped")
+        self.assertEqual(core._player(self.redis, "person_cecilia")["status"], "playing")
+
     def test_occupied_targets_are_pair_normalized_consistently(self):
         core = self.core
         # No stereo pairs in this test env, so normalization is identity — the
