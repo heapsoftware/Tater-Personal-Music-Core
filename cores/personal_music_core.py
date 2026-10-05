@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.14.1"
+__version__ = "3.15.0"
 MIN_TATER_VERSION = "1.2.0"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby, Jellyfin, Subsonic, or Plex account or "
@@ -216,6 +216,23 @@ CORE_SETTINGS = {
                 "What to do when requested rooms are already playing someone else's music, or a "
                 "Person asks for music while their own music plays elsewhere. Each Person can "
                 "override this on their link card in the People section."
+            ),
+        },
+        "voice_stop_scope": {
+            "label": "Voice Transport Scope",
+            "type": "select",
+            "default": "room",
+            "options": [
+                {"value": "room", "label": "Music playing on the speaking satellite first"},
+                {"value": "person", "label": "The speaking Person's own music first"},
+            ],
+            "description": (
+                "Which queue a spoken stop/pause/next/previous acts on. The room choice stops "
+                "whatever is playing on the satellite in front of them, even when it is another "
+                "Person's music — \"stop the music\" stops the noise in the room. The Person choice "
+                "always acts on the speaking Person's own queue, wherever their music is playing; "
+                "when the speaking Person has no destinations set for their queue, it falls back "
+                "to the room's playing music."
             ),
         },
         "follow_me_enabled": {
@@ -12349,12 +12366,29 @@ def _queue_playing_near(origin: Optional[Dict[str, Any]], client: Any = None) ->
     return ""
 
 
+def _voice_stop_scope(cfg: Dict[str, Any]) -> str:
+    """Which queue spoken transport commands act on, from the global setting."""
+    scope = _text(cfg.get("voice_stop_scope")).casefold()
+    return "person" if scope == "person" else "room"
+
+
 def _control_queue_id(origin: Optional[Dict[str, Any]], client: Any = None) -> str:
-    """Transport actions hit the music playing nearby first, then the Person's own."""
+    """Transport actions follow Voice Transport Scope.
+
+    Room scope hits the music playing nearby first, then the Person's own.
+    Person scope always acts on the speaking Person's own queue, wherever
+    their music plays; only a Person with no destinations set falls back to
+    the room's playing music so a spoken stop never stalls in a noisy room.
+    """
+    own_queue_id = _context_person_id(origin)
+    if own_queue_id and _voice_stop_scope(_settings(client)) == "person":
+        own = _player(client, own_queue_id)
+        if _list(own.get("targets") or own.get("target")):
+            return own_queue_id
     room_queue_id = _queue_playing_near(origin, client)
     if room_queue_id:
         return room_queue_id
-    return _context_person_id(origin)
+    return own_queue_id
 
 
 def _resume_queue_id(origin: Optional[Dict[str, Any]], control_queue_id: str, client: Any = None) -> str:
