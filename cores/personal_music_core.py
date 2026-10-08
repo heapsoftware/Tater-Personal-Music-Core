@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.17.0"
+__version__ = "3.18.0"
 MIN_TATER_VERSION = "1.2.0"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby, Jellyfin, Subsonic, or Plex account or "
@@ -10591,7 +10591,7 @@ def _sendspin_playback_module():
         return None
 
 
-async def _sendspin_stop_selectors_async(selectors: List[str]) -> List[str]:
+async def _sendspin_stop_selectors_async(selectors: List[str], *, reason: str = "stopped") -> List[str]:
     """Stop every live Sendspin stream owning one of the member selectors."""
     stops: List[str] = []
     sendspin = _sendspin_playback_module()
@@ -10600,12 +10600,36 @@ async def _sendspin_stop_selectors_async(selectors: List[str]) -> List[str]:
     from tater_voice import native_satellite
 
     targets = await native_satellite.sendspin_targets_for_selectors(selectors)
+    # Tater v1.3.1+ tags intended stops on the recorded outcome so a core
+    # reconcile never counts its own stop as a failure (pre-1.3.1 stops are
+    # recorded as plain "stopped", which no reconcile counts as a failure).
+    stop_kwargs: Dict[str, Any] = {}
+    try:
+        import inspect
+
+        if "reason" in inspect.signature(sendspin.stop_live_streams_for_targets).parameters:
+            stop_kwargs["reason"] = reason
+    except Exception:
+        stop_kwargs = {}
     result = await sendspin.stop_live_streams_for_targets(
-        _text(target.get("selector")) for target in targets if isinstance(target, dict)
+        (_text(target.get("selector")) for target in targets if isinstance(target, dict)),
+        **stop_kwargs,
     )
     if isinstance(result, dict) and result.get("ok") is False:
         stops.append(_text(result.get("error")) or "The Sendspin stream stop failed.")
     return stops
+
+
+def _supports_play_kwarg(name: str) -> bool:
+    """True when the host's play_media_url_targets accepts the given kwarg."""
+    try:
+        import inspect
+
+        from media_playback import play_media_url_targets
+
+        return name in inspect.signature(play_media_url_targets).parameters
+    except Exception:
+        return False
 
 
 def _supports_shared_group_source() -> bool:
@@ -10652,6 +10676,7 @@ def _play_track(
     selected_player_settings = (
         player_settings if isinstance(player_settings, dict) else {}
     )
+    native_sendspin = any(_is_native_target(target) for target in hardware_targets)
     audio_sync_transcode = _uses_audio_sync_transcode(hardware_targets)
     source_url = provider.stream_url(track, audio_sync=audio_sync_transcode)
     if not source_url:
@@ -10736,6 +10761,18 @@ def _play_track(
         # answer. The Sendspin timeline already shares one upstream, so the
         # legacy shared-relay flag stays off (upstream 3.6.0 passes neither).
         play_kwargs["source_owner"] = "music_core"
+        # Tater v1.3.1 (upstream Music Core 3.6.1): display-capable satellites
+        # render album art and take track colors off the same Sendspin
+        # timeline when the play call carries the artwork bytes. Audio-only
+        # satellites never receive it. A missing artwork must not block play.
+        if native_sendspin and _supports_play_kwarg("artwork_bytes"):
+            try:
+                artwork = _fetch_track_artwork(track, client)
+                play_kwargs["artwork_bytes"] = bytes(artwork.get("body") or b"")
+                play_kwargs["artwork_content_type"] = _text(artwork.get("content_type"))
+            except Exception:
+                play_kwargs["artwork_bytes"] = None
+                play_kwargs["artwork_content_type"] = ""
     elif _supports_shared_group_source():
         # Tater v1.2.7: synchronize multi-speaker groups through one shared
         # upstream stream (the host ignores it for single targets).
@@ -10743,7 +10780,7 @@ def _play_track(
     result = play_media_url_targets(hardware_targets, source_url, **play_kwargs)
     if not isinstance(result, dict) or result.get("ok") is False:
         raise RuntimeError(_text((result or {}).get("error")) or "Music playback failed.")
-    result["native_sendspin_used"] = any(_is_native_target(target) for target in hardware_targets)
+    result["native_sendspin_used"] = native_sendspin
     # The screen mirrors in parallel when a queue mixes screens with speakers;
     # mixed sync is not guaranteed.
     if screen_targets:
@@ -10826,7 +10863,7 @@ def _blind_stop_voice_core_selectors(
         try:
             warnings.extend(
                 native_satellite.run_on_runtime_loop(
-                    _sendspin_stop_selectors_async(clean_selectors),
+                    _sendspin_stop_selectors_async(clean_selectors, reason=reason),
                     timeout=8.0,
                 )
             )
@@ -12017,6 +12054,234 @@ def _advance_finished_player(client: Any = None, person_id: Any = "") -> None:
         _save_player(player, store, queue_id)
 
 
+def _skip_failed_track_and_continue(
+    player: Dict[str, Any],
+    *,
+    streak: int,
+    client: Any,
+    queue_owner_id: Any,
+    failed_labels: List[str],
+    detail_text: str,
+    park_message: str,
+) -> Dict[str, Any]:
+    """Shared reconciler tail: log, skip while the breaker allows, then park.
+
+    One bad file (or a dead source) used to park the whole queue as an error.
+    Name the file in the log, then skip forward while the breaker allows it;
+    after MAX_CONSECUTIVE_TRACK_FAILURES consecutive failures — a dead server,
+    not one bad rip — park with the error so the queue isn't machine-gunned.
+    """
+    current = player.get("current") or {}
+    detail_suffix = f" {detail_text}" if detail_text else ""
+    if streak < MAX_CONSECUTIVE_TRACK_FAILURES:
+        logger.warning(
+            "[Music] track failed to play — the file may be damaged or the target could "
+            "not decode it: %s (file=%s, target=%s, consecutive failures=%d%s) — skipping "
+            "to the next track",
+            _track_label(current),
+            _text(current.get("path")) or "(no file path on the queue row)",
+            ", ".join(failed_labels),
+            streak,
+            detail_suffix,
+        )
+        _save_player(player, client, queue_owner_id)
+        try:
+            _advance_player(1, person_id=queue_owner_id, client=client)
+        except Exception as exc:
+            logger.warning("[Music] skip after failed track could not advance: %s", _text(exc))
+        else:
+            advanced = _player(client, queue_owner_id)
+            if _text(advanced.get("status")).lower() == "playing":
+                skip_note = f"Skipped {_track_label(current)} — it failed to play; playing the next track."
+                advanced_warnings = [
+                    _text(value) for value in list(advanced.get("warnings") or []) if _text(value)
+                ]
+                if skip_note not in advanced_warnings:
+                    advanced_warnings.append(skip_note)
+                advanced["warnings"] = advanced_warnings
+                _save_player(advanced, client, queue_owner_id)
+                return advanced
+            # Queue genuinely ended (finished): leave _advance_player's result.
+            return advanced
+    # Circuit breaker tripped (or advancing raised): park as an error, as
+    # before, now with the failure history in the message.
+    logger.error(
+        "[Music] satellite playback failed person=%s track=%s targets=%s consecutive_failures=%d detail=%s",
+        _text(player.get("queue_id")),
+        _track_label(current),
+        ", ".join(failed_labels),
+        streak,
+        detail_text or "(no detail)",
+    )
+    player["status"] = "error"
+    player["last_error"] = park_message
+    player["started_at"] = 0.0
+    _save_player(player, client, queue_owner_id)
+    return player
+
+
+def _reconcile_sendspin_sessions(
+    player: Dict[str, Any],
+    playback_result: Dict[str, Any],
+    sendspin_sessions: List[Dict[str, Any]],
+    *,
+    client: Any = None,
+    queue_owner_id: Any = "",
+) -> Optional[Dict[str, Any]]:
+    """Reconcile Sendspin-timeline sessions through the host outcome registry.
+
+    Tater v1.3.1 records terminal outcomes per stream id
+    (``sendspin_playback.stream_outcomes`` — our filed feature request) with
+    an error_kind split that tells a bad track from a bad speaker: a
+    ``source`` failure means the media could not be decoded, so skip with the
+    named-file warning and the MAX_CONSECUTIVE_TRACK_FAILURES breaker;
+    ``transport``/``internal`` failures are speaker or network problems —
+    park the queue only when every dispatched track failed, and never skip.
+    Natural (``completed``) and intended (``stopped``/``replaced``) ends are
+    not failures. Returns the updated player when sendspin sessions were
+    handled, or None to let the legacy reconcile look at any other rows.
+    """
+    sendspin_outcomes: Dict[str, Dict[str, Any]] = {}
+    try:
+        from tater_voice import native_satellite, sendspin_playback
+
+        query = getattr(sendspin_playback, "stream_outcomes", None)
+        if callable(query):
+            stream_ids = [_text(row.get("session_id")) for row in sendspin_sessions]
+            starts = [
+                _as_int(row.get("start_unix_ms"), 0, 0, 9_999_999_999_999)
+                for row in sendspin_sessions
+            ]
+            starts = [start for start in starts if start > 0]
+            outcomes_result = native_satellite.run_on_runtime_loop(
+                query(stream_ids, since_unix_ms=min(starts, default=0)),
+                timeout=5.0,
+            )
+            rows = (
+                outcomes_result.get("outcomes")
+                if isinstance(outcomes_result, dict)
+                else {}
+            )
+            if isinstance(rows, dict):
+                sendspin_outcomes = {
+                    _text(stream_id): dict(row)
+                    for stream_id, row in rows.items()
+                    if _text(stream_id) and isinstance(row, dict)
+                }
+    except Exception:
+        # No outcome registry (pre-v1.3.1 hosts): keep the former behavior —
+        # silence until the host is updated — rather than guessing failures
+        # from the absence of audio.
+        sendspin_outcomes = {}
+
+    failures: List[Dict[str, Any]] = []
+    for session in sendspin_sessions:
+        stream_id = _text(session.get("session_id"))
+        outcome = sendspin_outcomes.get(stream_id) or {}
+        if _text(outcome.get("status")).lower() != "failed":
+            continue
+        selectors = _list(session.get("selectors") or session.get("target"))
+        failures.append(
+            {
+                "label": ", ".join(selectors) or _text(session.get("target")) or stream_id,
+                "kind": _text(outcome.get("error_kind")).lower() or "internal",
+                "error": _text(outcome.get("error")) or "The Sendspin stream failed.",
+                "stream_id": stream_id,
+            }
+        )
+
+    if not failures:
+        # The timeline completed, was stopped, or the host has no outcomes:
+        # clear the source-failure breaker once the current track has actually
+        # been audible for a while.
+        if (
+            _as_int(player.get("consecutive_source_failures"), 0, 0, 1000) > 0
+            and _player_position_seconds(player) >= 10.0
+        ):
+            player["consecutive_source_failures"] = 0
+            _save_player(player, client, queue_owner_id)
+        return None
+
+    warning = "Playback failed on " + ", ".join(
+        _text(row.get("label")) for row in failures if _text(row.get("label"))
+    ) + "."
+    warnings = [_text(value) for value in list(player.get("warnings") or []) if _text(value)]
+    if warning not in warnings:
+        warnings.append(warning)
+    player["warnings"] = warnings
+
+    def member_count(session: Dict[str, Any]) -> int:
+        return max(1, len(_list(session.get("selectors") or session.get("target"))))
+
+    tracked_count = sum(member_count(session) for session in sendspin_sessions)
+    sent_count = _as_int(playback_result.get("sent_count"), tracked_count, 0, 10000)
+    tracked_dispatch_count = (
+        _as_int(playback_result.get("voice_core_sent_count"), 0, 0, 10000)
+        + _as_int(playback_result.get("airplay_bridge_sent_count"), 0, 0, 10000)
+    )
+    if tracked_dispatch_count <= 0:
+        tracked_dispatch_count = tracked_count
+    all_dispatched = (
+        len(failures) >= len(sendspin_sessions) and sent_count <= tracked_dispatch_count
+    )
+
+    detail = next(
+        (_text(row.get("error")) for row in failures if _text(row.get("error"))),
+        "The media source could not be decoded.",
+    )
+    failure_labels = [_text(row.get("label")) for row in failures if _text(row.get("label"))]
+
+    if not all_dispatched:
+        # Only some targets failed; the survivors are still playing. Surface
+        # the failure (with the host's error text) but leave the queue running.
+        logger.error(
+            "[Music] Sendspin playback failed person=%s track=%s targets=%s kinds=%s detail=%s",
+            _text(player.get("queue_id")),
+            _track_label(player.get("current") or {}),
+            ", ".join(failure_labels),
+            ", ".join(_text(row.get("kind")) for row in failures),
+            detail,
+        )
+        _save_player(player, client, queue_owner_id)
+        return player
+
+    if not all(_text(row.get("kind")).lower() == "source" for row in failures):
+        # A transport/internal failure is a speaker or network problem, not a
+        # bad track — skipping would machine-gun the same healthy file onto
+        # the same broken satellite. Park and say so.
+        logger.error(
+            "[Music] Sendspin stream failed person=%s track=%s targets=%s detail=%s (transport failure; not skipping)",
+            _text(player.get("queue_id")),
+            _track_label(player.get("current") or {}),
+            ", ".join(failure_labels),
+            detail,
+        )
+        player["status"] = "error"
+        player["last_error"] = warning
+        player["started_at"] = 0.0
+        _save_player(player, client, queue_owner_id)
+        return player
+
+    consecutive = _as_int(player.get("consecutive_source_failures"), 0, 0, 1000) + 1
+    player["consecutive_source_failures"] = consecutive
+    track_warning = f"Could not play {_track_label(player.get('current') or {})}: {detail}"
+    if track_warning not in warnings:
+        warnings.append(track_warning)
+        player["warnings"] = warnings
+    return _skip_failed_track_and_continue(
+        player,
+        streak=consecutive,
+        client=client,
+        queue_owner_id=queue_owner_id,
+        failed_labels=failure_labels,
+        detail_text=detail,
+        park_message=(
+            f"Music stopped after {consecutive} consecutive source failures. "
+            f"Last failure: {detail}"
+        ),
+    )
+
+
 def _reconcile_native_playback(
     player: Dict[str, Any],
     client: Any = None,
@@ -12029,19 +12294,31 @@ def _reconcile_native_playback(
         if isinstance(player.get("playback_result"), dict)
         else {}
     )
-    sessions = [
+    all_sessions = [
         row
         for row in list(playback_result.get("voice_core_sessions") or [])
-        if (
-            isinstance(row, dict)
-            and _text(row.get("session_id"))
-            # Sendspin sessions (Tater v1.3.0+) live in the host's runtime
-            # loop, not in per-satellite media_session state, so the snapshot
-            # below can never match them; skip those rows here. This still
-            # covers legacy media-session rows on pre-Sendspin hosts.
-            and _text(row.get("transport")) != "sendspin"
-        )
+        if isinstance(row, dict) and _text(row.get("session_id"))
     ]
+    if not all_sessions:
+        return player
+    sendspin_sessions = [
+        row for row in all_sessions if _text(row.get("transport")).lower() == "sendspin"
+    ]
+    # Legacy per-satellite media-session rows only exist on pre-Sendspin hosts.
+    sessions = [row for row in all_sessions if row not in sendspin_sessions]
+    queue_owner_id = person_id if person_id else player.get("queue_id")
+
+    if sendspin_sessions:
+        sendspin_result = _reconcile_sendspin_sessions(
+            player,
+            playback_result,
+            sendspin_sessions,
+            client=client,
+            queue_owner_id=queue_owner_id,
+        )
+        if sendspin_result is not None:
+            return sendspin_result
+
     if not sessions:
         return player
     try:
@@ -12111,9 +12388,7 @@ def _reconcile_native_playback(
     all_dispatched_targets_are_tracked_native_sessions = (
         len(sessions) >= voice_core_sent_count and sent_count <= voice_core_sent_count
     )
-    queue_owner_id = person_id if person_id else player.get("queue_id")
     detail_suffix = (" " + "; ".join(detail_parts)) if detail_parts else " (satellite reported no error detail)"
-    skip_detail = (" " + "; ".join(detail_parts)) if detail_parts else ""
     if not (
         len(failed) == len(sessions) and all_dispatched_targets_are_tracked_native_sessions
     ):
@@ -12129,60 +12404,19 @@ def _reconcile_native_playback(
         _save_player(player, client, queue_owner_id)
         return player
 
-    # Every dispatched native session failed: one bad file (or a dead source)
-    # used to park the whole queue as an error. Name the file in the log, then
-    # skip forward while the circuit breaker allows it; after
-    # MAX_CONSECUTIVE_TRACK_FAILURES consecutive failures — a dead server, not
-    # one bad rip — stop with the error as before so the queue isn't
-    # machine-gunned.
+    # Every dispatched native session failed: skip while the circuit breaker
+    # allows it, then park with the error history.
     streak = _as_int(player.get("playback_failure_streak"), 0, 0, 1000) + 1
     player["playback_failure_streak"] = streak
-    current = player.get("current") or {}
-    if streak < MAX_CONSECUTIVE_TRACK_FAILURES:
-        logger.warning(
-            "[Music] track failed to play — the file may be damaged or the target could "
-            "not decode it: %s (file=%s, target=%s, consecutive failures=%d%s) — skipping "
-            "to the next track",
-            _track_label(current),
-            _text(current.get("path")) or "(no file path on the queue row)",
-            ", ".join(failed),
-            streak,
-            skip_detail,
-        )
-        _save_player(player, client, queue_owner_id)
-        try:
-            _advance_player(1, person_id=queue_owner_id, client=client)
-        except Exception as exc:
-            logger.warning("[Music] skip after failed track could not advance: %s", _text(exc))
-        else:
-            advanced = _player(client, queue_owner_id)
-            if _text(advanced.get("status")).lower() == "playing":
-                skip_note = f"Skipped {_track_label(current)} — it failed to play; playing the next track."
-                advanced_warnings = [
-                    _text(value) for value in list(advanced.get("warnings") or []) if _text(value)
-                ]
-                if skip_note not in advanced_warnings:
-                    advanced_warnings.append(skip_note)
-                advanced["warnings"] = advanced_warnings
-                _save_player(advanced, client, queue_owner_id)
-                return advanced
-            # Queue genuinely ended (finished): leave _advance_player's result.
-            return advanced
-    # Circuit breaker tripped (or advancing raised): park as an error, as
-    # before, now with the failure history in the message.
-    logger.error(
-        "[Music] satellite playback failed person=%s track=%s targets=%s consecutive_failures=%d detail=%s",
-        _text(player.get("queue_id")),
-        _track_label(current),
-        ", ".join(failed),
-        streak,
-        detail_suffix,
+    return _skip_failed_track_and_continue(
+        player,
+        streak=streak,
+        client=client,
+        queue_owner_id=queue_owner_id,
+        failed_labels=failed,
+        detail_text="; ".join(detail_parts),
+        park_message=warning,
     )
-    player["status"] = "error"
-    player["last_error"] = warning
-    player["started_at"] = 0.0
-    _save_player(player, client, queue_owner_id)
-    return player
 
 
 def _validate_catalog_provider_targets(targets: Any) -> None:
