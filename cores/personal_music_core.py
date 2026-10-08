@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
 
-__version__ = "3.16.0"
+__version__ = "3.17.0"
 MIN_TATER_VERSION = "1.2.0"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby, Jellyfin, Subsonic, or Plex account or "
@@ -10573,13 +10573,51 @@ def _track_media_type(track: Dict[str, Any]) -> str:
     }.get(extension, "application/octet-stream")
 
 
+def _sendspin_playback_module():
+    """The host's Sendspin source module on Tater v1.3.0+; None on older hosts.
+
+    Tater v1.3.0 (with satellite firmware 2.2.0) retired the per-satellite
+    ``media.session`` transport in favor of a Sendspin v1 WebSocket player:
+    one host-side timeline decodes the media with ffmpeg and streams timestamped
+    48 kHz PCM to every member satellite. That machinery lives in
+    ``tater_voice.sendspin_playback``, which only exists there, so importing it
+    doubles as the host-version probe for every Sendspin wire path below.
+    """
+    try:
+        from tater_voice import sendspin_playback
+
+        return sendspin_playback
+    except Exception:
+        return None
+
+
+async def _sendspin_stop_selectors_async(selectors: List[str]) -> List[str]:
+    """Stop every live Sendspin stream owning one of the member selectors."""
+    stops: List[str] = []
+    sendspin = _sendspin_playback_module()
+    if sendspin is None:
+        raise RuntimeError("Sendspin playback is unavailable on this host.")
+    from tater_voice import native_satellite
+
+    targets = await native_satellite.sendspin_targets_for_selectors(selectors)
+    result = await sendspin.stop_live_streams_for_targets(
+        _text(target.get("selector")) for target in targets if isinstance(target, dict)
+    )
+    if isinstance(result, dict) and result.get("ok") is False:
+        stops.append(_text(result.get("error")) or "The Sendspin stream stop failed.")
+    return stops
+
+
 def _supports_shared_group_source() -> bool:
     """True when the host accepts play_media_url_targets(shared_group_source=…).
 
     Tater v1.2.7 added the flag so a synchronized group of two or more
     satellites / AirPlay players streams through one shared upstream relay
     (the stereo-pair path) instead of each target fetching the source itself.
-    Older hosts reject the kwarg, so callers must gate it.
+    Older hosts reject the kwarg, so callers must gate it. On Sendspin hosts
+    (Tater v1.3.0+) the flag is left off: the Sendspin timeline is its own
+    one-upstream relay, and the legacy shared relay would only wrap the same
+    source a second time.
     """
     try:
         import inspect
@@ -10656,46 +10694,56 @@ def _play_track(
         if audio_sync_transcode
         else source_path.name
     )
-    result = play_media_url_targets(
-        hardware_targets,
-        source_url,
-        media_type=playback_media_type,
-        media_content_type="music",
-        filename=playback_filename,
-        text=f"Playing {_track_label(track)}.",
-        title=_text(track.get("title")) or Path(_text(track.get("path")) or "music-track").stem,
-        artist=_text(track.get("artist") or track.get("album_artist")),
-        album=_text(track.get("album")),
-        duration_seconds=duration,
-        volume_percent=volume_percent,
-        start_position_seconds=max(0.0, _as_float(start_position_seconds)),
-        mixed_sync_adjustment_ms=_as_int(mixed_sync_adjustment_ms, 0, -750, 3000),
-        target_volume_percent={
+    play_kwargs = {
+        "media_type": playback_media_type,
+        "media_content_type": "music",
+        "filename": playback_filename,
+        "text": f"Playing {_track_label(track)}.",
+        "title": _text(track.get("title")) or Path(_text(track.get("path")) or "music-track").stem,
+        "artist": _text(track.get("artist") or track.get("album_artist")),
+        "album": _text(track.get("album")),
+        "duration_seconds": duration,
+        "volume_percent": volume_percent,
+        "start_position_seconds": max(0.0, _as_float(start_position_seconds)),
+        "mixed_sync_adjustment_ms": _as_int(mixed_sync_adjustment_ms, 0, -750, 3000),
+        "target_volume_percent": {
             target: _as_int(values.get("volume_percent"), volume_percent, 0, 100)
             for target, values in dict(player_settings or {}).items()
             if _text(target) and not _is_screen_target(target) and isinstance(values, dict)
         },
-        target_sync_offset_ms={
+        "target_sync_offset_ms": {
             target: _as_int(values.get("sync_offset_ms"), 0, -1000, 1000)
             for target, values in dict(player_settings or {}).items()
             if _text(target) and not _is_screen_target(target) and isinstance(values, dict)
         },
-        target_transport_mode={
+        "target_transport_mode": {
             target: _player_transport_mode(values.get("transport_mode"))
             for target, values in dict(player_settings or {}).items()
             if _text(target)
             and isinstance(values, dict)
             and target.casefold().startswith(("sonos:", "integration:sonos:"))
         },
-        airplay_group_id=_text(airplay_group_id),
-        timeout_s=max(180.0, duration + 120.0),
-        respect_reply_playback=False,
-        # Tater v1.2.7+: synchronize multi-speaker groups through one shared
+        "airplay_group_id": _text(airplay_group_id),
+        "timeout_s": max(180.0, duration + 120.0),
+        "respect_reply_playback": False,
+    }
+    if _sendspin_playback_module() is not None:
+        # Tater v1.3.0+: native targets ride the host's Sendspin timeline
+        # (one ffmpeg decode into timestamped 48 kHz PCM, AirPlay players
+        # bridged onto the same clock). The owner tag is what switches the
+        # host to that route; without it the host falls back to the retired
+        # per-satellite media.session dispatch, which v2.2.0 firmware cannot
+        # answer. The Sendspin timeline already shares one upstream, so the
+        # legacy shared-relay flag stays off (upstream 3.6.0 passes neither).
+        play_kwargs["source_owner"] = "music_core"
+    elif _supports_shared_group_source():
+        # Tater v1.2.7: synchronize multi-speaker groups through one shared
         # upstream stream (the host ignores it for single targets).
-        **({"shared_group_source": True} if _supports_shared_group_source() else {}),
-    )
+        play_kwargs["shared_group_source"] = True
+    result = play_media_url_targets(hardware_targets, source_url, **play_kwargs)
     if not isinstance(result, dict) or result.get("ok") is False:
         raise RuntimeError(_text((result or {}).get("error")) or "Music playback failed.")
+    result["native_sendspin_used"] = any(_is_native_target(target) for target in hardware_targets)
     # The screen mirrors in parallel when a queue mixes screens with speakers;
     # mixed sync is not guaranteed.
     if screen_targets:
@@ -10753,18 +10801,42 @@ def _blind_stop_voice_core_selectors(
     *,
     reason: str = "music_core_stop",
 ) -> List[str]:
-    """Stop the live media session on each voice_core selector, id unmatched.
+    """Stop whatever is actually sounding on each voice_core selector, id unmatched.
 
-    An explicit stop has to end whatever is actually sounding on the target
-    speakers. Recorded session ids go stale — a relay restart or the
-    next-track advance mints a new one — and the matched-session stop then
-    quietly skips, leaving music playing while the tool reports success.
+    An explicit stop has to end what's actually playing on the target speakers,
+    not just the recorded session (recorded ids go stale — a relay restart or
+    the next-track advance mints a new one — and the matched-session stop then
+    quietly skips, leaving music playing while the tool reports success).
+
+    Tater v1.3.0+: the sounding thing is a Sendspin stream owned by a session
+    in the host's runtime loop, so stop by current ownership of the resolved
+    member targets. Older hosts: the retirement-era blind `media.session.stop`.
     """
     warnings: List[str] = []
+    clean_selectors = [selector for selector in _list(selectors) if _text(selector)]
+    if not clean_selectors:
+        return warnings
     try:
-        from tater_voice import native_satellite, stereo_pairs
+        from tater_voice import native_satellite
+    except Exception as exc:
+        return [_text(exc)]
+    if _sendspin_playback_module() is not None:
+        # The ownership map inside sendspin_playback keys on member selectors,
+        # so resolve logical selectors (and stereo pairs) to members first.
+        try:
+            warnings.extend(
+                native_satellite.run_on_runtime_loop(
+                    _sendspin_stop_selectors_async(clean_selectors),
+                    timeout=8.0,
+                )
+            )
+        except Exception as exc:
+            warnings.append(_text(exc))
+        return warnings
+    try:
+        from tater_voice import stereo_pairs
 
-        for selector in _list(selectors):
+        for selector in clean_selectors:
             pair = stereo_pairs.get_pair(selector) if stereo_pairs.is_stereo_selector(selector) else {}
             members = (
                 [_text(pair.get("left_selector")), _text(pair.get("right_selector"))]
@@ -10919,6 +10991,7 @@ def _native_session_members(player: Dict[str, Any]) -> List[Dict[str, Any]]:
                         "selector": selector,
                         "session_id": _text(session.get("session_id")),
                         "target": _text(session.get("target")),
+                        "transport": _text(session.get("transport")),
                     }
                 )
     return members
@@ -10927,10 +11000,25 @@ def _native_session_members(player: Dict[str, Any]) -> List[Dict[str, Any]]:
 def _require_native_seek_support(targets: Any) -> None:
     try:
         from announcement_targets import split_announcement_targets
-        from tater_voice import native_satellite, stereo_pairs
+        from tater_voice import native_satellite
 
         grouped = split_announcement_targets(_list(targets))
         selectors = list(grouped.get("voice_core_selectors") or [])
+        if not selectors:
+            return
+        if _sendspin_playback_module() is not None:
+            # Sendspin timelines are seekable by construction: the host feeds
+            # timestamped PCM from a stream position the player already keeps.
+            # Resolving the member targets confirms the selected players are
+            # live, reachable Sendspin players; probing legacy per-member
+            # media_session capabilities is meaningless against them.
+            native_satellite.run_on_runtime_loop(
+                native_satellite.sendspin_targets_for_selectors(selectors),
+                timeout=6.0,
+            )
+            return
+        from tater_voice import stereo_pairs
+
         members: List[str] = []
         for selector in selectors:
             pair = stereo_pairs.get_pair(selector) if stereo_pairs.is_stereo_selector(selector) else {}
@@ -11037,7 +11125,55 @@ def _set_target_volume(player: Dict[str, Any], volume_percent: int) -> Dict[str,
                 pair_scales[_text(pair.get("right_selector"))] = _as_int(
                     pair.get("right_volume_percent"), 100, 0, 100
                 )
+            sendspin_sessions: Dict[str, List[Dict[str, Any]]] = {}
+            legacy_members: List[Dict[str, Any]] = []
             for member in native_members:
+                if _text(member.get("transport")) == "sendspin":
+                    sendspin_sessions.setdefault(_text(member.get("session_id")), []).append(member)
+                else:
+                    legacy_members.append(member)
+            # Sendspin sessions (Tater v1.3.0+): volume rides the live stream
+            # through the host's own Sendspin source, grouped per stream.
+            for session_id, members in sendspin_sessions.items():
+                volumes = {
+                    _text(member.get("selector")): max(
+                        0,
+                        min(
+                            100,
+                            round(
+                                volume_percent
+                                * pair_scales.get(_text(member.get("selector")), 100)
+                                / 100
+                            ),
+                        ),
+                    )
+                    for member in members
+                    if _text(member.get("selector"))
+                }
+                result = native_satellite.run_on_runtime_loop(
+                    _sendspin_playback_module().set_live_stream_volumes(session_id, volumes),
+                    timeout=6.0,
+                )
+                if not isinstance(result, dict) or result.get("ok") is False:
+                    warnings.append(
+                        _text((result or {}).get("error"))
+                        if isinstance(result, dict)
+                        else f"{session_id}: Sendspin volume update failed"
+                    )
+                else:
+                    sent_count += len(volumes)
+            if legacy_members and (sendspin_sessions or _sendspin_playback_module() is not None):
+                warnings.append(
+                    "The active satellite session predates Sendspin; start the track again."
+                )
+            # Legacy media-session members (Tater v1.2.x): per-satellite
+            # media.session.volume as before.
+            for member in legacy_members:
+                if sendspin_sessions or _sendspin_playback_module() is not None:
+                    # Nothing answers the legacy volume message on a Sendspin
+                    # host (pre-Sendspin rows are stale after the host update;
+                    # live streams are volume-managed above).
+                    continue
                 selector = _text(member.get("selector"))
                 try:
                     supported = native_satellite.run_on_runtime_loop(
@@ -11220,6 +11356,10 @@ def _start_player_index(
                 "integration_sent_count",
                 "media_session_sent_count",
                 "media_session_fallback_count",
+                "native_sendspin_used",
+                "sendspin_sent_count",
+                "native_sent_count",
+                "group_shared_stream",
                 "mixed_sync_adjustment_ms",
                 "mixed_native_start_lead_ms",
                 "sonos_proxy_used",
@@ -11892,7 +12032,15 @@ def _reconcile_native_playback(
     sessions = [
         row
         for row in list(playback_result.get("voice_core_sessions") or [])
-        if isinstance(row, dict) and _text(row.get("session_id"))
+        if (
+            isinstance(row, dict)
+            and _text(row.get("session_id"))
+            # Sendspin sessions (Tater v1.3.0+) live in the host's runtime
+            # loop, not in per-satellite media_session state, so the snapshot
+            # below can never match them; skip those rows here. This still
+            # covers legacy media-session rows on pre-Sendspin hosts.
+            and _text(row.get("transport")) != "sendspin"
+        )
     ]
     if not sessions:
         return player
@@ -17004,6 +17152,7 @@ def handle_htmlui_tab_action(
             },
             timeout_s=30.0,
             respect_reply_playback=False,
+            source_owner="music_core",
         )
         if not isinstance(result, dict) or result.get("ok") is False:
             raise ValueError(_text((result or {}).get("error")) or "The sync test could not start.")

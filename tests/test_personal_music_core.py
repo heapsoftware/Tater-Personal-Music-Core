@@ -9176,5 +9176,326 @@ class AuthoritativeVoiceStopTests(unittest.TestCase):
         self.assertEqual(occupied["voice_core:native:hall"], "person_cecilia")
 
 
+class FakeTaterVoice:
+    """A fake tater_voice package standing in for the two host generations.
+
+    With ``sendspin`` the package exposes ``sendspin_playback`` exactly like a
+    Tater v1.3.0+ host (the module whose presence the core probes), plus a
+    ``native_satellite`` that records the selectors it resolves. Without it the
+    package looks like a v1.2.x host and every Sendspin path must stay off.
+    """
+
+    def __init__(self, *, sendspin=True):
+        self.calls = []
+        self.volumes = []
+        self.stopped_selectors = []
+        self.resolved_ok = True
+        self.native = self._native(sendspin)
+        self.stereo_pairs = self._stereo_pairs()
+        self.sendspin = self._sendspin() if sendspin else None
+
+    def _native(self, sendspin):
+        module = types.ModuleType("tater_voice.native_satellite")
+        calls = self.calls
+
+        async def sendspin_targets_for_selectors(selectors):
+            calls.append(("resolve", list(selectors)))
+            if not self.resolved_ok:
+                raise RuntimeError("satellite offline")
+            return [
+                {"selector": selector.replace("voice_core:", ""),
+                 "logical_selector": selector,
+                 "host": "127.0.0.1",
+                 "volume_percent": 100}
+                for selector in selectors
+            ]
+
+        def run_on_runtime_loop(awaitable, *, timeout=20.0):
+            calls.append(("loop", timeout))
+            return asyncio.run(awaitable)
+
+        module.sendspin_targets_for_selectors = sendspin_targets_for_selectors
+        module.run_on_runtime_loop = run_on_runtime_loop
+        module.status_snapshot_sync = lambda: {"clients": {}}
+        module.client_has_capability = lambda selector, capability: not sendspin
+        return module
+
+    def _stereo_pairs(self):
+        module = types.ModuleType("tater_voice.stereo_pairs")
+        module.is_stereo_selector = lambda value: False
+        module.get_pair = lambda value: {}
+        return module
+
+    def _sendspin(self):
+        module = types.ModuleType("tater_voice.sendspin_playback")
+        stopped = self
+
+        async def stop_live_streams_for_targets(selectors):
+            targets = [selector for selector in selectors if selector]
+            stopped.stopped_selectors.extend(targets)
+            return {"ok": True, "stopped_count": len(targets), "stream_ids": []}
+
+        async def set_live_stream_volumes(stream_id, volume_percent):
+            self.volumes.append((stream_id, dict(volume_percent)))
+            return {"ok": True, "stream_id": stream_id, "volume_percent": dict(volume_percent)}
+
+        module.stop_live_streams_for_targets = stop_live_streams_for_targets
+        module.set_live_stream_volumes = set_live_stream_volumes
+        return module
+
+    def install(self):
+        package = types.ModuleType("tater_voice")
+        package.native_satellite = self.native
+        package.stereo_pairs = self.stereo_pairs
+        if self.sendspin is not None:
+            package.sendspin_playback = self.sendspin
+        self.originals = (
+            ("tater_voice", sys.modules.get("tater_voice")),
+        )
+        sys.modules["tater_voice"] = package
+        return self
+
+    def restore(self):
+        for name, original in self.originals:
+            if original is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = original
+
+
+class SendspinHostTests(unittest.TestCase):
+    """On Tater v1.3.0+ hosts music rides the Sendspin timeline.
+
+    Mirrors upstream Music Core 3.6.0: `source_owner="music_core"` selects the
+    host's Sendspin route, stops resolve current stream ownership instead of
+    the retired `media.session` protocol, live volume goes through
+    `sendspin_playback.set_live_stream_volumes`, and the per-satellite
+    reconcile skip sessions whose transport is sendspin.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.core = load_personal_music_core()
+
+    def setUp(self):
+        self.redis = FakeRedis()
+        self.core.redis_client = self.redis
+        self.core._shutdown_stream_server()
+        # The core imports this host module lazily; stand in for it so target
+        # splitting is observable without a live Tater runtime.
+        announcement_targets = types.ModuleType("announcement_targets")
+
+        def split_announcement_targets(values, **_kwargs):
+            values = [value for value in list(values) if isinstance(value, str) and value.strip()]
+            return {
+                "voice_core_selectors": [
+                    value for value in values if value.startswith("voice_core:")
+                ],
+                "airplay_players": [],
+                "sonos_speakers": [],
+                "integration_devices": [],
+                "homeassistant_media_players": [],
+            }
+
+        announcement_targets.split_announcement_targets = split_announcement_targets
+        self._announcement_original = sys.modules.get("announcement_targets")
+        sys.modules["announcement_targets"] = announcement_targets
+
+    def tearDown(self):
+        self.core._shutdown_stream_server()
+        if getattr(self, "_announcement_original", None) is None:
+            sys.modules.pop("announcement_targets", None)
+        else:
+            sys.modules["announcement_targets"] = self._announcement_original
+        if getattr(self, "_media_original", None) is None:
+            sys.modules.pop("media_playback", None)
+        else:
+            sys.modules["media_playback"] = self._media_original
+
+    def stub_media_playback(self, capture, *, with_kwarg=True, extra_module=None):
+        media_playback = types.ModuleType("media_playback")
+
+        # Declare the kwarg so _supports_shared_group_source's signature probe
+        # passes through the stub the way it does against v1.2.7+ hosts. Bind
+        # it back into the recorded kwargs, or the named parameter swallows it.
+        def play_media_url_targets(targets, source_url, *, shared_group_source=False, **kwargs):
+            kwargs = dict(kwargs, shared_group_source=shared_group_source)
+            capture.append((list(targets), source_url, kwargs))
+            row = {"ok": True, "sent_count": len(targets), "voice_core_sessions": []}
+            if extra_module:
+                row.update(extra_module)
+            return row
+
+        media_playback.play_media_url_targets = play_media_url_targets
+        self._media_original = sys.modules.get("media_playback")
+        sys.modules["media_playback"] = media_playback
+
+    def play(self, targets, **overrides):
+        track = _track_row(1, "Jamming")
+        kwargs = {"volume_percent": 60, "client": self.redis}
+        kwargs.update(overrides)
+        return self.core._play_track(track, targets, **kwargs)
+
+    def test_play_track_selects_the_host_sendspin_route(self):
+        capture = []
+        voice = FakeTaterVoice()
+        voice.install()
+        self.addCleanup(voice.restore)
+        self.stub_media_playback(capture)
+
+        result = self.play(["voice_core:native:kitchen"])
+        self.assertTrue(result["ok"], result)
+        targets, source_url, kwargs = capture[-1]
+        self.assertEqual(kwargs.get("source_owner"), "music_core")
+        # The Sendspin timeline is its own one-upstream relay; the legacy
+        # shared relay flag must stay off (upstream 3.6.0 passes neither).
+        self.assertIsNot(kwargs.get("shared_group_source"), True)
+        self.assertTrue(result["native_sendspin_used"])
+
+    def test_play_track_keeps_the_legacy_relay_on_pre_sendspin_hosts(self):
+        capture = []
+        voice = FakeTaterVoice(sendspin=False)
+        voice.install()
+        self.addCleanup(voice.restore)
+        self.stub_media_playback(capture)
+
+        result = self.play(["voice_core:native:kitchen", "voice_core:native:hall"])
+        self.assertTrue(result["ok"], result)
+        targets, source_url, kwargs = capture[-1]
+        self.assertNotIn("source_owner", kwargs)
+        # The legacy media.session relay for multi-target groups (v1.2.7+).
+        self.assertIs(kwargs.get("shared_group_source"), True)
+        self.assertTrue(result["native_sendspin_used"])
+
+    def test_blind_stop_uses_sendspin_stream_ownership(self):
+        voice = FakeTaterVoice()
+        voice.install()
+        self.addCleanup(voice.restore)
+
+        warnings = self.core._blind_stop_voice_core_selectors(
+            ["voice_core:native:kitchen"],
+        )
+        self.assertEqual(warnings, [])
+        self.assertEqual(voice.stopped_selectors, ["native:kitchen"])
+        self.assertIn(("resolve", ["voice_core:native:kitchen"]), voice.calls)
+
+    def test_blind_stop_falls_back_to_media_session_message_offline(self):
+        voice = FakeTaterVoice()
+        voice.resolved_ok = False
+        voice.install()
+        self.addCleanup(voice.restore)
+        # No legacy fallback exists once the host speaks Sendspin; the
+        # resolution failure must surface as a warning instead of stopping.
+        warnings = self.core._blind_stop_voice_core_selectors(
+            ["voice_core:native:kitchen"],
+        )
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("satellite offline", warnings[0])
+
+    def test_set_target_volume_uses_live_sendspin_streams(self):
+        voice = FakeTaterVoice()
+        voice.install()
+        self.addCleanup(voice.restore)
+        self.seed_playing(
+            [
+                {
+                    "session_id": "music-stream-1",
+                    "selectors": ["voice_core:native:kitchen"],
+                    "target": "voice_core:native:kitchen",
+                    "transport": "sendspin",
+                }
+            ]
+        )
+        player = self.core._player(self.redis, "person_lee")
+        result = self.core._set_target_volume(player, 80)
+        self.assertEqual(voice.volumes, [("music-stream-1", {"voice_core:native:kitchen": 80})])
+        self.assertEqual(result["sent_count"], 1)
+        self.assertEqual(result["warnings"], [])
+
+    def test_set_target_volume_warns_for_rows_that_predate_sendspin(self):
+        voice = FakeTaterVoice()
+        voice.install()
+        self.addCleanup(voice.restore)
+        self.seed_playing(
+            [
+                {
+                    "session_id": "stale-session",
+                    "selectors": ["voice_core:native:kitchen"],
+                    "target": "voice_core:native:kitchen",
+                    "transport": "",
+                }
+            ]
+        )
+        player = self.core._player(self.redis, "person_lee")
+        result = self.core._set_target_volume(player, 80)
+        self.assertEqual(voice.volumes, [])
+        self.assertEqual(result["sent_count"], 0)
+        self.assertTrue(
+            any("predates Sendspin" in warning for warning in result["warnings"]),
+            result["warnings"],
+        )
+
+    def test_seek_support_resolves_sendspin_targets(self):
+        voice = FakeTaterVoice()
+        voice.install()
+        self.addCleanup(voice.restore)
+        self.core._require_native_seek_support(["voice_core:native:kitchen"])
+        self.assertIn(("resolve", ["voice_core:native:kitchen"]), voice.calls)
+
+    def test_seek_support_reports_a_failed_sendspin_resolution(self):
+        voice = FakeTaterVoice()
+        voice.resolved_ok = False
+        voice.install()
+        self.addCleanup(voice.restore)
+        with self.assertRaises(ValueError) as raised:
+            self.core._require_native_seek_support(["voice_core:native:kitchen"])
+        self.assertIn("satellite offline", str(raised.exception))
+
+    def test_reconcile_ignores_sendspin_sessions(self):
+        # Sendspin sessions are host-managed; there is no per-satellite
+        # media_session row to compare against, so a snapshot that would flag
+        # every legacy session must not be consulted at all.
+        voice = FakeTaterVoice()
+        voice.install()
+        self.addCleanup(voice.restore)
+
+        def explode():
+            raise RuntimeError("snapshot must not be consulted for Sendspin sessions")
+
+        self.seed_playing(
+            [
+                {
+                    "session_id": "music-stream-1",
+                    "selectors": ["voice_core:native:kitchen"],
+                    "target": "voice_core:native:kitchen",
+                    "transport": "sendspin",
+                }
+            ]
+        )
+        voice.native.status_snapshot_sync = explode
+        self.core._reconcile_native_playback(
+            self.core._player(self.redis, "person_lee"), self.redis, "person_lee"
+        )
+        self.assertEqual(self.core._player(self.redis, "person_lee")["status"], "playing")
+
+    def seed_playing(self, sessions):
+        tracks = [_track_row(1, "Jamming"), _track_row(2, "Exodus")]
+        player = {
+            "person_id": "person_lee",
+            "status": "playing",
+            "provider": "emby",
+            "queue": tracks,
+            "queue_original": list(tracks),
+            "index": 0,
+            "current": dict(tracks[0]),
+            "targets": ["voice_core:native:kitchen"],
+            "target": "voice_core:native:kitchen",
+            "volume_percent": 60,
+            "playback_result": {"ok": True, "voice_core_sessions": sessions},
+        }
+        self.core._register_queue("person_lee", self.redis)
+        self.core._save_player(player, self.redis, "person_lee")
+
+
 if __name__ == "__main__":
     unittest.main()
