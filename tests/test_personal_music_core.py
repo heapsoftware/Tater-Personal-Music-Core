@@ -9189,7 +9189,11 @@ class FakeTaterVoice:
         self.calls = []
         self.volumes = []
         self.stopped_selectors = []
+        self.stop_reasons = []
         self.resolved_ok = True
+        # stream_id -> outcome row, served by the fake stream_outcomes query.
+        self.outcomes = {}
+        self.outcomes_queries = []
         self.native = self._native(sendspin)
         self.stereo_pairs = self._stereo_pairs()
         self.sendspin = self._sendspin() if sendspin else None
@@ -9230,16 +9234,24 @@ class FakeTaterVoice:
         module = types.ModuleType("tater_voice.sendspin_playback")
         stopped = self
 
-        async def stop_live_streams_for_targets(selectors):
+        # v1.3.1 signature: the reason kwarg tags intended stops on the
+        # recorded outcome.
+        async def stop_live_streams_for_targets(selectors, *, reason="stopped"):
             targets = [selector for selector in selectors if selector]
             stopped.stopped_selectors.extend(targets)
+            stopped.stop_reasons.append(reason)
             return {"ok": True, "stopped_count": len(targets), "stream_ids": []}
+
+        async def stream_outcomes(stream_ids, *, since_unix_ms=0):
+            self.outcomes_queries.append((list(stream_ids), since_unix_ms))
+            return {"ok": True, "outcomes": dict(self.outcomes)}
 
         async def set_live_stream_volumes(stream_id, volume_percent):
             self.volumes.append((stream_id, dict(volume_percent)))
             return {"ok": True, "stream_id": stream_id, "volume_percent": dict(volume_percent)}
 
         module.stop_live_streams_for_targets = stop_live_streams_for_targets
+        module.stream_outcomes = stream_outcomes
         module.set_live_stream_volumes = set_live_stream_volumes
         return module
 
@@ -9312,19 +9324,53 @@ class SendspinHostTests(unittest.TestCase):
         else:
             sys.modules["media_playback"] = self._media_original
 
-    def stub_media_playback(self, capture, *, with_kwarg=True, extra_module=None):
+    def stub_media_playback(
+        self,
+        capture,
+        *,
+        extra_module=None,
+        with_artwork=False,
+    ):
         media_playback = types.ModuleType("media_playback")
 
-        # Declare the kwarg so _supports_shared_group_source's signature probe
-        # passes through the stub the way it does against v1.2.7+ hosts. Bind
-        # it back into the recorded kwargs, or the named parameter swallows it.
-        def play_media_url_targets(targets, source_url, *, shared_group_source=False, **kwargs):
-            kwargs = dict(kwargs, shared_group_source=shared_group_source)
-            capture.append((list(targets), source_url, kwargs))
+        def respond(targets):
             row = {"ok": True, "sent_count": len(targets), "voice_core_sessions": []}
             if extra_module:
                 row.update(extra_module)
             return row
+
+        # Declare the kwargs the probed host generation would have, and bind
+        # the named parameters back into the recorded kwargs, or the stub
+        # silently swallows them. The without-artwork variant has the v1.3.0
+        # signature: if the core sent artwork kwargs there anyway, the call
+        # itself raises instead of failing the assertion indirectly.
+        if with_artwork:
+
+            def play_media_url_targets(
+                targets,
+                source_url,
+                *,
+                shared_group_source=False,
+                artwork_bytes=None,
+                artwork_content_type="",
+                **kwargs,
+            ):
+                kwargs = dict(
+                    kwargs,
+                    shared_group_source=shared_group_source,
+                    artwork_bytes=artwork_bytes,
+                    artwork_content_type=artwork_content_type,
+                )
+                capture.append((list(targets), source_url, kwargs))
+                return respond(list(targets))
+        else:
+
+            def play_media_url_targets(
+                targets, source_url, *, shared_group_source=False, **kwargs
+            ):
+                kwargs = dict(kwargs, shared_group_source=shared_group_source)
+                capture.append((list(targets), source_url, kwargs))
+                return respond(list(targets))
 
         media_playback.play_media_url_targets = play_media_url_targets
         self._media_original = sys.modules.get("media_playback")
@@ -9478,8 +9524,11 @@ class SendspinHostTests(unittest.TestCase):
         )
         self.assertEqual(self.core._player(self.redis, "person_lee")["status"], "playing")
 
-    def seed_playing(self, sessions):
+    def seed_playing(
+        self, sessions, *, started_at=0.0, playback_result_extra=None, targets=None
+    ):
         tracks = [_track_row(1, "Jamming"), _track_row(2, "Exodus")]
+        targets = list(targets or ["voice_core:native:kitchen"])
         player = {
             "person_id": "person_lee",
             "status": "playing",
@@ -9488,13 +9537,270 @@ class SendspinHostTests(unittest.TestCase):
             "queue_original": list(tracks),
             "index": 0,
             "current": dict(tracks[0]),
-            "targets": ["voice_core:native:kitchen"],
-            "target": "voice_core:native:kitchen",
+            "targets": targets,
+            "target": targets[0] if targets else "voice_core:native:kitchen",
             "volume_percent": 60,
+            "started_at": started_at,
+            "position_offset_seconds": 0.0,
+            "duration_seconds": 180.0,
             "playback_result": {"ok": True, "voice_core_sessions": sessions},
         }
+        if playback_result_extra:
+            player["playback_result"].update(playback_result_extra)
         self.core._register_queue("person_lee", self.redis)
         self.core._save_player(player, self.redis, "person_lee")
+
+    def stub_track_artwork(self, body=b"jpeg-bytes", content_type="image/jpeg"):
+        original = self.core._fetch_track_artwork
+        self.core._fetch_track_artwork = lambda track, client=None, person_id="": {
+            "body": body,
+            "content_type": content_type,
+        }
+        self.addCleanup(setattr, self.core, "_fetch_track_artwork", original)
+
+    def test_play_track_passes_artwork_to_the_sendspin_timeline(self):
+        capture = []
+        voice = FakeTaterVoice()
+        voice.install()
+        self.addCleanup(voice.restore)
+        self.stub_media_playback(capture, with_artwork=True)
+        self.stub_track_artwork()
+
+        result = self.play(["voice_core:native:kitchen"])
+        self.assertTrue(result["ok"], result)
+        _targets, _source_url, kwargs = capture[-1]
+        self.assertEqual(kwargs.get("artwork_bytes"), b"jpeg-bytes")
+        self.assertEqual(kwargs.get("artwork_content_type"), "image/jpeg")
+
+    def test_play_track_without_artwork_support_skips_the_fetch(self):
+        capture = []
+        voice = FakeTaterVoice()
+        voice.install()
+        self.addCleanup(voice.restore)
+        self.stub_media_playback(capture, with_artwork=False)
+        self.stub_track_artwork()
+
+        result = self.play(["voice_core:native:kitchen"])
+        self.assertTrue(result["ok"], result)
+        _targets, _source_url, kwargs = capture[-1]
+        self.assertNotIn("artwork_bytes", kwargs)
+        self.assertNotIn("artwork_content_type", kwargs)
+
+    def test_play_track_survives_a_failed_artwork_fetch(self):
+        capture = []
+        voice = FakeTaterVoice()
+        voice.install()
+        self.addCleanup(voice.restore)
+        self.stub_media_playback(capture, with_artwork=True)
+        original = self.core._fetch_track_artwork
+
+        def failing(track, client=None, person_id=""):
+            raise RuntimeError("offline provider")
+
+        self.core._fetch_track_artwork = failing
+        self.addCleanup(setattr, self.core, "_fetch_track_artwork", original)
+
+        result = self.play(["voice_core:native:kitchen"])
+        self.assertTrue(result["ok"], result)
+        _targets, _source_url, kwargs = capture[-1]
+        # A failed fetch never blocks playback; artwork is just absent.
+        self.assertIsNone(kwargs.get("artwork_bytes"))
+
+    def test_reconcile_skips_failed_source_stream_and_counts_strikes(self):
+        capture = []
+        voice = FakeTaterVoice()
+        voice.outcomes = {
+            "music-stream-1": {
+                "status": "failed",
+                "error_kind": "source",
+                "error": "ffmpeg exited with status 1 (Invalid data found)",
+                "start_unix_ms": 1000,
+            }
+        }
+        voice.install()
+        self.addCleanup(voice.restore)
+        self.stub_media_playback(capture)
+        self.seed_playing(
+            [
+                {
+                    "session_id": "music-stream-1",
+                    "selectors": ["voice_core:native:kitchen"],
+                    "target": "voice_core:native:kitchen",
+                    "transport": "sendspin",
+                    "start_unix_ms": 1000,
+                }
+            ],
+            started_at=time.time() - 5.0,
+        )
+
+        player = self.core._reconcile_native_playback(
+            self.core._player(self.redis, "person_lee"), self.redis, "person_lee"
+        )
+        # The stream outcome was queried by stream id with the row's start.
+        self.assertEqual(voice.outcomes_queries, [(["music-stream-1"], 1000)])
+        self.assertEqual(player["index"], 1)
+        self.assertEqual(player["consecutive_source_failures"], 1)
+        self.assertEqual(player["status"], "playing")
+        self.assertTrue(
+            any("Skipped Jamming" in warning for warning in player["warnings"]),
+            player["warnings"],
+        )
+
+    def test_reconcile_circuit_breaker_parks_after_three_source_failures(self):
+        capture = []
+        voice = FakeTaterVoice()
+        voice.outcomes = {
+            "music-stream-1": {"status": "failed", "error_kind": "source", "error": "bad rip"}
+        }
+        voice.install()
+        self.addCleanup(voice.restore)
+        self.stub_media_playback(capture)
+        self.seed_playing(
+            [
+                {
+                    "session_id": "music-stream-1",
+                    "selectors": ["voice_core:native:kitchen"],
+                    "target": "voice_core:native:kitchen",
+                    "transport": "sendspin",
+                }
+            ],
+        )
+        player_row = self.core._player(self.redis, "person_lee")
+        player_row["consecutive_source_failures"] = 2
+        self.core._save_player(player_row, self.redis, "person_lee")
+
+        player = self.core._reconcile_native_playback(
+            self.core._player(self.redis, "person_lee"), self.redis, "person_lee"
+        )
+        self.assertEqual(player["status"], "error")
+        self.assertIn(
+            "Music stopped after 3 consecutive source failures", player["last_error"]
+        )
+        self.assertIn("bad rip", player["last_error"])
+
+    def test_reconcile_parks_transport_failure_without_skipping(self):
+        voice = FakeTaterVoice()
+        voice.outcomes = {
+            "music-stream-1": {
+                "status": "failed",
+                "error_kind": "transport",
+                "error": "the satellite closed its Sendspin connection",
+            }
+        }
+        voice.install()
+        self.addCleanup(voice.restore)
+        self.seed_playing(
+            [
+                {
+                    "session_id": "music-stream-1",
+                    "selectors": ["voice_core:native:kitchen"],
+                    "target": "voice_core:native:kitchen",
+                    "transport": "sendspin",
+                }
+            ],
+        )
+        player = self.core._reconcile_native_playback(
+            self.core._player(self.redis, "person_lee"), self.redis, "person_lee"
+        )
+        # A speaker/network problem is not a bad track: no skip, park now.
+        self.assertEqual(player["status"], "error")
+        self.assertIn("Playback failed on", player["last_error"])
+        self.assertNotIn("consecutive_source_failures", player)
+
+    def test_reconcile_keeps_playing_when_only_some_targets_failed(self):
+        voice = FakeTaterVoice()
+        voice.outcomes = {
+            "music-stream-1": {
+                "status": "failed",
+                "error_kind": "transport",
+                "error": "one satellite dropped",
+            }
+        }
+        voice.install()
+        self.addCleanup(voice.restore)
+        self.seed_playing(
+            [
+                {
+                    "session_id": "music-stream-1",
+                    "selectors": ["voice_core:native:kitchen"],
+                    "target": "voice_core:native:kitchen",
+                    "transport": "sendspin",
+                },
+                # A second tracked target survived the failure: not every
+                # dispatched target failed, so the queue keeps playing.
+                {
+                    "session_id": "music-stream-2",
+                    "selectors": ["voice_core:native:office"],
+                    "target": "voice_core:native:office",
+                    "transport": "sendspin",
+                },
+            ],
+            targets=["voice_core:native:kitchen", "voice_core:native:office"],
+            playback_result_extra={
+                "sent_count": 2,
+                "voice_core_sent_count": 2,
+            },
+        )
+        player = self.core._reconcile_native_playback(
+            self.core._player(self.redis, "person_lee"), self.redis, "person_lee"
+        )
+        self.assertEqual(player["status"], "playing")
+        self.assertTrue(
+            any("Playback failed on" in warning for warning in player["warnings"]),
+            player["warnings"],
+        )
+
+    def test_reconcile_resets_source_failures_after_a_stable_track(self):
+        voice = FakeTaterVoice()
+        voice.outcomes = {}
+        voice.install()
+        self.addCleanup(voice.restore)
+        self.seed_playing(
+            [
+                {
+                    "session_id": "music-stream-1",
+                    "selectors": ["voice_core:native:kitchen"],
+                    "target": "voice_core:native:kitchen",
+                    "transport": "sendspin",
+                    "start_unix_ms": 1000,
+                }
+            ],
+            started_at=time.time() - 30.0,
+        )
+        player_row = self.core._player(self.redis, "person_lee")
+        player_row["consecutive_source_failures"] = 1
+        self.core._save_player(player_row, self.redis, "person_lee")
+
+        player = self.core._reconcile_native_playback(
+            self.core._player(self.redis, "person_lee"), self.redis, "person_lee"
+        )
+        self.assertEqual(player["consecutive_source_failures"], 0)
+        self.assertEqual(player["status"], "playing")
+
+    def test_reconcile_keeps_the_breaker_on_v130_hosts_without_outcomes(self):
+        # A v1.3.0 host has no stream_outcomes: no data, no guesses, no resets.
+        voice = FakeTaterVoice()
+        voice.install()
+        self.addCleanup(voice.restore)
+        self.seed_playing(
+            [
+                {
+                    "session_id": "music-stream-1",
+                    "selectors": ["voice_core:native:kitchen"],
+                    "target": "voice_core:native:kitchen",
+                    "transport": "sendspin",
+                }
+            ],
+        )
+        player_row = self.core._player(self.redis, "person_lee")
+        player_row["consecutive_source_failures"] = 1
+        self.core._save_player(player_row, self.redis, "person_lee")
+
+        player = self.core._reconcile_native_playback(
+            self.core._player(self.redis, "person_lee"), self.redis, "person_lee"
+        )
+        self.assertEqual(player["consecutive_source_failures"], 1)
+        self.assertEqual(player["status"], "playing")
 
 
 if __name__ == "__main__":
