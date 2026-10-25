@@ -54,8 +54,13 @@ try:
 except Exception:  # pragma: no cover - compatibility with older Tater runtimes.
     _get_primary_llm_client_from_env = get_llm_client_from_env
 
+try:
+    from helpers import llm_structured_chat as _llm_structured_chat
+except Exception:  # pragma: no cover - compatibility with Tater hosts before v1.7.0.
+    _llm_structured_chat = None
 
-__version__ = "3.18.0"
+
+__version__ = "3.19.0"
 MIN_TATER_VERSION = "1.2.0"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby, Jellyfin, Subsonic, or Plex account or "
@@ -7982,19 +7987,39 @@ def _music_llm_json(
     llm_client: Any,
     system_prompt: str,
     payload: Dict[str, Any],
+    *,
+    native_system_prompt: str,
+    schema: Dict[str, Any],
+    function_name: str,
 ) -> Dict[str, Any]:
     if llm_client is None:
         raise RuntimeError("No primary LLM is configured for Tater.")
-    response = loop.run_until_complete(
-        llm_client.chat(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-            ],
-            max_tokens=None,
-            temperature=0.4,
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+    ]
+    if _llm_structured_chat is not None:
+        # Tater hosts with the shared structured-chat helper use the provider's
+        # native tool calling and fall back to the legacy JSON prompt internally.
+        response = loop.run_until_complete(
+            _llm_structured_chat(
+                llm_client,
+                messages=messages,
+                native_system_prompt=native_system_prompt,
+                schema=schema,
+                function_name=function_name,
+                max_tokens=None,
+                temperature=0.4,
+            )
         )
-    )
+    else:  # pragma: no cover - fallback for Tater hosts before v1.7.0.
+        response = loop.run_until_complete(
+            llm_client.chat(
+                messages=messages,
+                max_tokens=None,
+                temperature=0.4,
+            )
+        )
     raw = _text(((response or {}).get("message") or {}).get("content"))
     blob = extract_json(raw) or raw
     try:
@@ -8086,6 +8111,22 @@ def _generate_music_prompt_profile_impl(
             "genre_counts": [{"name": name, "plays": count} for name, count in genres],
             "recent_tracks": recent_tracks,
         },
+        native_system_prompt=(
+            "Build a compact factual music-taste profile for the supplied person using only the listening counts "
+            "and recent tracks. Use only supplied artist and genre names, keep the summary to one short sentence, "
+            "and do not infer demographic, emotional, medical, political, or other sensitive traits."
+        ),
+        schema={
+            "type": "object",
+            "properties": {
+                "taste_summary": {"type": "string"},
+                "favorite_artists": {"type": "array", "items": {"type": "string"}},
+                "favorite_genres": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["taste_summary", "favorite_artists", "favorite_genres"],
+            "additionalProperties": False,
+        },
+        function_name="submit_music_taste_profile",
     )
     allowed_artists = {name.casefold(): name for name, _count in artists}
     allowed_genres = {name.casefold(): name for name, _count in genres}
@@ -8434,6 +8475,47 @@ def _generate_recommendations_impl(
             "recent_listening": recent,
             "catalog_candidates": candidates,
         },
+        native_system_prompt=(
+            f"Act as {assistant_name}, a warm and imaginative personal music curator. Build up to {playlist_count} "
+            f"named playlists with at most {item_count} unique selections each. Choose only exact supplied candidate "
+            "IDs, balance familiar taste with useful discovery, vary artists and albums, and give each playlist and "
+            "selection a concise explanation."
+        ),
+        schema={
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string"},
+                "playlists": {
+                    "type": "array",
+                    "maxItems": playlist_count,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "description": {"type": "string"},
+                            "items": {
+                                "type": "array",
+                                "maxItems": item_count,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "candidate_id": {"type": "string"},
+                                        "reason": {"type": "string"},
+                                    },
+                                    "required": ["candidate_id", "reason"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                        },
+                        "required": ["name", "description", "items"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["summary", "playlists"],
+            "additionalProperties": False,
+        },
+        function_name="submit_curated_playlists",
     )
 
     playlists: List[Dict[str, Any]] = []
@@ -9609,6 +9691,31 @@ def _select_continuation_tracks(
             "recent_listening": history,
             "catalog_candidates": candidates,
         },
+        native_system_prompt=(
+            "Program a smooth continuous-radio sequence from only the supplied catalog track IDs. Treat the "
+            "currently playing song as the strongest signal and use artist, genre, album, era, nearby queue, and "
+            "secondarily listening history to preserve direction. Avoid abrupt changes and unnecessary repeats, and "
+            "give the station a short creative name."
+        ),
+        schema={
+            "type": "object",
+            "properties": {
+                "station_name": {"type": "string"},
+                "items": {
+                    "type": "array",
+                    "maxItems": CONTINUATION_BATCH_TRACKS,
+                    "items": {
+                        "type": "object",
+                        "properties": {"track_id": {"type": "string"}},
+                        "required": ["track_id"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["station_name", "items"],
+            "additionalProperties": False,
+        },
+        function_name="submit_radio_sequence",
     )
     selections: List[Dict[str, Any]] = []
     seen = set()

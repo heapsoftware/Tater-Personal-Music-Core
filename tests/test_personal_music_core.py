@@ -147,6 +147,100 @@ class CustomMusicCoreTests(unittest.TestCase):
         for tool_id in ids:
             self.assertNotIn("tater_tube", tool_id)
 
+    # ---- LLM dispatch: structured tool calling with a legacy fallback ----
+
+    def test_music_llm_json_uses_structured_chat_when_helper_present(self):
+        core = self.core
+
+        calls = []
+
+        async def fake_structured_chat(
+            llm_client, *, messages, native_system_prompt, schema, function_name, **kwargs
+        ):
+            calls.append(
+                {
+                    "llm_client": llm_client,
+                    "messages": messages,
+                    "native_system_prompt": native_system_prompt,
+                    "schema": schema,
+                    "function_name": function_name,
+                    "kwargs": kwargs,
+                }
+            )
+            return {
+                "message": {
+                    "content": json.dumps(
+                        {"taste_summary": "short", "favorite_artists": [], "favorite_genres": []}
+                    )
+                }
+            }
+
+        client = object()
+        original = core._llm_structured_chat
+        core._llm_structured_chat = fake_structured_chat
+        try:
+            loop = asyncio.new_event_loop()
+            try:
+                result = core._music_llm_json(
+                    loop,
+                    client,
+                    "legacy system prompt",
+                    {"payload": 1},
+                    native_system_prompt="native prompt",
+                    schema={"type": "object"},
+                    function_name="submit_music_taste_profile",
+                )
+            finally:
+                loop.close()
+        finally:
+            core._llm_structured_chat = original
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
+        self.assertIs(call["llm_client"], client)
+        self.assertEqual(call["function_name"], "submit_music_taste_profile")
+        self.assertEqual(call["native_system_prompt"], "native prompt")
+        self.assertEqual(call["schema"], {"type": "object"})
+        self.assertEqual(call["kwargs"], {"max_tokens": None, "temperature": 0.4})
+        self.assertEqual(call["messages"][0], {"role": "system", "content": "legacy system prompt"})
+        self.assertIn('"payload": 1', call["messages"][1]["content"])
+        self.assertEqual(result["taste_summary"], "short")
+
+    def test_music_llm_json_falls_back_to_plain_chat_without_helper(self):
+        core = self.core
+
+        class FakeLLM:
+            def __init__(self):
+                self.calls = []
+
+            async def chat(self, *, messages, **kwargs):
+                self.calls.append((messages, kwargs))
+                return {"message": {"content": json.dumps({"ok": True})}}
+
+        client = FakeLLM()
+        original = core._llm_structured_chat
+        core._llm_structured_chat = None
+        try:
+            loop = asyncio.new_event_loop()
+            try:
+                result = core._music_llm_json(
+                    loop,
+                    client,
+                    "legacy system prompt",
+                    {"payload": 1},
+                    native_system_prompt="ignored on older hosts",
+                    schema={"type": "object"},
+                    function_name="submit_radio_sequence",
+                )
+            finally:
+                loop.close()
+        finally:
+            core._llm_structured_chat = original
+        self.assertEqual(len(client.calls), 1)
+        messages, kwargs = client.calls[0]
+        self.assertEqual(messages[0], {"role": "system", "content": "legacy system prompt"})
+        self.assertEqual(kwargs, {"max_tokens": None, "temperature": 0.4})
+        self.assertEqual(result, {"ok": True})
+
     # ---- provider id + track normalization ----
 
     def test_provider_id_normalization(self):
