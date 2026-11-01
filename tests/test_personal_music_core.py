@@ -406,6 +406,75 @@ class CustomMusicCoreTests(unittest.TestCase):
         finally:
             self.core._provider = original_provider
 
+    def test_folder_names_act_as_genres_and_search_terms(self):
+        # "Play my Christmas music" must match the library's Christmas folder
+        # even when the files inside carry unrelated tags (Oldies, Pop…):
+        # folder names count as genres and as query haystack, while junk path
+        # segments never match anything.
+        core = self.core
+        seeded = [
+            {
+                **_track_row(1, "Blue Christmas"),
+                "genres": core._genres(["Classic Rock", "Rock"]),
+                "genre": "Classic Rock, Rock",
+                "album": "",
+                "path": "/usb/alex/Music/Christmas/Elvis - Blue Christmas.mp3",
+            },
+            {
+                **_track_row(2, "4 Carats"),
+                "genres": core._genres(["Pop"]),
+                "genre": "Pop",
+                "album": "",
+                "path": "/usb/alex/Music/Christmas/Kelly - 4 Carats.mp3",
+            },
+            {
+                **_track_row(3, "In The Zone"),
+                "genres": core._genres(["Pop"]),
+                "genre": "Pop",
+                "album": "",
+                "path": "/usb/alex/Music/Pop/Britney - In The Zone.mp3",
+            },
+            {
+                **_track_row(4, "Winter Wonderland"),
+                "genres": core._genres(["Jazz"]),
+                "genre": "Jazz",
+                "album": "",
+                "path": "/usb/alex/Music/Christmas/Song - Winter Wonderland.mp3",
+            },
+        ]
+        core._save_json(
+            core.redis_client,
+            core.CATALOG_KEY,
+            {
+                "provider": "emby",
+                "tracks": seeded,
+                "playlists": [],
+                "synced_at": time.time(),
+            },
+        )
+        filters = {"query": "Christmas music", "genre": "Christmas"}
+        # No track is genre-tagged Christmas: before this change the search
+        # found nothing. The folder name carries the genre instead.
+        self.assertEqual(
+            [hit["title"] for hit in core._search_tracks(**filters)],
+            ["4 Carats", "Blue Christmas", "Winter Wonderland"],
+        )
+        # …and folder-name matches rank below real genre-tag matches.
+        genre_score_tag = core._score_track(seeded[2], {"genre": "pop"})  # Pop tag
+        genre_score_folder = core._score_track(seeded[3], {"genre": "Christmas"})  # Jazz tag, folder name
+        self.assertEqual(genre_score_tag, 60)
+        self.assertEqual(genre_score_folder, 30)
+        # A folder word also arrives via the free-text query.
+        self.assertIn(
+            "In The Zone",
+            [hit["title"] for hit in core._search_tracks(query="pop")],
+        )
+        # Junk path segments never become search terms.
+        self.assertEqual(
+            [hit["title"] for hit in core._search_tracks(query="usb")],
+            [],
+        )
+
     def test_emby_library_folder_scopes_the_catalog(self):
         # A mixed-content library ("John Media": music + TV + movies) scoped to
         # its Music subfolder by name; the song pages query the folder id.

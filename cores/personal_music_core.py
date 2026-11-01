@@ -60,7 +60,7 @@ except Exception:  # pragma: no cover - compatibility with Tater hosts before v1
     _llm_structured_chat = None
 
 
-__version__ = "3.19.1"
+__version__ = "3.20.0"
 MIN_TATER_VERSION = "1.2.0"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby, Jellyfin, Subsonic, or Plex account or "
@@ -6050,6 +6050,54 @@ def _clean_query_tokens(value: Any) -> List[str]:
     return tokens
 
 
+# Path ingredients that can never be a useful search word ("storage", the
+# mount point, the Person's home folder…). Excluded from folder-name matching
+# so library layout alone cannot match a query.
+GENERIC_FOLDER_WORDS = {
+    "audio",
+    "files",
+    "home",
+    "media",
+    "mnt",
+    "music",
+    "opt",
+    "root",
+    "srv",
+    "storage",
+    "tmp",
+    "usr",
+    "var",
+}
+
+
+def _track_folder_names(track: Dict[str, Any]) -> List[str]:
+    """Directory names the track file sits in, deepest three, junk paths out.
+
+    A library folder is how People actually categorize music ("Play my
+    Christmas music" means the Christmas folder) even when the files inside
+    carry unrelated tags — so the folder name participates in every search.
+    """
+    path = _text(track.get("path"))
+    if not path:
+        return []
+    segments = [
+        segment
+        for segment in path.replace("\\", "/").split("/")
+        if segment and ":" not in segment
+    ]
+    directories = segments[:-1] if len(segments) > 1 else segments
+    picked = [
+        segment.casefold()
+        for segment in directories[-3:]
+        if segment.casefold() not in GENERIC_FOLDER_WORDS
+    ]
+    return picked
+
+
+def _track_folder_haystack(track: Dict[str, Any]) -> str:
+    return " ".join(_track_folder_names(track))
+
+
 def _track_haystack(track: Dict[str, Any]) -> str:
     return " ".join(
         [
@@ -6059,6 +6107,7 @@ def _track_haystack(track: Dict[str, Any]) -> str:
             _text(track.get("album")),
             _text(track.get("genre")),
             _text(track.get("year")),
+            _track_folder_haystack(track),
         ]
     ).casefold()
 
@@ -6073,8 +6122,16 @@ def _matches_filter(track: Dict[str, Any], key: str, value: Any) -> bool:
             _text(item).casefold()
             for item in _genres(track.get("genres"), track.get("genre"))
         }
-        return bool(wanted_values & values) or any(
+        if bool(wanted_values & values) or any(
             wanted in item for item in values
+        ):
+            return True
+        # The genre filter also matches folder names: tracks inside a library
+        # folder named "Christmas" are Christmas music to the Person who built
+        # that folder, no matter what genre their file tags carry.
+        folders = _track_folder_names(track)
+        return bool(wanted_values & set(folders)) or any(
+            wanted in item for item in folders
         )
     if key == "artist":
         value = f"{_text(track.get('artist'))} {_text(track.get('album_artist'))}".casefold()
@@ -6100,6 +6157,10 @@ def _score_track(track: Dict[str, Any], filters: Dict[str, Any]) -> int:
         if wanted in values:
             score += weight
         elif any(wanted in item for item in values):
+            score += max(1, weight // 2)
+        # A genre that names the folder the track lives in ranks like a partial
+        # genre-tag match: real tagged genres keep outranking folder matches.
+        elif key == "genre" and wanted in _track_folder_haystack(track):
             score += max(1, weight // 2)
     query_tokens = _clean_query_tokens(filters.get("query"))
     haystack = _track_haystack(track)
@@ -12775,7 +12836,9 @@ def get_hydra_kernel_tools(*, platform: str = "", **_kwargs) -> List[Dict[str, A
             "id": "personal_music_play",
             "description": (
                 "Use when the user asks to play music from their personal Emby or network-share library by "
-                "song, artist, album, genre, or description. For requests like \"play my music\" or \"some of my "
+                "song, artist, album, genre, or description. Folder names in the library also "
+                "work as genres — \"play my Christmas music\" passes genre:\"Christmas\" even when "
+                "the files there are tagged Oldies, Pop, or Rock. For requests like \"play my music\" or \"some of my "
                 "music\" that name no artist, album, song, or genre, leave query empty and pass shuffle:true — "
                 "the tool then shuffles the speaker's whole library. Never echo the user's phrasing "
                 "(\"my music\", \"personal music\") into query. Put user-named rooms in rooms, specific "
