@@ -6,3 +6,6 @@
 
 # Local-only working docs (never commit or push)
 /docs/specs/
+
+# Personal tests with real household fixtures — never commit or push
+/tests/local/

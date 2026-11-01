@@ -1,6 +1,6 @@
 # Sendspin playback start waits ~15s for eight clock exchanges that converge in 0.3s
 
-Observed on the live host (v1.9.3) against a firmware v4.0.0 Tater Echo microcontroller
+Observed on the live host (v1.9.3) against a firmware v4.0.0 Tater Echo biscuit
 (Go firmware, noise-capable). Measured 2026-10-31 by driving the host's own
 `sendspin_playback._SendspinPeer` exactly as `play_media_url_targets` does, from
 inside the container:
