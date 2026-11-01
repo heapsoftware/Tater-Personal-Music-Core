@@ -3152,7 +3152,7 @@ class MultiQueueTests(unittest.TestCase):
 
     def test_stop_reply_names_the_satellite_and_room_not_the_selector(self):
         # "Stop the music" replies in speech must name the device ("Tater
-        # Biscuit") and its room ("Kitchen") from Tater's live satellite
+        # Crumb") and its room ("Kitchen") from Tater's live satellite
         # registry — never the raw selector Tater's reply LLM would garble.
         core = self.core
         self.stub_playback()
