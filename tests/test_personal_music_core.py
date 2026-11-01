@@ -3035,10 +3035,11 @@ class MultiQueueTests(unittest.TestCase):
             self.origin_for("person_a"),
             self.redis,
         )
-        # Detailed stays the historical, unmodified wording.
+        # Detailed replies now use the friendly speaker label too — raw
+        # selectors are never handed to Tater's reply LLM.
         self.assertEqual(
             result["summary_for_user"],
-            "Playing Requested Song by Bob Marley on voice_core:native:kitchen. The queue has 1 track, "
+            "Playing Requested Song by Bob Marley on the speaker. The queue has 1 track, "
             "and continuous radio will keep it playing.",
         )
 
@@ -3066,12 +3067,13 @@ class MultiQueueTests(unittest.TestCase):
             core._target_options = self._originals["_target_options"]
         self.assertEqual(result["summary_for_user"], "Playing Requested Song by Bob Marley on Kitchen speaker.")
 
-    def test_short_reply_falls_back_to_the_selector_without_labels(self):
+    def test_short_reply_falls_back_to_a_neutral_phrase_without_labels(self):
         core = self.core
         self.stub_playback()
         self.stub_play_request(["voice_core:native:kitchen"])
         self.seed_voice_reply_mode("person_a", "short")
-        # No target options resolvable: the selector stands in as the label.
+        # Nothing resolvable (no registry row, no picker labels): the summary
+        # stays speakable instead of leaking the selector.
         self._originals["_target_options"] = core._target_options
         core._target_options = lambda *args, **kwargs: []
         try:
@@ -3084,7 +3086,7 @@ class MultiQueueTests(unittest.TestCase):
             core._target_options = self._originals["_target_options"]
         self.assertEqual(
             result["summary_for_user"],
-            "Playing Requested Song by Bob Marley on voice_core:native:kitchen.",
+            "Playing Requested Song by Bob Marley on the speaker.",
         )
 
     def test_link_save_round_trips_the_reply_mode(self):
@@ -3147,6 +3149,80 @@ class MultiQueueTests(unittest.TestCase):
             self.assertEqual(core._player(self.redis, "person_a")["status"], "playing")
         finally:
             core._preferred_room_target = self._originals["_preferred_room_target"]
+
+    def test_stop_reply_names_the_satellite_and_room_not_the_selector(self):
+        # "Stop the music" replies in speech must name the device ("Tater
+        # Biscuit") and its room ("Kitchen") from Tater's live satellite
+        # registry — never the raw selector Tater's reply LLM would garble.
+        core = self.core
+        self.stub_playback()
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"])
+        core._save_json(
+            self.redis,
+            core.SATELLITE_REGISTRY_KEY,
+            {
+                "native:ABCDEF1234567890": {
+                    "selector": "voice_core:native:kitchen",
+                    "name": "Tater Crumb",
+                    "metadata": {"room": "Kitchen"},
+                },
+            },
+        )
+        result = asyncio.run(
+            core.run_hydra_kernel_tool(
+                tool_id="personal_music_control",
+                args={"action": "stop"},
+                origin=self.origin_for("person_a", selector="native:kitchen"),
+                redis_client=self.redis,
+            )
+        )
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(
+            result["summary_for_user"],
+            "Music is stopped on Tater Crumb in the Kitchen.",
+        )
+        self.assertEqual(core._player(self.redis, "person_a")["status"], "stopped")
+
+    def test_friendly_summary_avoids_selectors_without_registry_or_options(self):
+        core = self.core
+        self.seed_playing_queue("person_a", ["voice_core:native:kitchen"])
+        # Registry row with a picker label carrying the kind prefix, room in
+        # parens and the selector: the cleaned label keeps just the name.
+        core._save_json(
+            self.redis,
+            core.SATELLITE_REGISTRY_KEY,
+            {},
+        )
+        self._originals["_target_options"] = core._target_options
+        core._target_options = lambda *args, **kwargs: [
+            {
+                "value": "voice_core:native:kitchen",
+                "label": "Tater Satellite: Tater Crumb (Kitchen • native:kitchen) • online",
+            }
+        ]
+        try:
+            self.assertEqual(
+                core._friendly_target_summary(["voice_core:native:kitchen"], self.redis),
+                "Tater Crumb",
+            )
+        finally:
+            core._target_options = self._originals["_target_options"]
+        # A room name that is already the whole name is not duplicated.
+        core._save_json(
+            self.redis,
+            core.SATELLITE_REGISTRY_KEY,
+            {
+                "native:k1": {
+                    "selector": "voice_core:native:kitchen",
+                    "name": "Kitchen",
+                    "metadata": {"room": "Kitchen"},
+                },
+            },
+        )
+        self.assertEqual(
+            core._friendly_target_summary(["voice_core:native:kitchen"], self.redis),
+            "Kitchen",
+        )
 
     # ---- clear playlist ----
 

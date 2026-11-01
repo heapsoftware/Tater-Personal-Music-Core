@@ -60,7 +60,7 @@ except Exception:  # pragma: no cover - compatibility with Tater hosts before v1
     _llm_structured_chat = None
 
 
-__version__ = "3.20.0"
+__version__ = "3.21.0"
 MIN_TATER_VERSION = "1.2.0"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby, Jellyfin, Subsonic, or Plex account or "
@@ -7221,7 +7221,7 @@ def _follow_me_move(
                     {_queue_owner_label(qid, store) for qid in conflicts["foreign_queues"]}
                 )
                 question = (
-                    f"{' and '.join(owners)} still playing on {_target_summary(wanted)}. "
+                    f"{' and '.join(owners)} still playing on {_friendly_target_summary(wanted, store)}. "
                     f"Say yes to move your music here."
                 )
                 _save_pending_confirmation(
@@ -10680,6 +10680,87 @@ def _resolve_target(
     return targets[0] if targets else ""
 
 
+SATELLITE_REGISTRY_KEY = "tater:voice:satellites:registry:v1"
+
+
+def _satellite_registry_entries(client: Any = None) -> List[Dict[str, Any]]:
+    """Tater's live satellite registry rows (read-only peek, like screen
+    profiles): the only source that knows a satellite's display name and
+    room without guessing from picker labels."""
+    store = client or globals().get("redis_client")
+    try:
+        payload = _load_json(store, SATELLITE_REGISTRY_KEY, {})
+    except Exception:
+        return []
+    rows = list(payload.values()) if isinstance(payload, dict) else payload
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _satellite_display_info(target: Any, client: Any = None) -> tuple[str, str]:
+    """(display_name, room) for a satellite target, ("", "") when unknown."""
+    wanted = _text(target).casefold()
+    if not wanted:
+        return "", ""
+    for row in _satellite_registry_entries(client):
+        if _text(row.get("selector")).casefold() != wanted:
+            continue
+        name = (
+            _text(row.get("name"))
+            or _text(row.get("device_name"))
+            or _text(row.get("friendly_name"))
+        )
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        room = ""
+        for key in ("room", "room_name", "area_name", "area"):
+            room = _text(metadata.get(key)) or _text(row.get(key))
+            if room:
+                break
+        return name, room
+    return "", ""
+
+
+def _clean_target_label(label: Any) -> str:
+    """Picker label reduced to what a person would call the device.
+
+    Strips the kind prefix ("Tater Satellite:", "AirPlay:"), the selector
+    suffix in parentheses, and online/offline status markers, so voice
+    replies can use the picker as a fallback without speaking selectors.
+    """
+    text = _text(label).strip()
+    for pattern in (
+        r"^tater\s+[^:]*:\s*",
+        r"^airplay\s*[^:]*:\s*",
+        r"^sonos\s*[^:]*:\s*",
+        r"^home assistant\s*[^:]*:\s*",
+        r"^ha\s*[^:]*:\s*",
+    ):
+        stripped = re.sub(pattern, "", text, flags=re.IGNORECASE)
+        if stripped != text:
+            text = stripped
+            break
+    for suffix in (
+        " • offline or firmware update required",
+        " • offline",
+        " • online",
+    ):
+        if text.casefold().endswith(suffix):
+            text = text[: -len(suffix)].strip()
+    # The trailing "(…) " parentheses hold room and selector details, which
+    # never speak well; the room gets appended separately from the registry.
+    text = re.sub(r"\s*\([^)]*\)\s*$", "", text).strip()
+    return text
+
+
+def _looks_like_selector(value: str) -> bool:
+    """True when a string is still a machine target token, not a name."""
+    text = _text(value).strip()
+    return bool(re.match(r"^[\w-]+(:[\w:-]+)*$", text)) and (
+        ":" in text or re.match(r"^[A-Z0-9_]{8,}$", text)
+    )
+
+
 def _target_summary(targets: Any) -> str:
     values = _list(targets)
     if not values:
@@ -10692,12 +10773,14 @@ def _target_summary(targets: Any) -> str:
     return f"{len(values)} destinations"
 
 
-def _friendly_target_summary(targets: Any) -> str:
-    """Speaker label shaped for a short spoken summary — names, not selectors.
+def _friendly_target_summary(targets: Any, client: Any = None) -> str:
+    """Speaker label shaped for speech — names and rooms, never selectors.
 
-    The detailed summary keeps the raw selector on purpose (historical wording);
-    this variant is what feeds Tater's reply LLM in "short" mode, since raw
-    tokens like voice_core:native:… are what it tends to garble.
+    Tater's reply LLM rephrases these summaries out loud and garbles raw
+    tokens like voice_core:native:SERIALX…, so every summary this function
+    builds resolves the satellite's display name ("Tater Crumb") and room
+    ("Kitchen") from the live satellite registry first, then the picker
+    label, and falls back to a neutral phrase — anything but the selector.
     """
     values = _list(targets)
     if not values:
@@ -10707,6 +10790,11 @@ def _friendly_target_summary(targets: Any) -> str:
     target = _text(values[0])
     if _is_screen_target(target):
         return _screen_target_summary_label(target.casefold()[len(SCREEN_TARGET_PREFIX) :])
+    name, room = _satellite_display_info(target, client)
+    if name and room and room.casefold() not in name.casefold():
+        return f"{name} in the {room}"
+    if name:
+        return name
     try:
         options = _target_options()
     except Exception:
@@ -10714,11 +10802,12 @@ def _friendly_target_summary(targets: Any) -> str:
     for row in options:
         if _text(row.get("value")).casefold() != target.casefold():
             continue
-        compact = _compact_target_option(dict(row))
-        label = _text(compact.get("label"))
-        if label and label != target:
+        label = _clean_target_label(_text(_compact_target_option(dict(row)).get("label")))
+        if label and not _looks_like_selector(label):
             return label
-    return target
+    # Unknown target (offline, unregistered, options unavailable): keep the
+    # reply speakable rather than leaking the selector.
+    return "the speaker"
 
 
 def _track_label(track: Dict[str, Any]) -> str:
@@ -12756,7 +12845,7 @@ def _play_request(
         )
     else:
         summary = (
-            f"Playing {track_label} on {_target_summary(targets)}. "
+            f"Playing {track_label} on {_friendly_target_summary(targets)}. "
             f"The queue has {len(player.get('queue') or [])} track"
             f"{'' if len(player.get('queue') or []) == 1 else 's'}, and continuous radio will keep it playing."
             + sleep_note
@@ -12795,14 +12884,14 @@ def _queue_conflict_prompt(
             {_queue_owner_label(qid, store) for qid in conflicts["foreign_queues"]}
         )
         question = (
-            f"{' and '.join(owners)} still playing on {_target_summary(targets)}. Take over?"
+            f"{' and '.join(owners)} still playing on {_friendly_target_summary(targets, store)}. Take over?"
         )
     else:
         pending_type = "relocate"
         own_targets = _list(conflicts.get("own_queue", {}).get("targets"))
         question = (
-            f"Your music is still playing on {_target_summary(own_targets)}. "
-            f"Say yes to move it to {_target_summary(targets)} instead, or ask me to start the new music."
+            f"Your music is still playing on {_friendly_target_summary(own_targets, store)}. "
+            f"Say yes to move it to {_friendly_target_summary(targets, store)} instead, or ask me to start the new music."
         )
     person_for_pending = _text(queue_id)
     _save_pending_confirmation(
@@ -13063,8 +13152,8 @@ def _resume_player_for_room(
             next(iter(conflicts["foreign_queues"]), queue_id), store
         )
         note = (
-            f" {_target_summary(wanted)} was still playing {foreign_label}'s music, so "
-            f"yours resumed on {_target_summary(own_targets)}."
+            f" {_friendly_target_summary(wanted, store)} was still playing {foreign_label}'s music, so "
+            f"yours resumed on {_friendly_target_summary(own_targets, store)}."
         )
         return _resume_player(person_id=queue_id, client=store), note
     if mode == "ask":
@@ -13081,9 +13170,9 @@ def _resume_player_for_room(
         )
         _speak_follow_me_prompt(
             wanted,
-            f"Your music is paused on {_target_summary(own_targets)}. Say 'resume it "
+            f"Your music is paused on {_friendly_target_summary(own_targets, store)}. Say 'resume it "
             "here' to play it in this room, or 'resume it there' to leave it on "
-            f"{_target_summary(own_targets)}.",
+            f"{_friendly_target_summary(own_targets, store)}.",
         )
         return player, ""
     # follow: hand the paused queue to the speaking room (the Transfer Resume
@@ -13199,7 +13288,7 @@ async def run_hydra_kernel_tool(
                 "status": _text(player.get("status")),
                 "now_playing": _public_track(player.get("current") or {}),
                 "summary_for_user": (
-                    f"Moved the music to {_target_summary(targets)} at the same spot in the "
+                    f"Moved the music to {_friendly_target_summary(targets, store)} at the same spot in the "
                     f"track.{delay_note}"
                 ),
             }
@@ -13236,7 +13325,8 @@ async def run_hydra_kernel_tool(
                         "status": _text(player.get("status")),
                         "now_playing": _public_track(player.get("current") or {}),
                         "summary_for_user": (
-                            f"Resumed your music on {_target_summary(_list(player.get('targets') or player.get('target')))}."
+                            f"Resumed your music on "
+                            f"{_friendly_target_summary(_list(player.get('targets') or player.get('target')), store)}."
                         ),
                     }
                 # "here" (the default): resume in the room they asked from. The
@@ -13257,7 +13347,7 @@ async def run_hydra_kernel_tool(
                     "now_playing": _public_track(player.get("current") or {}),
                     "summary_for_user": (
                         f"Music is {_text(player.get('status')) or 'idle'} on "
-                        f"{_target_summary(targets)}.{note}"
+                        f"{_friendly_target_summary(targets, store)}.{note}"
                     ),
                 }
             if choice in {"no", "cancel", "stop", "leave"}:
@@ -13298,7 +13388,7 @@ async def run_hydra_kernel_tool(
                     "status": _text(player.get("status")),
                     "now_playing": _public_track(player.get("current") or {}),
                     "summary_for_user": (
-                        f"Moved the music to {_target_summary(pending.get('targets') or [])} "
+                        f"Moved the music to {_friendly_target_summary(pending.get('targets') or [], store)} "
                         "at the same spot in the track."
                     ),
                 }
@@ -13320,7 +13410,7 @@ async def run_hydra_kernel_tool(
                     "status": _text(player.get("status")),
                     "now_playing": _public_track(player.get("current") or {}),
                     "summary_for_user": (
-                        f"Moved the music to {_target_summary(targets)} "
+                        f"Moved the music to {_friendly_target_summary(targets, store)} "
                         "at the same spot in the track."
                     ),
                 }
@@ -13474,7 +13564,7 @@ async def run_hydra_kernel_tool(
                     "now_playing": _public_track(player.get("current") or {}),
                     "queue_count": len(player.get("queue") or []),
                     "summary_for_user": (
-                        f"Sleep timer set: the music on {_target_summary(targets)} stops in "
+                        f"Sleep timer set: the music on {_friendly_target_summary(targets, store)} stops in "
                         f"{sleep_minutes} minute{'' if sleep_minutes == 1 else 's'} — endless "
                         "playback will not keep it going."
                         if sleep_minutes > 0
@@ -13504,7 +13594,7 @@ async def run_hydra_kernel_tool(
                     "smart_pool_count": len(player.get("smart_pool") or []),
                     "summary_for_user": (
                         f"Added {_as_int(add_result.get('added'), 0, 0, 100000)} tracks to "
-                        f"{_target_summary(targets)}"
+                        f"{_friendly_target_summary(targets, store)}"
                         + (
                             "; Smart Shuffle will mix them in as the queue plays."
                             if add_result.get("queued_directly") is False
@@ -13627,7 +13717,7 @@ async def run_hydra_kernel_tool(
                 "continuous_radio": bool(player.get("continuous_radio")),
                 "radio_name": _text(player.get("radio_name")),
                 "summary_for_user": (
-                    f"Music is {_text(player.get('status')) or 'idle'} on {_target_summary(targets)}."
+                    f"Music is {_text(player.get('status')) or 'idle'} on {_friendly_target_summary(targets, store)}."
                     f"{resume_note}"
                 ),
             }
@@ -13652,7 +13742,7 @@ async def run_hydra_kernel_tool(
             "radio_name": _text(player.get("radio_name")),
             "summary_for_user": (
                 f"{_track_label(player.get('current') or {})} is {_text(player.get('status'))} "
-                f"on {_target_summary(targets)}."
+                f"on {_friendly_target_summary(targets, store)}."
                 if player.get("current")
                 else "Personal Music Core is idle."
             ),
