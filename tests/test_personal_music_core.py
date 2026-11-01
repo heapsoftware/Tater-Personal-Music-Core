@@ -2817,6 +2817,74 @@ class MultiQueueTests(unittest.TestCase):
         self.assertAlmostEqual(self.played[-1]["start_position"], 40.0, delta=1.0)
         self.assertEqual(core._load_pending_confirmation(self.redis, "person_a"), {})
 
+    def test_possessive_query_falls_back_to_library_shuffle(self):
+        core = self.core
+        self.stub_playback()
+        tracks = [_track_row(3, "Reggae Nights"), _track_row(4, "Kaya")]
+        payload = {"provider": "emby", "tracks": tracks, "artists": [], "albums": [], "genres": []}
+        self._originals["_resolve_targets"] = core._resolve_targets
+        self._originals["_person_catalog"] = core._person_catalog
+        core._resolve_targets = (
+            lambda requested="", room="", origin=None, client=None, provider_id="", person_id="": [
+                "voice_core:native:kitchen"
+            ]
+        )
+        # Real _search_tracks runs against the stubbed catalog so the fallback
+        # path (possessive-only query, empty result, re-search) is exercised.
+        core._person_catalog = lambda client=None, provider_id="", person_id="": payload
+        result = core._play_request(
+            {"query": "personal music", "shuffle": True},
+            self.origin_for("person_a"),
+            self.redis,
+        )
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(result.get("queue_count"), 2)
+        self.assertTrue(core._player(self.redis, "person_a").get("shuffle"))
+
+    def test_named_query_with_no_matches_still_fails_honestly(self):
+        core = self.core
+        self.stub_playback()
+        tracks = [_track_row(3, "Reggae Nights"), _track_row(4, "Kaya")]
+        payload = {"provider": "emby", "tracks": tracks, "artists": [], "albums": [], "genres": []}
+        self._originals["_resolve_targets"] = core._resolve_targets
+        self._originals["_person_catalog"] = core._person_catalog
+        core._resolve_targets = (
+            lambda requested="", room="", origin=None, client=None, provider_id="", person_id="": [
+                "voice_core:native:kitchen"
+            ]
+        )
+        core._person_catalog = lambda client=None, provider_id="", person_id="": payload
+        with self.assertRaises(ValueError) as caught:
+            core._play_request(
+                {"query": "dark side of the moon"},
+                self.origin_for("person_a"),
+                self.redis,
+            )
+        self.assertIn("No matching music", str(caught.exception))
+
+    def test_mixed_possessive_named_query_does_not_fallback(self):
+        core = self.core
+        self.stub_playback()
+        # "my girl" keeps the real token "girl": it matches the catalog and the
+        # fallback must never widen a request that already resolved.
+        tracks = [_track_row(5, "My Girl")]
+        payload = {"provider": "emby", "tracks": tracks, "artists": [], "albums": [], "genres": []}
+        self._originals["_resolve_targets"] = core._resolve_targets
+        self._originals["_person_catalog"] = core._person_catalog
+        core._resolve_targets = (
+            lambda requested="", room="", origin=None, client=None, provider_id="", person_id="": [
+                "voice_core:native:kitchen"
+            ]
+        )
+        core._person_catalog = lambda client=None, provider_id="", person_id="": payload
+        result = core._play_request(
+            {"query": "my girl"},
+            self.origin_for("person_a"),
+            self.redis,
+        )
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(result.get("now_playing", {}).get("title"), "My Girl")
+
     def test_confirm_start_new_replaces_own_queue(self):
         core = self.core
         self.stub_playback()

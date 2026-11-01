@@ -60,7 +60,7 @@ except Exception:  # pragma: no cover - compatibility with Tater hosts before v1
     _llm_structured_chat = None
 
 
-__version__ = "3.19.0"
+__version__ = "3.19.1"
 MIN_TATER_VERSION = "1.2.0"
 CORE_DESCRIPTION = (
     "Per-person music for Tater: link each Person to their own Emby, Jellyfin, Subsonic, or Plex account or "
@@ -711,6 +711,14 @@ GENERIC_SEARCH_WORDS = {
     "songs",
     "the",
 }
+
+# Words a planner can echo back from "play some of my music"-style requests
+# instead of leaving the query empty. When a query's only surviving tokens come
+# from this set it was never a search target, so the play handler falls back to
+# a whole-library shuffle rather than failing with "no matching music". Words
+# that can appear in real titles/artists (like "my girl") still work because
+# the fallback only fires when *nothing else* remains.
+POSSESSIVE_QUERY_WORDS = {"my", "mine", "personal", "our", "your", "own"}
 
 # Broad browse/search families. Specific source tags remain visible, while a
 # track such as "Roots Reggae" is also discoverable through "Reggae".
@@ -12588,6 +12596,30 @@ def _play_request(
         provider_id=selected_provider,
         person_id=person_id,
     )
+    if not matches and not any((title, artist, album, genre)):
+        # The planner sometimes echoes "play some of my music" back as the
+        # literal search query="personal music". A query whose only surviving
+        # token is a possessive described the request, not a track — re-search
+        # without the query so it plays a whole-library shuffle (exactly what
+        # an empty query does) instead of dead-ending. Named searches whose
+        # tokens are real words keep failing honestly.
+        leftovers = [
+            token
+            for token in _clean_query_tokens(query)
+            if token not in POSSESSIVE_QUERY_WORDS
+        ]
+        if query and not leftovers:
+            matches = _search_tracks(
+                query="",
+                title=title,
+                artist=artist,
+                album=album,
+                genre=genre,
+                limit=_as_int(cfg.get("maximum_queue_tracks"), 200, 1, 1000),
+                client=client,
+                provider_id=selected_provider,
+                person_id=person_id,
+            )
     requested_targets = (
         args.get("targets")
         or args.get("target")
@@ -12743,7 +12775,10 @@ def get_hydra_kernel_tools(*, platform: str = "", **_kwargs) -> List[Dict[str, A
             "id": "personal_music_play",
             "description": (
                 "Use when the user asks to play music from their personal Emby or network-share library by "
-                "song, artist, album, genre, or description. Put user-named rooms in rooms, specific "
+                "song, artist, album, genre, or description. For requests like \"play my music\" or \"some of my "
+                "music\" that name no artist, album, song, or genre, leave query empty and pass shuffle:true — "
+                "the tool then shuffles the speaker's whole library. Never echo the user's phrasing "
+                "(\"my music\", \"personal music\") into query. Put user-named rooms in rooms, specific "
                 "user-named speakers in targets, and leave both empty when playback should follow the "
                 "speaking room. User-named screens (\"play on the office screen\") are also valid "
                 "destinations and can be mixed with speakers — screen playback renders in the screen's "
